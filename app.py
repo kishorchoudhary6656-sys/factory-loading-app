@@ -1,5 +1,7 @@
 from flask import Flask, render_template_string, request, redirect, session
 import sqlite3
+import csv
+import io
 import random
 
 app = Flask(__name__)
@@ -35,8 +37,8 @@ def init_db():
     cursor.execute('SELECT COUNT(*) FROM po_items')
     if cursor.fetchone()[0] == 0:
         sample_data = [
-            ("P134760", "Daily Good Raw Peanut / Singdana", "500g", 3520, "89010101"),
-            ("P134760", "Daily Good Ponni Raw Rice", "5 kg", 500, "89010202")
+            ("P5229701", "Daily Good Raw Peanut / Singdana", "500g", 1620, "8909177015591"),
+            ("P5229701", "Daily Good Idli Rice", "1 kg", 540, "8909177015874")
         ]
         cursor.executemany('INSERT INTO po_items (po_number, item_name, weight, ordered_qty, barcode) VALUES (?, ?, ?, ?, ?)', sample_data)
         conn.commit()
@@ -140,7 +142,7 @@ DASHBOARD_TEMPLATE = """
                 <button type="button" onclick="startScanner()" class="btn btn-scan" id="scanBtn">कैमरा चालू करके स्कैन करें</button>
                 
                 <form action="/manual_barcode" method="POST" style="margin-top: 15px;">
-                    <input type="text" name="barcode" placeholder="या बारकोड नंबर टाइप करें (जैसे 8909177016307)" required style="margin-bottom: 5px; font-size: 0.9rem;">
+                    <input type="text" name="barcode" placeholder="या बारकोड नंबर टाइप करें" required style="margin-bottom: 5px; font-size: 0.9rem;">
                     <button type="submit" class="btn btn-manual">टाइप करके जोड़े (+25Qty)</button>
                 </form>
                 <div id="scan-result" style="margin-top: 10px; font-weight: bold; color: #10b981; font-size: 0.9rem;"></div>
@@ -160,10 +162,10 @@ DASHBOARD_TEMPLATE = """
             </div>
 
             <div class="card">
-                <h2 class="card-title">📁 PO फोटो/फाइल अपलोड</h2>
+                <h2 class="card-title">📁 PO फाइल (CSV) अपलोड</h2>
                 <form action="/upload_file" method="POST" enctype="multipart/form-data">
-                    <input type="file" name="po_file" accept=".csv, .xlsx, .pdf, image/*" required>
-                    <button type="submit" class="btn btn-upload">फाइल/फोटो अपलोड करें</button>
+                    <input type="file" name="po_file" accept=".csv" required>
+                    <button type="submit" class="btn btn-upload">फाइल अपलोड करें</button>
                 </form>
             </div>
         </div>
@@ -284,24 +286,13 @@ def manual_barcode():
     cursor.execute('SELECT item_name, weight, po_number FROM po_items WHERE barcode = ?', (barcode,))
     item = cursor.fetchone()
     
-    if not item:
-        cursor.execute('INSERT INTO po_items (po_number, item_name, weight, ordered_qty, barcode) VALUES (?, ?, ?, ?, ?)',
-                       ("P134760", "Daily Good Lakchari Kolam Raw Rice", "1 kg", 450, barcode))
-        conn.commit()
-        cursor.execute('SELECT item_name, weight, po_number FROM po_items WHERE barcode = ?', (barcode,))
-        item = cursor.fetchone()
-
     if item:
         name_weight = f"{item[0]} ({item[1]})"
         po_no = item[2]
         cursor.execute('SELECT id FROM loading_log WHERE po_number = ? AND product_name = ?', (po_no, name_weight))
-        log_row = cursor.fetchone()
-        if not log_row:
-            cursor.execute('INSERT INTO loading_log (po_number, product_name, total_ordered, box_size, loaded_qty, barcode) VALUES (?, ?, 450, 25, 0, ?)',
+        if not cursor.fetchone():
+            cursor.execute('INSERT INTO loading_log (po_number, product_name, total_ordered, box_size, loaded_qty, barcode) VALUES (?, ?, 500, 25, 0, ?)',
                            (po_no, name_weight, barcode))
-        else:
-            cursor.execute('UPDATE loading_log SET barcode = ? WHERE po_number = ? AND product_name = ?', (barcode, po_no, name_weight))
-        
         cursor.execute('UPDATE loading_log SET loaded_qty = loaded_qty + 25 WHERE po_number = ? AND product_name = ?', (po_no, name_weight))
         conn.commit()
     
@@ -340,8 +331,6 @@ def load_po():
         if not cursor.fetchone():
             cursor.execute('INSERT INTO loading_log (po_number, product_name, total_ordered, box_size, loaded_qty, barcode) VALUES (?, ?, ?, 25, 0, ?)',
                            (po_number, name_weight, qty, b_code))
-        else:
-            cursor.execute('UPDATE loading_log SET barcode = ? WHERE po_number = ? AND product_name = ?', (b_code, po_number, name_weight))
     conn.commit()
     conn.close()
     return redirect('/')
@@ -352,24 +341,28 @@ def upload_file():
     if 'po_file' in request.files:
         file = request.files['po_file']
         if file.filename != '':
-            conn = sqlite3.connect('factory.db')
-            cursor = conn.cursor()
-            
-            po_number = "P134760"
-            po_items_data = [
-                (po_number, "Daily Good Raw Peanut / Singdana", "500g", 3520, "89010101"),
-                (po_number, "Daily Good Ponni Raw Rice", "5 kg", 500, "89010202"),
-                (po_number, "Daily Good Lakchari Kolam Raw Rice", "1 kg", 450, "8909177016307"),
-                (po_number, "Daily Good Unpolished Urad Black Whole - Gota", "1 kg", 300, "89010404"),
-                (po_number, "Daily Good Masoor Dal / Masoor Whole", "1 kg", 930, "89010505")
-            ]
-            for p_item in po_items_data:
-                cursor.execute('SELECT id FROM po_items WHERE po_number = ? AND item_name = ?', (p_item[0], p_item[1]))
-                if not cursor.fetchone():
-                    cursor.execute('INSERT INTO po_items (po_number, item_name, weight, ordered_qty, barcode) VALUES (?, ?, ?, ?, ?)', p_item)
-            
-            conn.commit()
-            conn.close()
+            try:
+                stream = io.TextIOWrapper(file.stream, encoding="utf-8")
+                reader = csv.DictReader(stream)
+                conn = sqlite3.connect('factory.db')
+                cursor = conn.cursor()
+                
+                for row in reader:
+                    po_no = row.get('PoNumber', '').strip()
+                    desc = row.get('SkuDesc', '').strip()
+                    qty = row.get('Quantity', '0').strip()
+                    ean = row.get('EAN', '').strip()
+                    
+                    if po_no and desc:
+                        # वजन या साइज़ निकालने के लिए SkuDesc का उपयोग करें
+                        cursor.execute('SELECT id FROM po_items WHERE po_number = ? AND item_name = ?', (po_no, desc))
+                        if not cursor.fetchone():
+                            cursor.execute('INSERT INTO po_items (po_number, item_name, weight, ordered_qty, barcode) VALUES (?, ?, ?, ?, ?)',
+                                           (po_no, desc, "1 pack", int(float(qty)) if qty else 0, ean))
+                conn.commit()
+                conn.close()
+            except Exception as e:
+                print("Error:", e)
     return redirect('/')
 
 @app.route('/update_load', methods=['POST'])
@@ -385,4 +378,3 @@ def update_load():
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', debug=True, port=5000)
-    
