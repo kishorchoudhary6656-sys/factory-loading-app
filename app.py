@@ -54,7 +54,6 @@ LOGIN_TEMPLATE = """
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>FactoryFlow - Login</title>
-    <meta name="google-site-verification" content="db57yD1AuDoUejtp" />
     <style>
         body { font-family: Arial, sans-serif; background: #0f172a; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
         .login-card { background: white; padding: 30px; border-radius: 12px; width: 100%; max-width: 350px; box-shadow: 0 10px 25px rgba(0,0,0,0.3); text-align: center; }
@@ -87,7 +86,6 @@ DASHBOARD_TEMPLATE = """
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>FactoryFlow AI ERP - Secure</title>
-    <meta name="google-site-verification" content="db57yD1AuDoUejtp" />
     <script src="https://unpkg.com/html5-qrcode" type="text/javascript"></script>
     <style>
         :root { --primary: #2563eb; --secondary: #10b981; --dark: #0f172a; --bg: #f8fafc; }
@@ -277,6 +275,11 @@ def login():
 def logout():
     session.pop('logged_in', None)
     return redirect('/')
+
+# Google Search Console Verification Route with correct file name
+@app.route('/googlec1dd36a62fa9245c.html')
+def google_verify():
+    return "google-site-verification: googlec1dd36a62fa9245c.html"
 
 @app.route('/manual_barcode', methods=['POST'])
 def manual_barcode():
