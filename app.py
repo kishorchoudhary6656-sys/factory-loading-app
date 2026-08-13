@@ -27,7 +27,8 @@ def init_db():
             product_name TEXT,
             total_ordered INTEGER,
             box_size INTEGER,
-            loaded_qty INTEGER DEFAULT 0
+            loaded_qty INTEGER DEFAULT 0,
+            barcode TEXT DEFAULT ''
         )
     ''')
     
@@ -117,6 +118,7 @@ DASHBOARD_TEMPLATE = """
         .text-green { color: #16a34a; font-weight: 800; font-size: 1.1rem; }
         .text-red { color: #dc2626; font-weight: 800; font-size: 1.1rem; }
         .loose-badge { color: #d97706; font-size: 0.85rem; background: #fef3c7; padding: 0.2rem 0.6rem; border-radius: 6px; display: inline-block; margin-top: 4px; }
+        .barcode-badge { color: #475569; font-size: 0.85rem; background: #f1f5f9; padding: 0.2rem 0.5rem; border-radius: 4px; font-family: monospace; display: inline-block; margin-top: 4px; border: 1px solid #cbd5e1; }
         
         .update-form { display: flex; gap: 0.5rem; align-items: center; justify-content: center; }
         .update-input { width: 75px; margin: 0; padding: 0.6rem; text-align: center; font-weight: bold; }
@@ -137,7 +139,6 @@ DASHBOARD_TEMPLATE = """
                 <div id="reader"></div>
                 <button type="button" onclick="startScanner()" class="btn btn-scan" id="scanBtn">कैमरा चालू करके स्कैन करें</button>
                 
-                <!-- नया मैन्युअल बारकोड टाइप करने का विकल्प -->
                 <form action="/manual_barcode" method="POST" style="margin-top: 15px;">
                     <input type="text" name="barcode" placeholder="या बारकोड नंबर टाइप करें (जैसे 8909177016307)" required style="margin-bottom: 5px; font-size: 0.9rem;">
                     <button type="submit" class="btn btn-manual">टाइप करके जोड़े (+25Qty)</button>
@@ -177,6 +178,7 @@ DASHBOARD_TEMPLATE = """
                         <tr>
                             <th>PO नंबर</th>
                             <th>प्रोडक्ट / साइज़</th>
+                            <th>EAN / Barcode</th>
                             <th>मास्टर बैग हिसाब</th>
                             <th>लोड हुआ</th>
                             <th>बाकी (Pending)</th>
@@ -188,6 +190,7 @@ DASHBOARD_TEMPLATE = """
                         <tr>
                             <td><b>{{ item[1] }}</b></td>
                             <td>{{ item[2] }}</td>
+                            <td><span class="barcode-badge">{{ item[6] }}</span></td>
                             <td>
                                 {% set bags = item[3] // item[4] %}
                                 {% set loose = item[3] % item[4] %}
@@ -207,7 +210,7 @@ DASHBOARD_TEMPLATE = """
                         </tr>
                         {% else %}
                         <tr>
-                            <td colspan="6" style="text-align:center; padding:3rem; color:#94a3b8;">
+                            <td colspan="7" style="text-align:center; padding:3rem; color:#94a3b8;">
                                 📋 लोडिंग के लिए कोई PO सिलेक्ट नहीं किया गया है। ऊपर दिए गए बॉक्स से PO चुनें।
                             </td>
                         </tr>
@@ -278,12 +281,10 @@ def manual_barcode():
     conn = sqlite3.connect('factory.db')
     cursor = conn.cursor()
     
-    # यदि बारकोड डेटाबेस में नहीं है, तो इसे हाल के PO P134760 के आइटम के साथ जोड़ देते हैं ताकि तुरंत काम चले
     cursor.execute('SELECT item_name, weight, po_number FROM po_items WHERE barcode = ?', (barcode,))
     item = cursor.fetchone()
     
     if not item:
-        # अगर नया बारकोड है, तो इसे आपके लेबल वाले आइटम (जैसे Lachkari Kolam Rice) से जोड़ देते हैं
         cursor.execute('INSERT INTO po_items (po_number, item_name, weight, ordered_qty, barcode) VALUES (?, ?, ?, ?, ?)',
                        ("P134760", "Daily Good Lakchari Kolam Raw Rice", "1 kg", 450, barcode))
         conn.commit()
@@ -293,11 +294,13 @@ def manual_barcode():
     if item:
         name_weight = f"{item[0]} ({item[1]})"
         po_no = item[2]
-        # चेक करें कि लोडिंग लिस्ट में यह है या नहीं, अगर नहीं तो जोड़ें
         cursor.execute('SELECT id FROM loading_log WHERE po_number = ? AND product_name = ?', (po_no, name_weight))
-        if not cursor.fetchone():
-            cursor.execute('INSERT INTO loading_log (po_number, product_name, total_ordered, box_size, loaded_qty) VALUES (?, ?, 450, 25, 0)',
-                           (po_no, name_weight))
+        log_row = cursor.fetchone()
+        if not log_row:
+            cursor.execute('INSERT INTO loading_log (po_number, product_name, total_ordered, box_size, loaded_qty, barcode) VALUES (?, ?, 450, 25, 0, ?)',
+                           (po_no, name_weight, barcode))
+        else:
+            cursor.execute('UPDATE loading_log SET barcode = ? WHERE po_number = ? AND product_name = ?', (barcode, po_no, name_weight))
         
         cursor.execute('UPDATE loading_log SET loaded_qty = loaded_qty + 25 WHERE po_number = ? AND product_name = ?', (po_no, name_weight))
         conn.commit()
@@ -307,7 +310,7 @@ def manual_barcode():
 
 @app.route('/scan_update', methods=['POST'])
 def scan_update():
-    if not session.get('logged_in'): return redirect('')
+    if not session.get('logged_in'): return '', 403
     barcode = request.form.get('barcode')
     conn = sqlite3.connect('factory.db')
     cursor = conn.cursor()
@@ -327,15 +330,18 @@ def load_po():
     po_number = request.form['po_number']
     conn = sqlite3.connect('factory.db')
     cursor = conn.cursor()
-    cursor.execute('SELECT item_name, weight, ordered_qty FROM po_items WHERE po_number = ?', (po_number,))
+    cursor.execute('SELECT item_name, weight, ordered_qty, barcode FROM po_items WHERE po_number = ?', (po_number,))
     items = cursor.fetchall()
     for item in items:
         name_weight = f"{item[0]} ({item[1]})"
         qty = item[2]
+        b_code = item[3]
         cursor.execute('SELECT id FROM loading_log WHERE po_number = ? AND product_name = ?', (po_number, name_weight))
         if not cursor.fetchone():
-            cursor.execute('INSERT INTO loading_log (po_number, product_name, total_ordered, box_size, loaded_qty) VALUES (?, ?, ?, 25, 0)',
-                           (po_number, name_weight, qty))
+            cursor.execute('INSERT INTO loading_log (po_number, product_name, total_ordered, box_size, loaded_qty, barcode) VALUES (?, ?, ?, 25, 0, ?)',
+                           (po_number, name_weight, qty, b_code))
+        else:
+            cursor.execute('UPDATE loading_log SET barcode = ? WHERE po_number = ? AND product_name = ?', (b_code, po_number, name_weight))
     conn.commit()
     conn.close()
     return redirect('/')
@@ -379,4 +385,4 @@ def update_load():
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', debug=True, port=5000)
-            
+    
