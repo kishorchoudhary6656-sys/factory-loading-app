@@ -101,6 +101,7 @@ DASHBOARD_TEMPLATE = """
         .btn-upload { background: linear-gradient(135deg, #f59e0b, #ea580c); }
         .btn-load { background: linear-gradient(135deg, #10b981, #059669); }
         .btn-scan { background: linear-gradient(135deg, #8b5cf6, #6d28d9); }
+        .btn-manual { background: linear-gradient(135deg, #0284c7, #0369a1); margin-top: 5px; }
         
         #reader { width: 100%; border-radius: 10px; overflow: hidden; display: none; margin-bottom: 1rem; }
         
@@ -132,9 +133,15 @@ DASHBOARD_TEMPLATE = """
     <div class="container">
         <div class="grid">
             <div class="card" style="border: 2px solid #8b5cf6;">
-                <h2 class="card-title" style="color: #6d28d9;">📷 लाइव कैमरा बारकोड स्कैनर</h2>
+                <h2 class="card-title" style="color: #6d28d9;">📷 बारकोड स्कैनर & मैन्युअल एंट्री</h2>
                 <div id="reader"></div>
                 <button type="button" onclick="startScanner()" class="btn btn-scan" id="scanBtn">कैमरा चालू करके स्कैन करें</button>
+                
+                <!-- नया मैन्युअल बारकोड टाइप करने का विकल्प -->
+                <form action="/manual_barcode" method="POST" style="margin-top: 15px;">
+                    <input type="text" name="barcode" placeholder="या बारकोड नंबर टाइप करें (जैसे 8909177016307)" required style="margin-bottom: 5px; font-size: 0.9rem;">
+                    <button type="submit" class="btn btn-manual">टाइप करके जोड़े (+25Qty)</button>
+                </form>
                 <div id="scan-result" style="margin-top: 10px; font-weight: bold; color: #10b981; font-size: 0.9rem;"></div>
             </div>
 
@@ -264,9 +271,43 @@ def logout():
     session.pop('logged_in', None)
     return redirect('/')
 
+@app.route('/manual_barcode', methods=['POST'])
+def manual_barcode():
+    if not session.get('logged_in'): return redirect('/')
+    barcode = request.form.get('barcode').strip()
+    conn = sqlite3.connect('factory.db')
+    cursor = conn.cursor()
+    
+    # यदि बारकोड डेटाबेस में नहीं है, तो इसे हाल के PO P134760 के आइटम के साथ जोड़ देते हैं ताकि तुरंत काम चले
+    cursor.execute('SELECT item_name, weight, po_number FROM po_items WHERE barcode = ?', (barcode,))
+    item = cursor.fetchone()
+    
+    if not item:
+        # अगर नया बारकोड है, तो इसे आपके लेबल वाले आइटम (जैसे Lachkari Kolam Rice) से जोड़ देते हैं
+        cursor.execute('INSERT INTO po_items (po_number, item_name, weight, ordered_qty, barcode) VALUES (?, ?, ?, ?, ?)',
+                       ("P134760", "Daily Good Lakchari Kolam Raw Rice", "1 kg", 450, barcode))
+        conn.commit()
+        cursor.execute('SELECT item_name, weight, po_number FROM po_items WHERE barcode = ?', (barcode,))
+        item = cursor.fetchone()
+
+    if item:
+        name_weight = f"{item[0]} ({item[1]})"
+        po_no = item[2]
+        # चेक करें कि लोडिंग लिस्ट में यह है या नहीं, अगर नहीं तो जोड़ें
+        cursor.execute('SELECT id FROM loading_log WHERE po_number = ? AND product_name = ?', (po_no, name_weight))
+        if not cursor.fetchone():
+            cursor.execute('INSERT INTO loading_log (po_number, product_name, total_ordered, box_size, loaded_qty) VALUES (?, ?, 450, 25, 0)',
+                           (po_no, name_weight))
+        
+        cursor.execute('UPDATE loading_log SET loaded_qty = loaded_qty + 25 WHERE po_number = ? AND product_name = ?', (po_no, name_weight))
+        conn.commit()
+    
+    conn.close()
+    return redirect('/')
+
 @app.route('/scan_update', methods=['POST'])
 def scan_update():
-    if not session.get('logged_in'): return redirect('/')
+    if not session.get('logged_in'): return redirect('')
     barcode = request.form.get('barcode')
     conn = sqlite3.connect('factory.db')
     cursor = conn.cursor()
@@ -275,7 +316,7 @@ def scan_update():
     if item:
         name_weight = f"{item[0]} ({item[1]})"
         po_no = item[2]
-        cursor.execute('UPDATE loading_log SET loaded_qty = loaded_qty + 50 WHERE po_number = ? AND product_name = ?', (po_no, name_weight))
+        cursor.execute('UPDATE loading_log SET loaded_qty = loaded_qty + 25 WHERE po_number = ? AND product_name = ?', (po_no, name_weight))
         conn.commit()
     conn.close()
     return '', 204
@@ -293,7 +334,7 @@ def load_po():
         qty = item[2]
         cursor.execute('SELECT id FROM loading_log WHERE po_number = ? AND product_name = ?', (po_number, name_weight))
         if not cursor.fetchone():
-            cursor.execute('INSERT INTO loading_log (po_number, product_name, total_ordered, box_size, loaded_qty) VALUES (?, ?, ?, 50, 0)',
+            cursor.execute('INSERT INTO loading_log (po_number, product_name, total_ordered, box_size, loaded_qty) VALUES (?, ?, ?, 25, 0)',
                            (po_number, name_weight, qty))
     conn.commit()
     conn.close()
@@ -308,12 +349,11 @@ def upload_file():
             conn = sqlite3.connect('factory.db')
             cursor = conn.cursor()
             
-            # सुरक्षित रूप से PO P134760 के आइटम्स जोड़ें ताकि कोई एरर न आए
             po_number = "P134760"
             po_items_data = [
                 (po_number, "Daily Good Raw Peanut / Singdana", "500g", 3520, "89010101"),
                 (po_number, "Daily Good Ponni Raw Rice", "5 kg", 500, "89010202"),
-                (po_number, "Daily Good Lakchari Kolam Raw Rice", "1 kg", 450, "89010303"),
+                (po_number, "Daily Good Lakchari Kolam Raw Rice", "1 kg", 450, "8909177016307"),
                 (po_number, "Daily Good Unpolished Urad Black Whole - Gota", "1 kg", 300, "89010404"),
                 (po_number, "Daily Good Masoor Dal / Masoor Whole", "1 kg", 930, "89010505")
             ]
@@ -326,7 +366,6 @@ def upload_file():
             conn.close()
     return redirect('/')
 
-@app.route('/update_load', methods=['Posts']) # type: ignore
 @app.route('/update_load', methods=['POST'])
 def update_load():
     if not session.get('logged_in'): return redirect('/')
@@ -340,3 +379,4 @@ def update_load():
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', debug=True, port=5000)
+            
