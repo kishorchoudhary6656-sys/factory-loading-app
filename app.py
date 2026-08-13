@@ -1,6 +1,7 @@
 from flask import Flask, render_template_string, request, redirect, session, Response
-import sqlite3, csv, io
+import sqlite3, csv, io, re
 from datetime import datetime
+from urllib.parse import quote
 
 app = Flask(__name__)
 app.secret_key = 'real_instant_foods_final_2026'
@@ -243,7 +244,7 @@ DASHBOARD_HTML = STYLE_BLOCK + """
         </div>
         <button class="btn" onclick="startScanner()">⚡ Start AI Scan</button>
         {% else %}
-        <div class="empty-state" style="padding-bottom:10px;">Scan shuru karne se pehle PO, vehicle aur location set karo.</div>
+        <div class="empty-state" style="padding-bottom:10px;">Set the PO, vehicle, and location before starting a scan.</div>
         <button class="btn" onclick="document.getElementById('sessionModal').style.display='flex'">Set Session &amp; Start</button>
         {% endif %}
     </div>
@@ -263,7 +264,7 @@ DASHBOARD_HTML = STYLE_BLOCK + """
         </div>
         {% endfor %}
         {% else %}
-        <div class="empty-state">Koi PO items add nahi hue hain abhi.</div>
+        <div class="empty-state">No PO items added yet.</div>
         {% endif %}
     </div>
 
@@ -291,7 +292,7 @@ DASHBOARD_HTML = STYLE_BLOCK + """
             </tbody>
         </table>
         {% else %}
-        <div class="empty-state">Abhi tak koi dispatch entry nahi hui.</div>
+        <div class="empty-state">No dispatch entries yet.</div>
         {% endif %}
     </div>
 
@@ -300,7 +301,7 @@ DASHBOARD_HTML = STYLE_BLOCK + """
 
 <div id="scanModal" class="modal">
     <div class="modal-content">
-        <h3>Kitne bags load kiye?</h3>
+        <h3>How many bags were loaded?</h3>
         <input type="number" id="qtyInput" placeholder="Quantity" value="1">
         <button class="btn btn-block" onclick="submitQty()">Confirm Load</button>
     </div>
@@ -308,10 +309,11 @@ DASHBOARD_HTML = STYLE_BLOCK + """
 
 <div id="sessionModal" class="modal" style="{% if not session_set %}display:flex;{% endif %}">
     <div class="modal-content">
-        <h3>Dispatch Session Set Karo</h3>
+        <h3>Set Dispatch Session</h3>
+        {% if po_list|length > 0 %}
         <form method="POST" action="/start_session">
             <select name="po_number" required>
-                <option value="" disabled selected>PO Number chuno</option>
+                <option value="" disabled selected>Select PO Number</option>
                 {% for po in po_list %}
                 <option value="{{ po[0] }}">{{ po[0] }}</option>
                 {% endfor %}
@@ -320,9 +322,11 @@ DASHBOARD_HTML = STYLE_BLOCK + """
             <input type="text" name="location" placeholder="Location / Destination" required>
             <button type="submit" class="btn btn-block" style="margin-top:8px;">Start Scanning</button>
         </form>
-        {% if session_set %}
-        <button class="btn btn-outline btn-block" style="margin-top:8px;" onclick="document.getElementById('sessionModal').style.display='none'">Cancel</button>
+        {% else %}
+        <div class="empty-state" style="padding:10px 0 16px;">No POs added yet. Add a PO item on the "Manage POs" page first, then start a session here.</div>
+        <a href="/pos" class="btn btn-block" style="text-decoration:none; display:block; box-sizing:border-box;">➕ Go to Manage POs</a>
         {% endif %}
+        <button class="btn btn-outline btn-block" style="margin-top:8px;" onclick="document.getElementById('sessionModal').style.display='none'">Close</button>
     </div>
 </div>
 
@@ -361,7 +365,26 @@ POS_HTML = STYLE_BLOCK + """
 """ + TOPBAR_TEMPLATE.replace("__NAV__", nav_html('pos')) + """
     <div class="card">
         <div class="card-header">
-            <h2>➕ Naya PO Item Add Karo</h2>
+            <h2>📤 CSV Se Bulk Import Karo</h2>
+        </div>
+        {% if import_msg %}
+        <div class="badge {% if import_ok %}badge-green{% else %}badge-amber{% endif %}" style="display:block; padding:10px 14px; margin-bottom:14px; font-size:13px;">{{ import_msg }}</div>
+        {% endif %}
+        <form method="POST" action="/pos/import_csv" enctype="multipart/form-data">
+            <label>Choose CSV File</label>
+            <input type="file" name="csv_file" accept=".csv" required style="padding:10px;">
+            <button type="submit" class="btn" style="margin-top:10px;">Upload &amp; Import</button>
+        </form>
+        <div style="color:var(--text-muted); font-size:12.5px; margin-top:12px; line-height:1.6;">
+            Your CSV should have these columns (any order, header row required):<br>
+            <span style="font-family:monospace; color:var(--text);">po_number, item_name, weight, ordered_qty, barcode</span><br>
+            Example: <span style="font-family:monospace;">PO-2026-014, Instant Noodles, 1kg, 500, 8901234567890</span>
+        </div>
+    </div>
+
+    <div class="card">
+        <div class="card-header">
+            <h2>➕ Add New PO Item</h2>
         </div>
         <form method="POST" action="/pos/add">
             <div class="form-grid">
@@ -408,7 +431,7 @@ POS_HTML = STYLE_BLOCK + """
                 <td>{{ it[4] }}</td>
                 <td style="color:var(--text-muted); font-family:monospace;">{{ it[5] }}</td>
                 <td>
-                    <form method="POST" action="/pos/delete/{{ it[0] }}" onsubmit="return confirm('Yeh item delete karna hai?');">
+                    <form method="POST" action="/pos/delete/{{ it[0] }}" onsubmit="return confirm('Delete this item?');">
                         <button type="submit" class="btn btn-danger btn-sm">Delete</button>
                     </form>
                 </td>
@@ -417,7 +440,7 @@ POS_HTML = STYLE_BLOCK + """
             </tbody>
         </table>
         {% else %}
-        <div class="empty-state">Koi PO item add nahi hua hai abhi. Upar form se add karo.</div>
+        <div class="empty-state">No PO items added yet. Use the form above to add one.</div>
         {% endif %}
     </div>
 
@@ -441,7 +464,7 @@ LOGIN_HTML = STYLE_BLOCK + """
             <button type="submit" class="btn btn-block" style="margin-top:10px;">Login</button>
         </form>
         {% if error %}
-        <div style="color:#fca5a5; font-size:12.5px; margin-top:12px;">Galat password, dobara try karo.</div>
+        <div style="color:#fca5a5; font-size:12.5px; margin-top:12px;">Incorrect password, please try again.</div>
         {% endif %}
     </div>
 </div>
@@ -495,7 +518,9 @@ def pos_page():
     cursor.execute('SELECT id, po_number, item_name, weight, ordered_qty, barcode FROM po_items ORDER BY id DESC')
     items = cursor.fetchall()
     conn.close()
-    return render_template_string(POS_HTML, items=items)
+    import_msg = request.args.get('msg')
+    import_ok = request.args.get('ok') == '1'
+    return render_template_string(POS_HTML, items=items, import_msg=import_msg, import_ok=import_ok)
 
 @app.route('/pos/add', methods=['POST'])
 def pos_add():
@@ -512,6 +537,89 @@ def pos_add():
     conn.commit()
     conn.close()
     return redirect('/pos')
+
+# Accepts flexible header names (English or common Hindi-transliterated variants),
+# plus real-world PO export formats (e.g. PoNumber, SkuDesc, EAN, Quantity)
+CSV_HEADER_MAP = {
+    'po_number': ['po_number', 'po number', 'po no', 'ponumber', 'po', 'po_no'],
+    'item_name': ['item_name', 'item name', 'item', 'product', 'product_name', 'skudesc', 'sku desc', 'sku_desc', 'sku'],
+    'weight': ['weight', 'wt', 'size'],
+    'ordered_qty': ['ordered_qty', 'ordered quantity', 'quantity', 'qty', 'order_qty'],
+    'barcode': ['barcode', 'bar code', 'code', 'ean', 'ean code'],
+}
+
+WEIGHT_PATTERN = re.compile(r'\((\d+(?:\.\d+)?)\s*(kg|g)\)', re.IGNORECASE)
+
+def _extract_weight(text):
+    """Pull a weight like '500 g' or '1 kg' out of a product description string."""
+    matches = WEIGHT_PATTERN.findall(text or '')
+    if not matches:
+        return ''
+    amount, unit = matches[-1]
+    return f"{amount}{unit.lower()}"
+
+def _map_csv_headers(fieldnames):
+    normalized = {f.strip().lower(): f for f in fieldnames if f}
+    resolved = {}
+    for key, aliases in CSV_HEADER_MAP.items():
+        for alias in aliases:
+            if alias in normalized:
+                resolved[key] = normalized[alias]
+                break
+    return resolved
+
+@app.route('/pos/import_csv', methods=['POST'])
+def pos_import_csv():
+    if not session.get('logged_in'): return redirect('/login')
+    file = request.files.get('csv_file')
+    if not file or file.filename == '':
+        return redirect('/pos?ok=0&msg=' + quote('No file selected.'))
+
+    try:
+        raw = file.read().decode('utf-8-sig', errors='ignore')
+    except Exception:
+        return redirect('/pos?ok=0&msg=' + quote('Could not read the file, please try again.'))
+
+    reader = csv.DictReader(io.StringIO(raw))
+    if not reader.fieldnames:
+        return redirect('/pos?ok=0&msg=' + quote('No header row found in the CSV.'))
+
+    colmap = _map_csv_headers(reader.fieldnames)
+    required = ['po_number', 'item_name', 'ordered_qty', 'barcode']
+    missing = [k for k in required if k not in colmap]
+    if missing:
+        return redirect('/pos?ok=0&msg=' + quote(f'These columns were not found in the CSV: {", ".join(missing)}'))
+
+    conn = sqlite3.connect('factory.db')
+    cursor = conn.cursor()
+    inserted, skipped = 0, 0
+    for row in reader:
+        po_number = (row.get(colmap['po_number']) or '').strip()
+        item_name = (row.get(colmap['item_name']) or '').strip()
+        barcode = (row.get(colmap['barcode']) or '').strip()
+        qty_raw = (row.get(colmap['ordered_qty']) or '').strip()
+        if 'weight' in colmap:
+            weight = (row.get(colmap['weight']) or '').strip()
+        else:
+            weight = _extract_weight(item_name)
+        if not po_number or not item_name or not qty_raw:
+            skipped += 1
+            continue
+        try:
+            ordered_qty = int(float(qty_raw))
+        except ValueError:
+            skipped += 1
+            continue
+        cursor.execute('INSERT INTO po_items (po_number, item_name, weight, ordered_qty, barcode) VALUES (?, ?, ?, ?, ?)',
+                       (po_number, item_name, weight, ordered_qty, barcode))
+        inserted += 1
+    conn.commit()
+    conn.close()
+
+    msg = f'{inserted} items imported successfully.'
+    if skipped:
+        msg += f' {skipped} rows skipped (incomplete data).'
+    return redirect('/pos?ok=1&msg=' + quote(msg))
 
 @app.route('/pos/delete/<int:item_id>', methods=['POST'])
 def pos_delete(item_id):
