@@ -136,23 +136,23 @@ DASHBOARD_TEMPLATE = """
 
     <div class="container">
         <div class="grid">
-            <!-- हाई-स्पीड बारकोड स्कैनर -->
+            <!-- सुपर फास्ट स्मार्ट स्कैनर -->
             <div class="card" style="border: 2px solid #8b5cf6;">
-                <h2 class="card-title" style="color: #6d28d9;">📷 सुपर फास्ट बारकोड स्कैनर</h2>
+                <h2 class="card-title" style="color: #6d28d9;">📷 स्मार्ट बारकोड स्कैनर (डिटेक्ट & पॉप-अप)</h2>
                 <div id="reader"></div>
-                <button type="button" onclick="startScanner()" class="btn btn-scan" id="scanBtn">कैमरा चालू करें (Instant Scan)</button>
+                <button type="button" onclick="startScanner()" class="btn btn-scan" id="scanBtn">कैमरा चालू करें (Scan & Enter Qty)</button>
                 
                 <form action="/manual_scan" method="POST" style="margin-top: 15px;">
-                    <input type="text" name="barcode" placeholder="या बारकोड यहाँ टाइप/स्कôiन करें (जैसे 8909177015591)" required style="font-size: 0.9rem;">
+                    <input type="text" name="barcode" placeholder="या बारकोड यहाँ टाइप करें" required style="font-size: 0.9rem;">
                     <div style="display: flex; gap: 10px;">
-                        <input type="number" name="box_size" value="50" placeholder="मास्टर बैग पीस (Box Size)" required style="margin-bottom:0;">
+                        <input type="number" name="box_size" value="50" placeholder="बॉक्स साइज (50)" required style="margin-bottom:0;">
                         <button type="submit" class="btn btn-manual" style="width: auto; padding: 0.8rem 1.2rem;">जोड़ें</button>
                     </div>
                 </form>
                 <div id="scan-result" style="margin-top: 10px; font-weight: bold; color: #10b981; font-size: 0.9rem;"></div>
             </div>
 
-            <!-- PO लोड करने का सेक्शन -->
+            <!-- पेंडिंग PO लोड करें -->
             <div class="card">
                 <h2 class="card-title">📦 पेंडिंग PO लोड करें</h2>
                 <form action="/load_po" method="POST">
@@ -188,7 +188,7 @@ DASHBOARD_TEMPLATE = """
                             <th>PO नंबर</th>
                             <th>प्रोडक्ट विवरण</th>
                             <th>Barcode / EAN</th>
-                            <th>मास्टर बैग हिसाब (Box Size)</th>
+                            <th>मास्टर बैग हिसाब</th>
                             <th>कुल आर्डर (Target)</th>
                             <th>लोड हुआ</th>
                             <th>बाकी (Short/Pending)</th>
@@ -213,7 +213,6 @@ DASHBOARD_TEMPLATE = """
                             <td class="text-green">{{ item[5] }} pcs</td>
                             <td class="text-red">{{ item[3] - item[5] }} pcs</td>
                             <td>
-                                <!-- जोड़ने या शॉर्ट होने पर सीधे एडिट करने का फॉर्म -->
                                 <form action="/update_load" method="POST" class="update-form" style="margin-bottom: 4px;">
                                     <input type="hidden" name="id" value="{{ item[0] }}">
                                     <input type="hidden" name="action_type" value="add">
@@ -223,7 +222,7 @@ DASHBOARD_TEMPLATE = """
                                 <form action="/update_load" method="POST" class="update-form">
                                     <input type="hidden" name="id" value="{{ item[0] }}">
                                     <input type="hidden" name="action_type" value="edit">
-                                    <input type="number" name="qty" value="{{ item[5] }}" class="update-input" style="background:#fef3c7;" required title="सीधे सही लोड हुआ पीस दर्ज करें (Edit)">
+                                    <input type="number" name="qty" value="{{ item[5] }}" class="update-input" style="background:#fef3c7;" required title="सीधे सही लोड हुआ पीस दर्ज करें (Edit / Short)">
                                     <button type="submit" class="btn-update btn-edit-qty">Set/Edit</button>
                                 </form>
                             </td>
@@ -251,17 +250,33 @@ DASHBOARD_TEMPLATE = """
                 { facingMode: "environment" }, 
                 { fps: 20, qrbox: { width: 300, height: 120 } },
                 (decodedText, decodedResult) => {
-                    document.getElementById('scan-result').innerText = "सफलतापूर्वक स्कैन हुआ: " + decodedText;
-                    // ऑटोमैटिक स्कैन होने पर सर्वर पर भेजें (डिफ़ॉल्ट 50 पीस बॉक्स साइज के साथ)
-                    fetch('/scan_update', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                        body: 'barcode=' + encodeURIComponent(decodedText) + '&box_size=50'
-                    }).then(response => { 
-                        if(response.ok) { 
-                            setTimeout(() => { window.location.reload(); }, 500);
-                        } 
-                    });
+                    // तुरंत स्कैनर बंद करें
+                    html5QrCode.stop();
+                    
+                    // पॉप-अप के जरिए बैग्स और लूज पीस की संख्या पूछें
+                    let boxCount = prompt("✅ बारकोड स्कैन हुआ: " + decodedText + "\n\nकितने मास्टर बैग्स (Boxes) लोड किए?", "1");
+                    if (boxCount !== null && boxCount.trim() !== "") {
+                        let looseCount = prompt("और कितने लूज पीस (Loose Pcs) लोड किए?", "0");
+                        if (looseCount !== null) {
+                            // डेटा सर्वर पर भेजें
+                            fetch('/manual_scan_smart', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                                body: `barcode=${encodeURIComponent(decodedText)}&box_count=${boxCount}&loose_count=${looseCount}`
+                            }).then(response => { 
+                                if(response.ok) { 
+                                    window.location.reload(); 
+                                } else {
+                                    alert("❌ यह बारकोड सिस्टम के PO में नहीं मिला!");
+                                    window.location.reload();
+                                }
+                            });
+                        } else {
+                            window.location.reload();
+                        }
+                    } else {
+                        window.location.reload();
+                    }
                 },
                 (errorMessage) => {}
             ).catch(err => { alert("कैमरा चालू करने में एरर: " + err); });
@@ -302,6 +317,44 @@ def logout():
 def google_verify():
     return "google-site-verification: googlec1dd36a62fa9245c.html"
 
+@app.route('/manual_scan_smart', methods=['POST'])
+def manual_scan_smart():
+    if not session.get('logged_in'): return '', 403
+    barcode = request.form.get('barcode').strip()
+    try:
+        box_count = int(request.form.get('box_count', 0))
+        loose_count = int(request.form.get('loose_count', 0))
+    except ValueError:
+        box_count = 1
+        loose_count = 0
+    
+    box_size = 50 # मानक मास्टर बॉक्स साइज
+    total_qty = (box_count * box_size) + loose_count
+    
+    conn = sqlite3.connect('factory.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT item_name, weight, po_number, ordered_qty FROM po_items WHERE barcode = ?', (barcode,))
+    item = cursor.fetchone()
+    
+    if item:
+        name_weight = f"{item[0]} ({item[1]})"
+        po_no = item[2]
+        target_qty = item[3]
+        
+        cursor.execute('SELECT id FROM loading_log WHERE po_number = ? AND product_name = ?', (po_no, name_weight))
+        if not cursor.fetchone():
+            cursor.execute('INSERT INTO loading_log (po_number, product_name, total_ordered, box_size, loaded_qty, barcode) VALUES (?, ?, ?, ?, 0, ?)',
+                           (po_no, name_weight, target_qty, box_size, barcode))
+        
+        cursor.execute('UPDATE loading_log SET loaded_qty = loaded_qty + ?, box_size = ? WHERE po_number = ? AND product_name = ?', 
+                       (total_qty, box_size, po_no, name_weight))
+        conn.commit()
+        conn.close()
+        return '', 200
+    
+    conn.close()
+    return '', 404
+
 @app.route('/manual_scan', methods=['POST'])
 def manual_scan():
     if not session.get('logged_in'): return redirect('/')
@@ -328,31 +381,6 @@ def manual_scan():
         conn.commit()
     conn.close()
     return redirect('/')
-
-@app.route('/scan_update', methods=['POST'])
-def scan_update():
-    if not session.get('logged_in'): return '', 403
-    barcode = request.form.get('barcode')
-    box_size = int(request.form.get('box_size', 50))
-    
-    conn = sqlite3.connect('factory.db')
-    cursor = conn.cursor()
-    cursor.execute('SELECT item_name, weight, po_number, ordered_qty FROM po_items WHERE barcode = ?', (barcode,))
-    item = cursor.fetchone()
-    if item:
-        name_weight = f"{item[0]} ({item[1]})"
-        po_no = item[2]
-        target_qty = item[3]
-        
-        cursor.execute('SELECT id FROM loading_log WHERE po_number = ? AND product_name = ?', (po_no, name_weight))
-        if not cursor.fetchone():
-            cursor.execute('INSERT INTO loading_log (po_number, product_name, total_ordered, box_size, loaded_qty, barcode) VALUES (?, ?, ?, ?, 0, ?)',
-                           (po_no, name_weight, target_qty, box_size, barcode))
-            
-        cursor.execute('UPDATE loading_log SET loaded_qty = loaded_qty + ? WHERE po_number = ? AND product_name = ?', (box_size, po_no, name_weight))
-        conn.commit()
-    conn.close()
-    return '', 204
 
 @app.route('/load_po', methods=['POST'])
 def load_po():
@@ -394,7 +422,7 @@ def upload_file():
                     
                     if po_no and desc:
                         cursor.execute('SELECT id FROM po_items WHERE po_number = ? AND item_name = ?', (po_no, desc))
-                        if not Ctrl := cursor.fetchone():
+                        if not cursor.fetchone():
                             cursor.execute('INSERT INTO po_items (po_number, item_name, weight, ordered_qty, barcode) VALUES (?, ?, ?, ?, ?)',
                                            (po_no, desc, "1 pack", int(float(qty)) if qty else 0, ean))
                 conn.commit()
@@ -413,10 +441,8 @@ def update_load():
     conn = sqlite3.connect('factory.db')
     cursor = conn.cursor()
     if action_type == 'edit':
-        # सीधे लोड हुई मात्रा को सेट/एडिट करना (शॉर्ट या अधिक होने पर)
         cursor.execute('UPDATE loading_log SET loaded_qty = ? WHERE id = ?', (qty, item_id))
     else:
-        # प्लस करना
         cursor.execute('UPDATE loading_log SET loaded_qty = loaded_qty + ? WHERE id = ?', (qty, item_id))
     conn.commit()
     conn.close()
