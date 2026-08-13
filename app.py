@@ -277,9 +277,9 @@ def logout():
     return redirect('/')
 
 # Google Search Console Verification Route
-@app.route('/google123456789.html')
+@app.route('/googlec1dd36a62fa9245c.html')
 def google_verify():
-    return "google-site-verification: google123456789"
+    return "google-site-verification: googlec1dd36a62fa9245c"
 
 @app.route('/manual_barcode', methods=['POST'])
 def manual_barcode():
