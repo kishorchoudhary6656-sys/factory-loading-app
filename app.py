@@ -276,7 +276,7 @@ DASHBOARD_HTML = STYLE_BLOCK + """
         {% if logs|length > 0 %}
         <table>
             <thead><tr>
-                <th>PO Number</th><th>Vehicle No.</th><th>Location</th><th>Product</th><th>Qty Loaded</th><th>Time</th>
+                <th>PO Number</th><th>Vehicle No.</th><th>Location</th><th>Product</th><th>Qty Loaded</th><th>Time</th><th></th>
             </tr></thead>
             <tbody>
             {% for log in logs %}
@@ -287,6 +287,12 @@ DASHBOARD_HTML = STYLE_BLOCK + """
                 <td>{{ log[4] }}</td>
                 <td><span class="badge badge-green">{{ log[5] }}</span></td>
                 <td style="color:var(--text-muted);">{{ log[6] }}</td>
+                <td style="white-space:nowrap;">
+                    <button class="btn btn-outline btn-sm" onclick="openEditLog('{{ log[0] }}', '{{ log[5] }}')">Edit</button>
+                    <form method="POST" action="/dispatch/delete/{{ log[0] }}" style="display:inline;" onsubmit="return confirm('Delete this entry?');">
+                        <button type="submit" class="btn btn-danger btn-sm">Delete</button>
+                    </form>
+                </td>
             </tr>
             {% endfor %}
             </tbody>
@@ -299,9 +305,27 @@ DASHBOARD_HTML = STYLE_BLOCK + """
     <footer>REAL INSTANT FOODS &middot; AI ERP System</footer>
 </div>
 
+<div id="editLogModal" class="modal">
+    <div class="modal-content">
+        <h3>Edit Loaded Quantity</h3>
+        <form method="POST" id="editLogForm" action="/dispatch/edit/0">
+            <input type="number" name="loaded_qty" id="editQtyInput" placeholder="Quantity" required>
+            <button type="submit" class="btn btn-block" style="margin-top:8px;">Save</button>
+        </form>
+        <button class="btn btn-outline btn-block" style="margin-top:8px;" onclick="document.getElementById('editLogModal').style.display='none'">Cancel</button>
+    </div>
+</div>
+
 <div id="scanModal" class="modal">
     <div class="modal-content">
-        <h3>How many bags were loaded?</h3>
+        <h3>Item Scanned</h3>
+        <div id="scannedItemInfo" style="background:rgba(255,255,255,0.04); border-radius:10px; padding:14px; margin:12px 0; text-align:left;">
+            <div style="font-size:12px; color:var(--text-muted); font-weight:600;">ITEM</div>
+            <div id="scannedItemName" style="font-weight:700; font-size:15px; margin-bottom:8px;">—</div>
+            <div style="font-size:12px; color:var(--text-muted); font-weight:600;">WEIGHT</div>
+            <div id="scannedItemWeight" style="font-weight:700; font-size:15px;">—</div>
+        </div>
+        <label style="text-align:left;">How many bags were loaded?</label>
         <input type="number" id="qtyInput" placeholder="Quantity" value="1">
         <button class="btn btn-block" onclick="submitQty()">Confirm Load</button>
     </div>
@@ -341,7 +365,24 @@ DASHBOARD_HTML = STYLE_BLOCK + """
             scanner.stop();
             reader.style.display = 'none';
             lastBarcode = data;
+            document.getElementById('scannedItemName').textContent = 'Looking up…';
+            document.getElementById('scannedItemWeight').textContent = '—';
             document.getElementById('scanModal').style.display = 'flex';
+            fetch('/lookup_barcode?barcode=' + encodeURIComponent(data))
+                .then(res => res.json())
+                .then(info => {
+                    if (info.found) {
+                        document.getElementById('scannedItemName').textContent = info.item_name;
+                        document.getElementById('scannedItemWeight').textContent = info.weight || 'Not specified';
+                    } else {
+                        document.getElementById('scannedItemName').textContent = 'Barcode not found in any PO';
+                        document.getElementById('scannedItemWeight').textContent = '—';
+                    }
+                })
+                .catch(() => {
+                    document.getElementById('scannedItemName').textContent = 'Could not look up item';
+                    document.getElementById('scannedItemWeight').textContent = '—';
+                });
         });
     }
     function submitQty() {
@@ -351,6 +392,11 @@ DASHBOARD_HTML = STYLE_BLOCK + """
             body: 'barcode=' + encodeURIComponent(lastBarcode) + '&qty=' + qty,
             headers: {'Content-Type': 'application/x-www-form-urlencoded'}
         }).then(() => location.reload());
+    }
+    function openEditLog(logId, currentQty) {
+        document.getElementById('editLogForm').action = '/dispatch/edit/' + logId;
+        document.getElementById('editQtyInput').value = currentQty;
+        document.getElementById('editLogModal').style.display = 'flex';
     }
 </script>
 </body>
@@ -479,7 +525,7 @@ def home():
     cursor = conn.cursor()
     cursor.execute('SELECT DISTINCT po_number FROM po_items')
     po_list = cursor.fetchall()
-    cursor.execute('SELECT id, po_number, vehicle_no, location, product_name, SUM(loaded_qty), timestamp FROM dispatch_log GROUP BY product_name, po_number, vehicle_no, location ORDER BY id DESC')
+    cursor.execute('SELECT id, po_number, vehicle_no, location, product_name, loaded_qty, timestamp FROM dispatch_log ORDER BY id DESC LIMIT 200')
     logs = cursor.fetchall()
     cursor.execute('SELECT COALESCE(SUM(loaded_qty), 0) FROM dispatch_log')
     total_loaded = cursor.fetchone()[0]
@@ -639,6 +685,19 @@ def start_session():
     session['cur_location'] = request.form.get('location', '').strip()
     return redirect('/')
 
+@app.route('/lookup_barcode')
+def lookup_barcode():
+    if not session.get('logged_in'): return {'found': False}, 401
+    barcode = request.args.get('barcode', '').strip()
+    conn = sqlite3.connect('factory.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT item_name, weight FROM po_items WHERE barcode = ? LIMIT 1', (barcode,))
+    item = cursor.fetchone()
+    conn.close()
+    if item:
+        return {'found': True, 'item_name': item[0], 'weight': item[1]}
+    return {'found': False}
+
 @app.route('/process_scan', methods=['POST'])
 def process_scan():
     barcode = request.form['barcode'].strip()
@@ -657,6 +716,31 @@ def process_scan():
         conn.commit()
     conn.close()
     return '', 200
+
+@app.route('/dispatch/edit/<int:log_id>', methods=['POST'])
+def dispatch_edit(log_id):
+    if not session.get('logged_in'): return redirect('/login')
+    new_qty = request.form.get('loaded_qty', '').strip()
+    try:
+        new_qty = int(float(new_qty))
+    except ValueError:
+        return redirect('/')
+    conn = sqlite3.connect('factory.db')
+    cursor = conn.cursor()
+    cursor.execute('UPDATE dispatch_log SET loaded_qty = ? WHERE id = ?', (new_qty, log_id))
+    conn.commit()
+    conn.close()
+    return redirect('/')
+
+@app.route('/dispatch/delete/<int:log_id>', methods=['POST'])
+def dispatch_delete(log_id):
+    if not session.get('logged_in'): return redirect('/login')
+    conn = sqlite3.connect('factory.db')
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM dispatch_log WHERE id = ?', (log_id,))
+    conn.commit()
+    conn.close()
+    return redirect('/')
 
 @app.route('/export_csv')
 def export_csv():
@@ -679,11 +763,8 @@ def export_csv():
     )
 
 def calculate_qty(weight, master_units):
-    w = weight.lower().strip()
-    units = int(master_units)
-    if "1kg" in w: return units * 25
-    elif "500g" in w: return units * 50
-    return units
+    # Quantity entered on scan is the direct bag/unit count — no multiplier applied.
+    return int(master_units)
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
@@ -702,3 +783,4 @@ def logout():
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
+    
