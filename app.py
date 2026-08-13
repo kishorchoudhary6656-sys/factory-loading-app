@@ -276,6 +276,11 @@ def logout():
     session.pop('logged_in', None)
     return redirect('/')
 
+# Google Search Console Verification Route
+@app.route('/google123456789.html')
+def google_verify():
+    return "google-site-verification: google123456789"
+
 @app.route('/manual_barcode', methods=['POST'])
 def manual_barcode():
     if not session.get('logged_in'): return redirect('/')
@@ -354,7 +359,6 @@ def upload_file():
                     ean = row.get('EAN', '').strip()
                     
                     if po_no and desc:
-                        # वजन या साइज़ निकालने के लिए SkuDesc का उपयोग करें
                         cursor.execute('SELECT id FROM po_items WHERE po_number = ? AND item_name = ?', (po_no, desc))
                         if not cursor.fetchone():
                             cursor.execute('INSERT INTO po_items (po_number, item_name, weight, ordered_qty, barcode) VALUES (?, ?, ?, ?, ?)',
