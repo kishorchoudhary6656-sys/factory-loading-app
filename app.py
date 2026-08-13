@@ -1,9 +1,9 @@
-from flask import Flask, render_template_string, request, redirect, session
+from flask import Flask, render_template_string, request, redirect, session, Response
 import sqlite3, csv, io
 from datetime import datetime
 
 app = Flask(__name__)
-app.secret_key = 'real_instant_foods_final_all_in_one'
+app.secret_key = 'real_instant_foods_final_2026'
 
 def init_db():
     conn = sqlite3.connect('factory.db')
@@ -14,70 +14,439 @@ def init_db():
     conn.close()
 init_db()
 
-DASHBOARD_HTML = """
-<!DOCTYPE html>
-<html lang="hi"><head><meta charset="UTF-8">
-<title>REAL INSTANT FOODS | ERP</title>
-<script src="https://unpkg.com/html5-qrcode"></script>
+# ---------------------------------------------------------------------------
+# Shared design system (plain CSS - no Jinja braces used, safe to concatenate)
+# ---------------------------------------------------------------------------
+STYLE_BLOCK = """
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <style>
-    :root { --primary: #2563eb; --bg: #020617; --card: #1e293b; --text: #f8fafc; }
-    body { font-family: 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); padding: 20px; }
-    .card { background: var(--card); padding: 20px; border-radius: 15px; margin-bottom: 20px; border: 1px solid #334155; }
-    input, select, button { width: 100%; padding: 12px; margin: 8px 0; border-radius: 8px; border: none; background: #334155; color: white; }
-    button { background: var(--primary); font-weight: bold; cursor: pointer; }
-    .modal { display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.8); justify-content:center; align-items:center; }
-    .modal-content { background:var(--card); padding:20px; border-radius:15px; width:300px; text-align:center; }
-    table { width: 100%; border-collapse: collapse; margin-top: 20px; }
-    th, td { padding: 12px; border-bottom: 1px solid #475569; text-align: left; }
-</style></head>
-<body>
-    <h1 style="text-align:center; color:var(--primary);">REAL INSTANT FOODS | DISPATCH ERP</h1>
-    <div class="card">
-        <h3>⚡ स्मार्ट AI स्कैनर</h3>
-        <div id="reader" style="width:100%; display:none;"></div>
-        <button onclick="startScanner()">Start AI Scan</button>
+    :root {
+        --primary: #3b82f6;
+        --primary-dark: #2563eb;
+        --accent: #8b5cf6;
+        --bg: #0b1120;
+        --bg-glow: radial-gradient(circle at 15% 0%, rgba(59,130,246,0.16), transparent 45%),
+                   radial-gradient(circle at 85% 20%, rgba(139,92,246,0.14), transparent 45%);
+        --card: rgba(30,41,59,0.65);
+        --card-solid: #1e293b;
+        --card-alt: #263349;
+        --border: rgba(148,163,184,0.16);
+        --text: #f8fafc;
+        --text-muted: #94a3b8;
+        --success: #22c55e;
+        --warn: #f59e0b;
+        --danger: #ef4444;
+        --radius: 16px;
+    }
+    * { box-sizing: border-box; }
+    body {
+        font-family: 'Inter', system-ui, sans-serif;
+        background-color: var(--bg);
+        background-image: var(--bg-glow);
+        background-attachment: fixed;
+        color: var(--text);
+        margin: 0;
+        padding: 0 20px 60px;
+        min-height: 100vh;
+    }
+    .container { max-width: 1150px; margin: 0 auto; }
+
+    .topbar {
+        display: flex; justify-content: space-between; align-items: center;
+        padding: 22px 0 18px; flex-wrap: wrap; gap: 14px;
+    }
+    .brand { display: flex; align-items: center; gap: 13px; }
+    .brand-logo {
+        width: 46px; height: 46px; border-radius: 12px;
+        background: linear-gradient(135deg, var(--primary), var(--accent));
+        display: flex; align-items: center; justify-content: center;
+        font-weight: 800; font-size: 17px; letter-spacing: -0.5px;
+        box-shadow: 0 6px 18px rgba(59,130,246,0.35);
+    }
+    .brand h1 { font-size: 19px; margin: 0; font-weight: 700; letter-spacing: -0.2px; }
+    .brand span { font-size: 12px; color: var(--text-muted); font-weight: 500; }
+
+    .nav {
+        display: flex; gap: 6px; background: var(--card); border: 1px solid var(--border);
+        padding: 5px; border-radius: 12px; backdrop-filter: blur(12px);
+    }
+    .nav a {
+        color: var(--text-muted); text-decoration: none; padding: 9px 16px;
+        border-radius: 8px; font-size: 13.5px; font-weight: 600; transition: all 0.15s;
+    }
+    .nav a:hover { color: var(--text); background: rgba(255,255,255,0.04); }
+    .nav a.active { color: white; background: linear-gradient(135deg, var(--primary), var(--primary-dark)); }
+
+    .btn {
+        background: linear-gradient(135deg, var(--primary), var(--primary-dark));
+        color: white; font-weight: 600; border: none; border-radius: 10px;
+        padding: 12px 20px; cursor: pointer; font-size: 14px; font-family: inherit;
+        transition: transform 0.12s, box-shadow 0.12s; box-shadow: 0 4px 14px rgba(59,130,246,0.28);
+    }
+    .btn:hover { transform: translateY(-1px); box-shadow: 0 6px 20px rgba(59,130,246,0.4); }
+    .btn:active { transform: translateY(0); }
+    .btn-outline {
+        background: rgba(255,255,255,0.03); border: 1px solid var(--border); color: var(--text);
+        box-shadow: none;
+    }
+    .btn-outline:hover { background: rgba(255,255,255,0.07); box-shadow: none; }
+    .btn-danger { background: rgba(239,68,68,0.12); color: #fca5a5; border: 1px solid rgba(239,68,68,0.25); box-shadow: none; }
+    .btn-danger:hover { background: rgba(239,68,68,0.2); box-shadow: none; }
+    .btn-sm { padding: 8px 14px; font-size: 12.5px; border-radius: 8px; }
+    .btn-block { width: 100%; }
+
+    .stats-grid {
+        display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+        gap: 16px; margin-bottom: 26px;
+    }
+    .stat-card {
+        background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
+        padding: 20px; backdrop-filter: blur(12px); position: relative; overflow: hidden;
+    }
+    .stat-card::before {
+        content: ''; position: absolute; top: -30px; right: -30px; width: 90px; height: 90px;
+        border-radius: 50%; background: radial-gradient(circle, rgba(59,130,246,0.18), transparent 70%);
+    }
+    .stat-card .label { color: var(--text-muted); font-size: 12.5px; font-weight: 600; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.04em; }
+    .stat-card .value { font-size: 30px; font-weight: 800; letter-spacing: -0.5px; }
+    .stat-card .icon { font-size: 20px; margin-bottom: 10px; opacity: 0.9; }
+
+    .card {
+        background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
+        padding: 22px; margin-bottom: 22px; backdrop-filter: blur(12px);
+    }
+    .card-header {
+        display: flex; justify-content: space-between; align-items: center;
+        margin-bottom: 18px; flex-wrap: wrap; gap: 10px;
+    }
+    .card-header h2 { font-size: 15.5px; margin: 0; font-weight: 700; display: flex; align-items: center; gap: 8px; }
+
+    table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+    th {
+        text-align: left; color: var(--text-muted); font-weight: 600; font-size: 11.5px;
+        text-transform: uppercase; letter-spacing: 0.04em; padding: 10px 14px; border-bottom: 1px solid var(--border);
+    }
+    td { padding: 13px 14px; border-bottom: 1px solid var(--border); }
+    tr:last-child td { border-bottom: none; }
+    tbody tr { transition: background 0.12s; }
+    tbody tr:hover td { background: rgba(255,255,255,0.025); }
+
+    .badge {
+        display: inline-block; border-radius: 7px; padding: 4px 10px; font-size: 12px; font-weight: 700;
+    }
+    .badge-green { background: rgba(34,197,94,0.14); color: #4ade80; }
+    .badge-blue { background: rgba(59,130,246,0.14); color: #60a5fa; }
+    .badge-amber { background: rgba(245,158,11,0.14); color: #fbbf24; }
+
+    .progress-track { width: 100%; height: 8px; border-radius: 5px; background: rgba(255,255,255,0.06); overflow: hidden; margin-top: 6px; }
+    .progress-fill { height: 100%; border-radius: 5px; background: linear-gradient(90deg, var(--primary), var(--accent)); transition: width 0.3s; }
+
+    .empty-state { text-align: center; color: var(--text-muted); padding: 34px 10px; font-size: 13.5px; }
+
+    #reader { width: 100%; border-radius: var(--radius); overflow: hidden; margin-bottom: 16px; display: none; border: 1px solid var(--border); }
+
+    .modal {
+        display: none; position: fixed; inset: 0; background: rgba(5,10,20,0.82);
+        justify-content: center; align-items: center; z-index: 50; backdrop-filter: blur(4px);
+    }
+    .modal-content {
+        background: var(--card-solid); border: 1px solid var(--border); padding: 28px;
+        border-radius: var(--radius); width: 320px; max-width: 90vw; text-align: center;
+        box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+    }
+    .modal-content h3 { margin-top: 0; font-size: 16px; font-weight: 700; }
+
+    input, select {
+        width: 100%; padding: 12px 14px; margin: 8px 0; border-radius: 10px;
+        border: 1px solid var(--border); background: rgba(255,255,255,0.03); color: var(--text);
+        font-size: 14.5px; font-family: inherit; transition: border 0.15s;
+    }
+    input::placeholder { color: #64748b; }
+    input:focus, select:focus { outline: none; border-color: var(--primary); }
+    label { display: block; text-align: left; font-size: 12.5px; color: var(--text-muted); font-weight: 600; margin: 12px 0 2px; }
+
+    .form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 4px 16px; align-items: end; }
+
+    footer { text-align: center; color: var(--text-muted); font-size: 12px; margin-top: 34px; opacity: 0.7; }
+
+    @media (max-width: 640px) {
+        .topbar { flex-direction: column; align-items: flex-start; }
+        .nav { width: 100%; overflow-x: auto; }
+    }
+</style>
+"""
+
+def nav_html(active):
+    def cls(name):
+        return "active" if active == name else ""
+    return f"""
+    <div class="nav">
+        <a href="/" class="{cls('dashboard')}">Dashboard</a>
+        <a href="/pos" class="{cls('pos')}">Manage POs</a>
     </div>
+    """
+
+TOPBAR_TEMPLATE = """
+<div class="topbar">
+    <div class="brand">
+        <div class="brand-logo">RIF</div>
+        <div>
+            <h1>REAL INSTANT FOODS</h1>
+            <span>AI Dispatch &amp; Packing ERP</span>
+        </div>
+    </div>
+    __NAV__
+</div>
+"""
+
+DASHBOARD_HTML = STYLE_BLOCK + """
+<title>Dashboard | REAL INSTANT FOODS</title>
+</head>
+<body>
+<div class="container">
+""" + TOPBAR_TEMPLATE.replace("__NAV__", nav_html('dashboard')) + """
+    <div class="stats-grid">
+        <div class="stat-card">
+            <div class="icon">📦</div>
+            <div class="label">Active POs</div>
+            <div class="value">{{ po_list|length }}</div>
+        </div>
+        <div class="stat-card">
+            <div class="icon">🚚</div>
+            <div class="label">Dispatch Entries</div>
+            <div class="value">{{ logs|length }}</div>
+        </div>
+        <div class="stat-card">
+            <div class="icon">✅</div>
+            <div class="label">Total Bags Loaded</div>
+            <div class="value">{{ total_loaded }}</div>
+        </div>
+    </div>
+
+    <div id="reader"></div>
+
     <div class="card">
-        <h3>📦 PO लोड करें & डिस्पैच एंट्री</h3>
-        <form action="/load_po" method="POST">
-            <select name="po_number">{% for po in po_list %}<option value="{{ po[0] }}">{{ po[0] }}</option>{% endfor %}</select>
-            <input type="text" name="vehicle_no" placeholder="Vehicle Number" required>
-            <input type="text" name="location" placeholder="Location" required>
-            <button type="submit">Load PO</button>
+        <div class="card-header">
+            <h2>🧾 Active Dispatch Session</h2>
+            {% if session_set %}
+            <button class="btn btn-outline btn-sm" onclick="document.getElementById('sessionModal').style.display='flex'">Change</button>
+            {% endif %}
+        </div>
+        {% if session_set %}
+        <div style="display:flex; gap:28px; flex-wrap:wrap; margin-bottom:16px;">
+            <div><div style="color:var(--text-muted); font-size:12px; font-weight:600; margin-bottom:3px;">PO NUMBER</div><div style="font-weight:700; font-size:15px;">{{ cur_po }}</div></div>
+            <div><div style="color:var(--text-muted); font-size:12px; font-weight:600; margin-bottom:3px;">VEHICLE NO.</div><div style="font-weight:700; font-size:15px;">{{ cur_vehicle }}</div></div>
+            <div><div style="color:var(--text-muted); font-size:12px; font-weight:600; margin-bottom:3px;">LOCATION</div><div style="font-weight:700; font-size:15px;">{{ cur_location }}</div></div>
+        </div>
+        <button class="btn" onclick="startScanner()">⚡ Start AI Scan</button>
+        {% else %}
+        <div class="empty-state" style="padding-bottom:10px;">Scan shuru karne se pehle PO, vehicle aur location set karo.</div>
+        <button class="btn" onclick="document.getElementById('sessionModal').style.display='flex'">Set Session &amp; Start</button>
+        {% endif %}
+    </div>
+
+    <div class="card">
+        <div class="card-header">
+            <h2>📊 PO Progress</h2>
+        </div>
+        {% if po_progress|length > 0 %}
+        {% for p in po_progress %}
+        <div style="margin-bottom:16px;">
+            <div style="display:flex; justify-content:space-between; font-size:13.5px; margin-bottom:2px;">
+                <span style="font-weight:600;">{{ p.po_number }}</span>
+                <span style="color:var(--text-muted);">{{ p.dispatched }} / {{ p.ordered }} bags</span>
+            </div>
+            <div class="progress-track"><div class="progress-fill" style="width:{{ p.percent }}%;"></div></div>
+        </div>
+        {% endfor %}
+        {% else %}
+        <div class="empty-state">Koi PO items add nahi hue hain abhi.</div>
+        {% endif %}
+    </div>
+
+    <div class="card">
+        <div class="card-header">
+            <h2>🚚 Dispatch Log</h2>
+            <a href="/export_csv" class="btn btn-outline btn-sm" style="text-decoration:none;">⬇ Export CSV</a>
+        </div>
+        {% if logs|length > 0 %}
+        <table>
+            <thead><tr>
+                <th>PO Number</th><th>Vehicle No.</th><th>Location</th><th>Product</th><th>Qty Loaded</th><th>Time</th>
+            </tr></thead>
+            <tbody>
+            {% for log in logs %}
+            <tr>
+                <td>{{ log[1] or '—' }}</td>
+                <td>{{ log[2] or '—' }}</td>
+                <td>{{ log[3] or '—' }}</td>
+                <td>{{ log[4] }}</td>
+                <td><span class="badge badge-green">{{ log[5] }}</span></td>
+                <td style="color:var(--text-muted);">{{ log[6] }}</td>
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <div class="empty-state">Abhi tak koi dispatch entry nahi hui.</div>
+        {% endif %}
+    </div>
+
+    <footer>REAL INSTANT FOODS &middot; AI ERP System</footer>
+</div>
+
+<div id="scanModal" class="modal">
+    <div class="modal-content">
+        <h3>Kitne bags load kiye?</h3>
+        <input type="number" id="qtyInput" placeholder="Quantity" value="1">
+        <button class="btn btn-block" onclick="submitQty()">Confirm Load</button>
+    </div>
+</div>
+
+<div id="sessionModal" class="modal" style="{% if not session_set %}display:flex;{% endif %}">
+    <div class="modal-content">
+        <h3>Dispatch Session Set Karo</h3>
+        <form method="POST" action="/start_session">
+            <select name="po_number" required>
+                <option value="" disabled selected>PO Number chuno</option>
+                {% for po in po_list %}
+                <option value="{{ po[0] }}">{{ po[0] }}</option>
+                {% endfor %}
+            </select>
+            <input type="text" name="vehicle_no" placeholder="Vehicle Number (e.g. KA-01-AB-1234)" required>
+            <input type="text" name="location" placeholder="Location / Destination" required>
+            <button type="submit" class="btn btn-block" style="margin-top:8px;">Start Scanning</button>
+        </form>
+        {% if session_set %}
+        <button class="btn btn-outline btn-block" style="margin-top:8px;" onclick="document.getElementById('sessionModal').style.display='none'">Cancel</button>
+        {% endif %}
+    </div>
+</div>
+
+<script src="https://unpkg.com/html5-qrcode"></script>
+<script>
+    let lastBarcode = "";
+    function startScanner() {
+        const reader = document.getElementById('reader');
+        reader.style.display = 'block';
+        const scanner = new Html5Qrcode("reader");
+        scanner.start({facingMode: "environment"}, {fps: 30, qrbox: 200}, (data) => {
+            scanner.stop();
+            reader.style.display = 'none';
+            lastBarcode = data;
+            document.getElementById('scanModal').style.display = 'flex';
+        });
+    }
+    function submitQty() {
+        let qty = document.getElementById('qtyInput').value;
+        fetch('/process_scan', {
+            method: 'POST',
+            body: 'barcode=' + encodeURIComponent(lastBarcode) + '&qty=' + qty,
+            headers: {'Content-Type': 'application/x-www-form-urlencoded'}
+        }).then(() => location.reload());
+    }
+</script>
+</body>
+</html>
+"""
+
+POS_HTML = STYLE_BLOCK + """
+<title>Manage POs | REAL INSTANT FOODS</title>
+</head>
+<body>
+<div class="container">
+""" + TOPBAR_TEMPLATE.replace("__NAV__", nav_html('pos')) + """
+    <div class="card">
+        <div class="card-header">
+            <h2>➕ Naya PO Item Add Karo</h2>
+        </div>
+        <form method="POST" action="/pos/add">
+            <div class="form-grid">
+                <div>
+                    <label>PO Number</label>
+                    <input type="text" name="po_number" placeholder="e.g. PO-2026-014" required>
+                </div>
+                <div>
+                    <label>Item Name</label>
+                    <input type="text" name="item_name" placeholder="e.g. Instant Noodles" required>
+                </div>
+                <div>
+                    <label>Weight</label>
+                    <input type="text" name="weight" placeholder="e.g. 1kg or 500g" required>
+                </div>
+                <div>
+                    <label>Ordered Quantity (bags)</label>
+                    <input type="number" name="ordered_qty" placeholder="e.g. 500" required>
+                </div>
+                <div>
+                    <label>Barcode</label>
+                    <input type="text" name="barcode" placeholder="Scan or type barcode" required>
+                </div>
+            </div>
+            <button type="submit" class="btn" style="margin-top:14px;">Add PO Item</button>
         </form>
     </div>
+
     <div class="card">
-        <h3>📋 डिस्पैच हिस्ट्री</h3>
+        <div class="card-header">
+            <h2>📋 All PO Items</h2>
+        </div>
+        {% if items|length > 0 %}
         <table>
-            <tr><th>PO</th><th>Vehicle</th><th>Product</th><th>Qty</th></tr>
-            {% for log in logs %}<tr><td>{{ log[1] }}</td><td>{{ log[2] }}</td><td>{{ log[4] }}</td><td>{{ log[5] }} pcs</td></tr>{% endfor %}
+            <thead><tr>
+                <th>PO Number</th><th>Item</th><th>Weight</th><th>Ordered Qty</th><th>Barcode</th><th></th>
+            </tr></thead>
+            <tbody>
+            {% for it in items %}
+            <tr>
+                <td style="font-weight:600;">{{ it[1] }}</td>
+                <td>{{ it[2] }}</td>
+                <td><span class="badge badge-blue">{{ it[3] }}</span></td>
+                <td>{{ it[4] }}</td>
+                <td style="color:var(--text-muted); font-family:monospace;">{{ it[5] }}</td>
+                <td>
+                    <form method="POST" action="/pos/delete/{{ it[0] }}" onsubmit="return confirm('Yeh item delete karna hai?');">
+                        <button type="submit" class="btn btn-danger btn-sm">Delete</button>
+                    </form>
+                </td>
+            </tr>
+            {% endfor %}
+            </tbody>
         </table>
+        {% else %}
+        <div class="empty-state">Koi PO item add nahi hua hai abhi. Upar form se add karo.</div>
+        {% endif %}
     </div>
 
-    <div id="scanModal" class="modal"><div class="modal-content">
-        <h3 id="pName">...</h3>
-        <input type="number" id="qtyIn" value="1">
-        <button onclick="submitQty()">Confirm</button>
-    </div></div>
+    <footer>REAL INSTANT FOODS &middot; AI ERP System</footer>
+</div>
+</body>
+</html>
+"""
 
-    <script>
-        let bCode = "";
-        function startScanner() {
-            document.getElementById('reader').style.display='block';
-            const s = new Html5Qrcode("reader");
-            s.start({facingMode: "environment"}, {fps: 20, qrbox: 200}, (data) => {
-                s.stop(); bCode = data;
-                fetch('/get_info?b='+data).then(res=>res.json()).then(info => {
-                    document.getElementById('pName').innerText = info.name;
-                    document.getElementById('scanModal').style.display='flex';
-                });
-            });
-        }
-        function submitQty() {
-            fetch('/process', {method:'POST', body:'b='+bCode+'&q='+document.getElementById('qtyIn').value, headers:{'Content-Type':'application/x-www-form-urlencoded'}}).then(() => location.reload());
-        }
-    </script>
-</body></html>
+LOGIN_HTML = STYLE_BLOCK + """
+<title>Login | REAL INSTANT FOODS</title>
+</head>
+<body>
+<div style="display:flex; justify-content:center; align-items:center; min-height:100vh;">
+    <div class="card" style="width:320px; text-align:center; padding:36px 28px;">
+        <div class="brand-logo" style="margin:0 auto 16px;">RIF</div>
+        <h2 style="margin:0 0 4px; font-size:19px;">REAL INSTANT FOODS</h2>
+        <div style="color:var(--text-muted); font-size:12.5px; margin-bottom:20px;">AI Dispatch &amp; Packing ERP</div>
+        <form method="POST">
+            <input type="password" name="password" placeholder="Password" autofocus>
+            <button type="submit" class="btn btn-block" style="margin-top:10px;">Login</button>
+        </form>
+        {% if error %}
+        <div style="color:#fca5a5; font-size:12.5px; margin-top:12px;">Galat password, dobara try karo.</div>
+        {% endif %}
+    </div>
+</div>
+</body>
+</html>
 """
 
 @app.route('/')
@@ -87,52 +456,141 @@ def home():
     cursor = conn.cursor()
     cursor.execute('SELECT DISTINCT po_number FROM po_items')
     po_list = cursor.fetchall()
-    cursor.execute('SELECT * FROM dispatch_log ORDER BY id DESC')
+    cursor.execute('SELECT id, po_number, vehicle_no, location, product_name, SUM(loaded_qty), timestamp FROM dispatch_log GROUP BY product_name, po_number, vehicle_no, location ORDER BY id DESC')
     logs = cursor.fetchall()
+    cursor.execute('SELECT COALESCE(SUM(loaded_qty), 0) FROM dispatch_log')
+    total_loaded = cursor.fetchone()[0]
+
+    cursor.execute('SELECT po_number, SUM(ordered_qty) FROM po_items GROUP BY po_number')
+    ordered_map = dict(cursor.fetchall())
+    cursor.execute('SELECT po_number, SUM(loaded_qty) FROM dispatch_log GROUP BY po_number')
+    dispatched_map = dict(cursor.fetchall())
     conn.close()
-    return render_template_string(DASHBOARD_HTML, po_list=po_list, logs=logs)
 
-@app.route('/get_info')
-def get_info():
-    b = request.args.get('b')
-    conn = sqlite3.connect('factory.db')
-    c = conn.cursor()
-    c.execute('SELECT item_name FROM po_items WHERE barcode = ?', (b,))
-    res = c.fetchone()
-    return {"name": res[0] if res else "Unknown"}
+    po_progress = []
+    for po_number, ordered in ordered_map.items():
+        ordered = ordered or 0
+        dispatched = dispatched_map.get(po_number, 0) or 0
+        percent = min(100, round((dispatched / ordered) * 100)) if ordered else 0
+        po_progress.append({'po_number': po_number, 'ordered': ordered, 'dispatched': dispatched, 'percent': percent})
 
-@app.route('/process', methods=['POST'])
-def process():
-    b = request.form['b']
-    q = int(request.form['q'])
+    session_set = bool(session.get('cur_po') and session.get('cur_vehicle') and session.get('cur_location'))
+    return render_template_string(
+        DASHBOARD_HTML,
+        po_list=po_list,
+        logs=logs,
+        total_loaded=total_loaded,
+        po_progress=po_progress,
+        session_set=session_set,
+        cur_po=session.get('cur_po'),
+        cur_vehicle=session.get('cur_vehicle'),
+        cur_location=session.get('cur_location')
+    )
+
+@app.route('/pos')
+def pos_page():
+    if not session.get('logged_in'): return redirect('/login')
     conn = sqlite3.connect('factory.db')
-    c = conn.cursor()
-    c.execute('SELECT item_name, weight FROM po_items WHERE barcode = ?', (b,))
-    i = c.fetchone()
-    if i:
-        mult = 25 if "1kg" in i[1] else 50 if "500g" in i[1] else 1
-        c.execute('INSERT INTO dispatch_log (po_number, product_name, loaded_qty, timestamp) VALUES (?, ?, ?, ?)', ("Scan", f"{i[0]} ({i[1]})", q*mult, datetime.now().strftime("%H:%M")))
+    cursor = conn.cursor()
+    cursor.execute('SELECT id, po_number, item_name, weight, ordered_qty, barcode FROM po_items ORDER BY id DESC')
+    items = cursor.fetchall()
+    conn.close()
+    return render_template_string(POS_HTML, items=items)
+
+@app.route('/pos/add', methods=['POST'])
+def pos_add():
+    if not session.get('logged_in'): return redirect('/login')
+    po_number = request.form.get('po_number', '').strip()
+    item_name = request.form.get('item_name', '').strip()
+    weight = request.form.get('weight', '').strip()
+    ordered_qty = request.form.get('ordered_qty', '').strip() or 0
+    barcode = request.form.get('barcode', '').strip()
+    conn = sqlite3.connect('factory.db')
+    cursor = conn.cursor()
+    cursor.execute('INSERT INTO po_items (po_number, item_name, weight, ordered_qty, barcode) VALUES (?, ?, ?, ?, ?)',
+                   (po_number, item_name, weight, int(ordered_qty), barcode))
     conn.commit()
+    conn.close()
+    return redirect('/pos')
+
+@app.route('/pos/delete/<int:item_id>', methods=['POST'])
+def pos_delete(item_id):
+    if not session.get('logged_in'): return redirect('/login')
+    conn = sqlite3.connect('factory.db')
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM po_items WHERE id = ?', (item_id,))
+    conn.commit()
+    conn.close()
+    return redirect('/pos')
+
+@app.route('/start_session', methods=['POST'])
+def start_session():
+    if not session.get('logged_in'): return redirect('/login')
+    session['cur_po'] = request.form.get('po_number', '').strip()
+    session['cur_vehicle'] = request.form.get('vehicle_no', '').strip()
+    session['cur_location'] = request.form.get('location', '').strip()
+    return redirect('/')
+
+@app.route('/process_scan', methods=['POST'])
+def process_scan():
+    barcode = request.form['barcode'].strip()
+    m_units = request.form['qty']
+    po_number = session.get('cur_po', 'Unknown')
+    vehicle_no = session.get('cur_vehicle', 'Unknown')
+    location = session.get('cur_location', 'Unknown')
+    conn = sqlite3.connect('factory.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT item_name, weight FROM po_items WHERE barcode = ?', (barcode,))
+    item = cursor.fetchone()
+    if item:
+        total_qty = calculate_qty(item[1], m_units)
+        cursor.execute('INSERT INTO dispatch_log (po_number, vehicle_no, location, product_name, loaded_qty, timestamp) VALUES (?, ?, ?, ?, ?, ?)',
+                       (po_number, vehicle_no, location, f"{item[0]} ({item[1]})", total_qty, datetime.now().strftime("%H:%M")))
+        conn.commit()
     conn.close()
     return '', 200
 
-@app.route('/load_po', methods=['POST'])
-def load_po():
-    po, v, l = request.form['po_number'], request.form['vehicle_no'], request.form['location']
+@app.route('/export_csv')
+def export_csv():
+    if not session.get('logged_in'): return redirect('/login')
     conn = sqlite3.connect('factory.db')
-    c = conn.cursor()
-    c.execute('SELECT item_name, weight FROM po_items WHERE po_number = ?', (po,))
-    for i in c.fetchall():
-        c.execute('INSERT INTO dispatch_log (po_number, vehicle_no, location, product_name, loaded_qty, timestamp) VALUES (?, ?, ?, ?, 0, ?)', (po, v, l, f"{i[0]} ({i[1]})", datetime.now().strftime("%H:%M")))
-    conn.commit()
+    cursor = conn.cursor()
+    cursor.execute('SELECT po_number, vehicle_no, location, product_name, loaded_qty, timestamp FROM dispatch_log ORDER BY id DESC')
+    rows = cursor.fetchall()
     conn.close()
-    return redirect('/')
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(['PO Number', 'Vehicle No', 'Location', 'Product', 'Qty Loaded', 'Time'])
+    writer.writerows(rows)
+
+    return Response(
+        output.getvalue(),
+        mimetype='text/csv',
+        headers={'Content-Disposition': 'attachment; filename=dispatch_log.csv'}
+    )
+
+def calculate_qty(weight, master_units):
+    w = weight.lower().strip()
+    units = int(master_units)
+    if "1kg" in w: return units * 25
+    elif "500g" in w: return units * 50
+    return units
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
-    if request.method == 'POST' and request.form.get('password') == 'real@8283':
-        session['logged_in'] = True
-        return redirect('/')
-    return "<body style='background:#0f172a; padding:50px; text-align:center;'><form method='POST'><input type='password' name='password'><button>Login</button></form></body>"
+    error = False
+    if request.method == 'POST':
+        if request.form.get('password') == 'real@8283':
+            session['logged_in'] = True
+            return redirect('/')
+        error = True
+    return render_template_string(LOGIN_HTML, error=error)
 
-if __name__ == '__main__': app.run(host='0.0.0.0', port=5000)
+@app.route('/logout')
+def logout():
+    session.clear()
+    return redirect('/login')
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)
