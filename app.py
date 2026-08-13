@@ -11,6 +11,11 @@ def init_db():
     cursor = conn.cursor()
     cursor.execute('''CREATE TABLE IF NOT EXISTS po_items (id INTEGER PRIMARY KEY AUTOINCREMENT, po_number TEXT, item_name TEXT, weight TEXT, ordered_qty INTEGER, barcode TEXT)''')
     cursor.execute('''CREATE TABLE IF NOT EXISTS dispatch_log (id INTEGER PRIMARY KEY AUTOINCREMENT, po_number TEXT, vehicle_no TEXT, location TEXT, product_name TEXT, loaded_qty INTEGER, timestamp TEXT)''')
+    # Add barcode column to dispatch_log if migrating from an older schema
+    try:
+        cursor.execute('ALTER TABLE dispatch_log ADD COLUMN barcode TEXT')
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
     conn.close()
 init_db()
@@ -187,6 +192,7 @@ def nav_html(active):
     <div class="nav">
         <a href="/" class="{cls('dashboard')}">Dashboard</a>
         <a href="/pos" class="{cls('pos')}">Manage POs</a>
+        <a href="/history" class="{cls('history')}">History</a>
     </div>
     """
 
@@ -243,6 +249,10 @@ DASHBOARD_HTML = STYLE_BLOCK + """
             <div><div style="color:var(--text-muted); font-size:12px; font-weight:600; margin-bottom:3px;">LOCATION</div><div style="font-weight:700; font-size:15px;">{{ cur_location }}</div></div>
         </div>
         <button class="btn" onclick="startScanner()">⚡ Start AI Scan</button>
+        <div style="display:flex; gap:8px; margin-top:12px; align-items:center;">
+            <input type="text" id="manualBarcodeInput" placeholder="Or type barcode manually" style="margin:0;">
+            <button class="btn btn-outline" style="white-space:nowrap;" onclick="lookupManualBarcode()">Look Up</button>
+        </div>
         {% else %}
         <div class="empty-state" style="padding-bottom:10px;">Set the PO, vehicle, and location before starting a scan.</div>
         <button class="btn" onclick="document.getElementById('sessionModal').style.display='flex'">Set Session &amp; Start</button>
@@ -251,14 +261,14 @@ DASHBOARD_HTML = STYLE_BLOCK + """
 
     <div class="card">
         <div class="card-header">
-            <h2>📊 PO Progress</h2>
+            <h2>📊 Item Progress (Ordered vs Loaded)</h2>
         </div>
-        {% if po_progress|length > 0 %}
-        {% for p in po_progress %}
+        {% if item_progress|length > 0 %}
+        {% for p in item_progress %}
         <div style="margin-bottom:16px;">
-            <div style="display:flex; justify-content:space-between; font-size:13.5px; margin-bottom:2px;">
-                <span style="font-weight:600;">{{ p.po_number }}</span>
-                <span style="color:var(--text-muted);">{{ p.dispatched }} / {{ p.ordered }} bags</span>
+            <div style="display:flex; justify-content:space-between; font-size:13.5px; margin-bottom:2px; gap:10px;">
+                <span style="font-weight:600;">{{ p.item_name }} <span style="color:var(--text-muted); font-weight:500;">({{ p.po_number }})</span></span>
+                <span style="color:var(--text-muted); white-space:nowrap;">{{ p.dispatched }} / {{ p.ordered }} &middot; {{ p.pending }} pending</span>
             </div>
             <div class="progress-track"><div class="progress-fill" style="width:{{ p.percent }}%;"></div></div>
         </div>
@@ -325,9 +335,10 @@ DASHBOARD_HTML = STYLE_BLOCK + """
             <div style="font-size:12px; color:var(--text-muted); font-weight:600;">WEIGHT</div>
             <div id="scannedItemWeight" style="font-weight:700; font-size:15px;">—</div>
         </div>
-        <label style="text-align:left;">How many bags were loaded?</label>
+        <label id="qtyLabel" style="text-align:left;">How many bags were loaded?</label>
         <input type="number" id="qtyInput" placeholder="Quantity" value="1">
-        <button class="btn btn-block" onclick="submitQty()">Confirm Load</button>
+        <button class="btn btn-block" id="confirmLoadBtn" onclick="submitQty()">Confirm Load</button>
+        <button class="btn btn-outline btn-block" style="margin-top:8px;" onclick="document.getElementById('scanModal').style.display='none'">Close</button>
     </div>
 </div>
 
@@ -364,26 +375,42 @@ DASHBOARD_HTML = STYLE_BLOCK + """
         scanner.start({facingMode: "environment"}, {fps: 30, qrbox: 200}, (data) => {
             scanner.stop();
             reader.style.display = 'none';
-            lastBarcode = data;
-            document.getElementById('scannedItemName').textContent = 'Looking up…';
-            document.getElementById('scannedItemWeight').textContent = '—';
-            document.getElementById('scanModal').style.display = 'flex';
-            fetch('/lookup_barcode?barcode=' + encodeURIComponent(data))
-                .then(res => res.json())
-                .then(info => {
-                    if (info.found) {
-                        document.getElementById('scannedItemName').textContent = info.item_name;
-                        document.getElementById('scannedItemWeight').textContent = info.weight || 'Not specified';
-                    } else {
-                        document.getElementById('scannedItemName').textContent = 'Barcode not found in any PO';
-                        document.getElementById('scannedItemWeight').textContent = '—';
-                    }
-                })
-                .catch(() => {
-                    document.getElementById('scannedItemName').textContent = 'Could not look up item';
-                    document.getElementById('scannedItemWeight').textContent = '—';
-                });
+            handleBarcode(data);
         });
+    }
+    function lookupManualBarcode() {
+        const val = document.getElementById('manualBarcodeInput').value.trim();
+        if (!val) return;
+        handleBarcode(val);
+        document.getElementById('manualBarcodeInput').value = '';
+    }
+    function handleBarcode(data) {
+        lastBarcode = data;
+        document.getElementById('scannedItemName').textContent = 'Looking up…';
+        document.getElementById('scannedItemWeight').textContent = '—';
+        document.getElementById('qtyInput').style.display = 'none';
+        document.getElementById('qtyLabel').style.display = 'none';
+        document.getElementById('confirmLoadBtn').style.display = 'none';
+        document.getElementById('scanModal').style.display = 'flex';
+        fetch('/lookup_barcode?barcode=' + encodeURIComponent(data))
+            .then(res => res.json())
+            .then(info => {
+                if (info.found) {
+                    document.getElementById('scannedItemName').textContent = info.item_name;
+                    document.getElementById('scannedItemWeight').textContent = info.weight || 'Not specified';
+                    document.getElementById('qtyInput').style.display = 'block';
+                    document.getElementById('qtyLabel').style.display = 'block';
+                    document.getElementById('confirmLoadBtn').style.display = 'block';
+                    document.getElementById('qtyInput').value = 1;
+                } else {
+                    document.getElementById('scannedItemName').textContent = 'Barcode not found in any PO';
+                    document.getElementById('scannedItemWeight').textContent = '—';
+                }
+            })
+            .catch(() => {
+                document.getElementById('scannedItemName').textContent = 'Could not look up item';
+                document.getElementById('scannedItemWeight').textContent = '—';
+            });
     }
     function submitQty() {
         let qty = document.getElementById('qtyInput').value;
@@ -496,6 +523,80 @@ POS_HTML = STYLE_BLOCK + """
 </html>
 """
 
+HISTORY_HTML = STYLE_BLOCK + """
+<title>History | REAL INSTANT FOODS</title>
+</head>
+<body>
+<div class="container">
+""" + TOPBAR_TEMPLATE.replace("__NAV__", nav_html('history')) + """
+    <div class="card">
+        <div class="card-header">
+            <h2>🔍 Search Dispatch History</h2>
+        </div>
+        <form method="GET" action="/history">
+            <div style="display:flex; gap:10px; flex-wrap:wrap;">
+                <input type="text" name="po" placeholder="Enter PO Number" value="{{ search_po or '' }}" style="flex:1; min-width:200px; margin:0;">
+                <button type="submit" class="btn" style="white-space:nowrap;">Search</button>
+                {% if search_po %}
+                <a href="/history" class="btn btn-outline" style="text-decoration:none; white-space:nowrap;">Clear</a>
+                {% endif %}
+            </div>
+        </form>
+    </div>
+
+    {% if search_po %}
+    <div class="stats-grid">
+        <div class="stat-card">
+            <div class="icon">📦</div>
+            <div class="label">PO Number</div>
+            <div class="value" style="font-size:20px;">{{ search_po }}</div>
+        </div>
+        <div class="stat-card">
+            <div class="icon">🚚</div>
+            <div class="label">Total Trips / Vehicles</div>
+            <div class="value">{{ vehicle_count }}</div>
+        </div>
+        <div class="stat-card">
+            <div class="icon">✅</div>
+            <div class="label">Total Items Loaded</div>
+            <div class="value">{{ total_loaded }}</div>
+        </div>
+    </div>
+    {% endif %}
+
+    <div class="card">
+        <div class="card-header">
+            <h2>📋 {% if search_po %}Records for {{ search_po }}{% else %}All Dispatch Records{% endif %}</h2>
+        </div>
+        {% if records|length > 0 %}
+        <table>
+            <thead><tr>
+                <th>PO Number</th><th>Vehicle No.</th><th>Location</th><th>Product</th><th>Qty Loaded</th><th>Time</th>
+            </tr></thead>
+            <tbody>
+            {% for r in records %}
+            <tr>
+                <td style="font-weight:600;">{{ r[0] or '—' }}</td>
+                <td>{{ r[1] or '—' }}</td>
+                <td>{{ r[2] or '—' }}</td>
+                <td>{{ r[3] }}</td>
+                <td><span class="badge badge-green">{{ r[4] }}</span></td>
+                <td style="color:var(--text-muted);">{{ r[5] }}</td>
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <div class="empty-state">{% if search_po %}No dispatch records found for this PO.{% else %}No dispatch history yet.{% endif %}</div>
+        {% endif %}
+    </div>
+
+    <footer>REAL INSTANT FOODS &middot; AI ERP System</footer>
+</div>
+</body>
+</html>
+"""
+
 LOGIN_HTML = STYLE_BLOCK + """
 <title>Login | REAL INSTANT FOODS</title>
 </head>
@@ -530,18 +631,24 @@ def home():
     cursor.execute('SELECT COALESCE(SUM(loaded_qty), 0) FROM dispatch_log')
     total_loaded = cursor.fetchone()[0]
 
-    cursor.execute('SELECT po_number, SUM(ordered_qty) FROM po_items GROUP BY po_number')
-    ordered_map = dict(cursor.fetchall())
-    cursor.execute('SELECT po_number, SUM(loaded_qty) FROM dispatch_log GROUP BY po_number')
-    dispatched_map = dict(cursor.fetchall())
+    # Item-level progress: ordered vs dispatched per (po_number, barcode)
+    cursor.execute('SELECT po_number, barcode, item_name, weight, SUM(ordered_qty) FROM po_items GROUP BY po_number, barcode')
+    po_item_rows = cursor.fetchall()
+    cursor.execute('SELECT po_number, barcode, SUM(loaded_qty) FROM dispatch_log GROUP BY po_number, barcode')
+    dispatched_map = {(r[0], r[1]): (r[2] or 0) for r in cursor.fetchall()}
     conn.close()
 
-    po_progress = []
-    for po_number, ordered in ordered_map.items():
+    item_progress = []
+    for po_number, barcode, item_name, weight, ordered in po_item_rows:
         ordered = ordered or 0
-        dispatched = dispatched_map.get(po_number, 0) or 0
+        dispatched = dispatched_map.get((po_number, barcode), 0)
+        pending = max(ordered - dispatched, 0)
         percent = min(100, round((dispatched / ordered) * 100)) if ordered else 0
-        po_progress.append({'po_number': po_number, 'ordered': ordered, 'dispatched': dispatched, 'percent': percent})
+        label = f"{item_name} ({weight})" if weight else item_name
+        item_progress.append({
+            'po_number': po_number, 'item_name': label,
+            'ordered': ordered, 'dispatched': dispatched, 'pending': pending, 'percent': percent
+        })
 
     session_set = bool(session.get('cur_po') and session.get('cur_vehicle') and session.get('cur_location'))
     return render_template_string(
@@ -549,11 +656,35 @@ def home():
         po_list=po_list,
         logs=logs,
         total_loaded=total_loaded,
-        po_progress=po_progress,
+        item_progress=item_progress,
         session_set=session_set,
         cur_po=session.get('cur_po'),
         cur_vehicle=session.get('cur_vehicle'),
         cur_location=session.get('cur_location')
+    )
+
+@app.route('/history')
+def history_page():
+    if not session.get('logged_in'): return redirect('/login')
+    search_po = request.args.get('po', '').strip()
+    conn = sqlite3.connect('factory.db')
+    cursor = conn.cursor()
+    if search_po:
+        cursor.execute('SELECT po_number, vehicle_no, location, product_name, loaded_qty, timestamp FROM dispatch_log WHERE po_number LIKE ? ORDER BY id DESC', (f'%{search_po}%',))
+    else:
+        cursor.execute('SELECT po_number, vehicle_no, location, product_name, loaded_qty, timestamp FROM dispatch_log ORDER BY id DESC LIMIT 200')
+    records = cursor.fetchall()
+    conn.close()
+
+    vehicle_count = len(set(r[1] for r in records if r[1]))
+    total_loaded = sum(r[4] or 0 for r in records)
+
+    return render_template_string(
+        HISTORY_HTML,
+        records=records,
+        search_po=search_po,
+        vehicle_count=vehicle_count,
+        total_loaded=total_loaded
     )
 
 @app.route('/pos')
@@ -711,11 +842,13 @@ def process_scan():
     item = cursor.fetchone()
     if item:
         total_qty = calculate_qty(item[1], m_units)
-        cursor.execute('INSERT INTO dispatch_log (po_number, vehicle_no, location, product_name, loaded_qty, timestamp) VALUES (?, ?, ?, ?, ?, ?)',
-                       (po_number, vehicle_no, location, f"{item[0]} ({item[1]})", total_qty, datetime.now().strftime("%H:%M")))
+        cursor.execute('INSERT INTO dispatch_log (po_number, vehicle_no, location, product_name, loaded_qty, timestamp, barcode) VALUES (?, ?, ?, ?, ?, ?, ?)',
+                       (po_number, vehicle_no, location, f"{item[0]} ({item[1]})", total_qty, datetime.now().strftime("%H:%M"), barcode))
         conn.commit()
+        conn.close()
+        return {'ok': True}, 200
     conn.close()
-    return '', 200
+    return {'ok': False, 'error': 'barcode not found'}, 404
 
 @app.route('/dispatch/edit/<int:log_id>', methods=['POST'])
 def dispatch_edit(log_id):
@@ -783,4 +916,3 @@ def logout():
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
-    
