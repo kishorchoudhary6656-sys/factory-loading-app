@@ -2,7 +2,6 @@ from flask import Flask, render_template_string, request, redirect, session
 import sqlite3
 import csv
 import io
-import random
 
 app = Flask(__name__)
 app.secret_key = 'factory_secret_key_secure_999'
@@ -37,7 +36,7 @@ def init_db():
     cursor.execute('SELECT COUNT(*) FROM po_items')
     if cursor.fetchone()[0] == 0:
         sample_data = [
-            ("P5229701", "Daily Good Raw Peanut / Singdana", "500g", 1620, "8909177015591"),
+            ("P5229701", "RAW PEANUT / SINGDANA", "500g", 1620, "8909177015591"),
             ("P5229701", "Daily Good Idli Rice", "1 kg", 540, "8909177015874")
         ]
         cursor.executemany('INSERT INTO po_items (po_number, item_name, weight, ordered_qty, barcode) VALUES (?, ?, ?, ?, ?)', sample_data)
@@ -85,7 +84,7 @@ DASHBOARD_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>FactoryFlow AI ERP - Secure</title>
+    <title>FactoryFlow Pro - Advanced ERP</title>
     <script src="https://unpkg.com/html5-qrcode" type="text/javascript"></script>
     <style>
         :root { --primary: #2563eb; --secondary: #10b981; --dark: #0f172a; --bg: #f8fafc; }
@@ -94,8 +93,8 @@ DASHBOARD_TEMPLATE = """
         .navbar h1 { margin: 0; font-size: 1.5rem; font-weight: 700; display: flex; align-items: center; gap: 10px; }
         .logout-btn { background: #dc2626; color: white; padding: 0.5rem 1rem; border-radius: 8px; text-decoration: none; font-size: 0.85rem; font-weight: bold; }
         
-        .container { max-width: 1100px; margin: 2rem auto; padding: 0 1rem; }
-        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 1.5rem; margin-bottom: 2.5rem; }
+        .container { max-width: 1200px; margin: 2rem auto; padding: 0 1rem; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 1.5rem; margin-bottom: 2.5rem; }
         .card { background: white; border-radius: 16px; padding: 1.5rem; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05); border: 1px solid #e2e8f0; }
         .card-title { font-size: 1.1rem; font-weight: 700; color: var(--dark); margin-top: 0; margin-bottom: 1.2rem; }
         
@@ -104,12 +103,12 @@ DASHBOARD_TEMPLATE = """
         .btn-upload { background: linear-gradient(135deg, #f59e0b, #ea580c); }
         .btn-load { background: linear-gradient(135deg, #10b981, #059669); }
         .btn-scan { background: linear-gradient(135deg, #8b5cf6, #6d28d9); }
-        .btn-manual { background: linear-gradient(135deg, #0284c7, #0369a1); margin-top: 5px; }
+        .btn-manual { background: linear-gradient(135deg, #0284c7, #0369a1); }
         
         #reader { width: 100%; border-radius: 10px; overflow: hidden; display: none; margin-bottom: 1rem; }
         
         .table-container { background: white; border-radius: 16px; box-shadow: 0 10px 15px -3px rgba(0,0,0,0.1); border: 1px solid #e2e8f0; overflow: hidden; }
-        .table-header { padding: 1.5rem; background: #f8fafc; border-bottom: 1px solid #e2e8f0; }
+        .table-header { padding: 1.5rem; background: #f8fafc; border-bottom: 1px solid #e2e8f0; display: flex; justify-content: space-between; align-items: center; }
         .table-header h3 { margin: 0; font-size: 1.2rem; color: var(--dark); }
         
         table { width: 100%; border-collapse: collapse; text-align: left; }
@@ -122,32 +121,38 @@ DASHBOARD_TEMPLATE = """
         .loose-badge { color: #d97706; font-size: 0.85rem; background: #fef3c7; padding: 0.2rem 0.6rem; border-radius: 6px; display: inline-block; margin-top: 4px; }
         .barcode-badge { color: #475569; font-size: 0.85rem; background: #f1f5f9; padding: 0.2rem 0.5rem; border-radius: 4px; font-family: monospace; display: inline-block; margin-top: 4px; border: 1px solid #cbd5e1; }
         
-        .update-form { display: flex; gap: 0.5rem; align-items: center; justify-content: center; }
-        .update-input { width: 75px; margin: 0; padding: 0.6rem; text-align: center; font-weight: bold; }
-        .btn-update { width: auto; padding: 0.6rem 1rem; background: var(--dark); color: white; font-size: 0.85rem; border-radius: 8px; border:none; cursor:pointer; }
+        .update-form { display: flex; gap: 0.4rem; align-items: center; justify-content: center; }
+        .update-input { width: 65px; margin: 0; padding: 0.5rem; text-align: center; font-weight: bold; }
+        .btn-update { padding: 0.5rem 0.8rem; background: var(--dark); color: white; font-size: 0.8rem; border-radius: 6px; border:none; cursor:pointer; }
+        .btn-edit-qty { background: #d97706; }
     </style>
 </head>
 <body>
 
     <header class="navbar">
-        <h1>🔒 FactoryFlow AI <span style="font-weight:400; font-size:1.1rem; color:#94a3b8;">| Secure ERP</span></h1>
+        <h1>🔒 FactoryFlow Pro <span style="font-weight:400; font-size:1.1rem; color:#94a3b8;">| Smart Scanner & ERP</span></h1>
         <a href="/logout" class="logout-btn">लॉगआउट (Logout)</a>
     </header>
 
     <div class="container">
         <div class="grid">
+            <!-- हाई-स्पीड बारकोड स्कैनर -->
             <div class="card" style="border: 2px solid #8b5cf6;">
-                <h2 class="card-title" style="color: #6d28d9;">📷 बारकोड स्कैनर & मैन्युअल एंट्री</h2>
+                <h2 class="card-title" style="color: #6d28d9;">📷 सुपर फास्ट बारकोड स्कैनर</h2>
                 <div id="reader"></div>
-                <button type="button" onclick="startScanner()" class="btn btn-scan" id="scanBtn">कैमरा चालू करके स्कैन करें</button>
+                <button type="button" onclick="startScanner()" class="btn btn-scan" id="scanBtn">कैमरा चालू करें (Instant Scan)</button>
                 
-                <form action="/manual_barcode" method="POST" style="margin-top: 15px;">
-                    <input type="text" name="barcode" placeholder="या बारकोड नंबर टाइप करें" required style="margin-bottom: 5px; font-size: 0.9rem;">
-                    <button type="submit" class="btn btn-manual">टाइप करके जोड़े (+25Qty)</button>
+                <form action="/manual_scan" method="POST" style="margin-top: 15px;">
+                    <input type="text" name="barcode" placeholder="या बारकोड यहाँ टाइप/स्कôiन करें (जैसे 8909177015591)" required style="font-size: 0.9rem;">
+                    <div style="display: flex; gap: 10px;">
+                        <input type="number" name="box_size" value="50" placeholder="मास्टर बैग पीस (Box Size)" required style="margin-bottom:0;">
+                        <button type="submit" class="btn btn-manual" style="width: auto; padding: 0.8rem 1.2rem;">जोड़ें</button>
+                    </div>
                 </form>
                 <div id="scan-result" style="margin-top: 10px; font-weight: bold; color: #10b981; font-size: 0.9rem;"></div>
             </div>
 
+            <!-- PO लोड करने का सेक्शन -->
             <div class="card">
                 <h2 class="card-title">📦 पेंडिंग PO लोड करें</h2>
                 <form action="/load_po" method="POST">
@@ -161,6 +166,7 @@ DASHBOARD_TEMPLATE = """
                 </form>
             </div>
 
+            <!-- CSV फाइल अपलोड -->
             <div class="card">
                 <h2 class="card-title">📁 PO फाइल (CSV) अपलोड</h2>
                 <form action="/upload_file" method="POST" enctype="multipart/form-data">
@@ -170,21 +176,23 @@ DASHBOARD_TEMPLATE = """
             </div>
         </div>
 
+        <!-- लाइव डिस्पैच टेबल -->
         <div class="table-container">
             <div class="table-header">
-                <h3>🚛 लाइव डिस्पैच & मास्टर बैग ट्रैकिंग</h3>
+                <h3>🚛 लाइव डिस्पैच & शॉर्ट/एक्सेस मास्टर ट्रैकिंग</h3>
             </div>
             <div style="overflow-x:auto;">
                 <table>
                     <thead>
                         <tr>
                             <th>PO नंबर</th>
-                            <th>प्रोडक्ट / साइज़</th>
-                            <th>EAN / Barcode</th>
-                            <th>मास्टर बैग हिसाब</th>
+                            <th>प्रोडक्ट विवरण</th>
+                            <th>Barcode / EAN</th>
+                            <th>मास्टर बैग हिसाब (Box Size)</th>
+                            <th>कुल आर्डर (Target)</th>
                             <th>लोड हुआ</th>
-                            <th>बाकी (Pending)</th>
-                            <th style="text-align:center;">मैनुअल अपडेट</th>
+                            <th>बाकी (Short/Pending)</th>
+                            <th style="text-align:center;">शॉर्ट/एडिट कंट्रोल</th>
                         </tr>
                     </thead>
                     <tbody>
@@ -194,26 +202,36 @@ DASHBOARD_TEMPLATE = """
                             <td>{{ item[2] }}</td>
                             <td><span class="barcode-badge">{{ item[6] }}</span></td>
                             <td>
-                                {% set bags = item[3] // item[4] %}
-                                {% set loose = item[3] % item[4] %}
-                                {{ bags }} बैग्स × {{ item[4] }}pcs<br>
-                                {% if loose > 0 %} <span class="loose-badge">+ 1 लूज बैग × {{ loose }}pcs</span><br> {% endif %}
-                                <span style="color:#64748b; font-size:0.8rem;">(कुल: {{ item[3] }} pcs)</span>
+                                {% set box = item[4] if item[4] > 0 else 50 %}
+                                {% set bags = item[5] // box %}
+                                {% set loose = item[5] % box %}
+                                <b>{{ box }} pcs/bag</b><br>
+                                {{ bags }} मास्टर बैग्स<br>
+                                {% if loose > 0 %} <span class="loose-badge">+ {{ loose }} pcs loose</span> {% endif %}
                             </td>
+                            <td style="font-weight: bold; color: #0284c7;">{{ item[3] }} pcs</td>
                             <td class="text-green">{{ item[5] }} pcs</td>
                             <td class="text-red">{{ item[3] - item[5] }} pcs</td>
                             <td>
+                                <!-- जोड़ने या शॉर्ट होने पर सीधे एडिट करने का फॉर्म -->
+                                <form action="/update_load" method="POST" class="update-form" style="margin-bottom: 4px;">
+                                    <input type="hidden" name="id" value="{{ item[0] }}">
+                                    <input type="hidden" name="action_type" value="add">
+                                    <input type="number" name="qty" value="{{ box }}" class="update-input" required>
+                                    <button type="submit" class="btn-update">+Add</button>
+                                </form>
                                 <form action="/update_load" method="POST" class="update-form">
                                     <input type="hidden" name="id" value="{{ item[0] }}">
-                                    <input type="number" name="add_qty" placeholder="Qty" required class="update-input">
-                                    <button type="submit" class="btn-update">Add</button>
+                                    <input type="hidden" name="action_type" value="edit">
+                                    <input type="number" name="qty" value="{{ item[5] }}" class="update-input" style="background:#fef3c7;" required title="सीधे सही लोड हुआ पीस दर्ज करें (Edit)">
+                                    <button type="submit" class="btn-update btn-edit-qty">Set/Edit</button>
                                 </form>
                             </td>
                         </tr>
                         {% else %}
                         <tr>
-                            <td colspan="7" style="text-align:center; padding:3rem; color:#94a3b8;">
-                                📋 लोडिंग के लिए कोई PO सिलेक्ट नहीं किया गया है। ऊपर दिए गए बॉक्स से PO चुनें।
+                            <td colspan="8" style="text-align:center; padding:3rem; color:#94a3b8;">
+                                📋 लोडिंग के लिए कोई PO सिलेक्ट नहीं किया गया है। ऊपर दिए गए बॉक्स से PO चुनें या बारकोड स्कैन करें।
                             </td>
                         </tr>
                         {% endfor %}
@@ -227,20 +245,26 @@ DASHBOARD_TEMPLATE = """
         function startScanner() {
             document.getElementById('reader').style.display = 'block';
             document.getElementById('scanBtn').style.display = 'none';
+            
             const html5QrCode = new Html5Qrcode("reader");
             html5QrCode.start(
                 { facingMode: "environment" }, 
-                { fps: 10, qrbox: { width: 250, height: 150 } },
+                { fps: 20, qrbox: { width: 300, height: 120 } },
                 (decodedText, decodedResult) => {
-                    document.getElementById('scan-result').innerText = "स्कैन हुआ: " + decodedText;
+                    document.getElementById('scan-result').innerText = "सफलतापूर्वक स्कैन हुआ: " + decodedText;
+                    // ऑटोमैटिक स्कैन होने पर सर्वर पर भेजें (डिफ़ॉल्ट 50 पीस बॉक्स साइज के साथ)
                     fetch('/scan_update', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                        body: 'barcode=' + encodeURIComponent(decodedText)
-                    }).then(response => { if(response.ok) { window.location.reload(); } });
+                        body: 'barcode=' + encodeURIComponent(decodedText) + '&box_size=50'
+                    }).then(response => { 
+                        if(response.ok) { 
+                            setTimeout(() => { window.location.reload(); }, 500);
+                        } 
+                    });
                 },
                 (errorMessage) => {}
-            ).catch(err => { alert("कैमरा एरर: " + err); });
+            ).catch(err => { alert("कैमरा चालू करने में एरर: " + err); });
         }
     </script>
 </body>
@@ -264,43 +288,44 @@ def home():
 
 @app.route('/login', methods=['POST'])
 def login():
-    entered_password = request.form.get('password')
-    if entered_password == 'real@8283':
+    if request.form.get('password') == 'real@8283':
         session['logged_in'] = True
         return redirect('/')
-    else:
-        return render_template_string(LOGIN_TEMPLATE, error="गलत पासवर्ड! कृपया दोबारा कोशिश करें।")
+    return render_template_string(LOGIN_TEMPLATE, error="गलत पासवर्ड!")
 
 @app.route('/logout')
 def logout():
     session.pop('logged_in', None)
     return redirect('/')
 
-# Google Search Console Verification Route with correct file name
 @app.route('/googlec1dd36a62fa9245c.html')
 def google_verify():
     return "google-site-verification: googlec1dd36a62fa9245c.html"
 
-@app.route('/manual_barcode', methods=['POST'])
-def manual_barcode():
+@app.route('/manual_scan', methods=['POST'])
+def manual_scan():
     if not session.get('logged_in'): return redirect('/')
     barcode = request.form.get('barcode').strip()
+    box_size = int(request.form.get('box_size', 50))
+    
     conn = sqlite3.connect('factory.db')
     cursor = conn.cursor()
-    
-    cursor.execute('SELECT item_name, weight, po_number FROM po_items WHERE barcode = ?', (barcode,))
+    cursor.execute('SELECT item_name, weight, po_number, ordered_qty FROM po_items WHERE barcode = ?', (barcode,))
     item = cursor.fetchone()
     
     if item:
         name_weight = f"{item[0]} ({item[1]})"
         po_no = item[2]
+        target_qty = item[3]
+        
         cursor.execute('SELECT id FROM loading_log WHERE po_number = ? AND product_name = ?', (po_no, name_weight))
         if not cursor.fetchone():
-            cursor.execute('INSERT INTO loading_log (po_number, product_name, total_ordered, box_size, loaded_qty, barcode) VALUES (?, ?, 500, 25, 0, ?)',
-                           (po_no, name_weight, barcode))
-        cursor.execute('UPDATE loading_log SET loaded_qty = loaded_qty + 25 WHERE po_number = ? AND product_name = ?', (po_no, name_weight))
+            cursor.execute('INSERT INTO loading_log (po_number, product_name, total_ordered, box_size, loaded_qty, barcode) VALUES (?, ?, ?, ?, 0, ?)',
+                           (po_no, name_weight, target_qty, box_size, barcode))
+        
+        cursor.execute('UPDATE loading_log SET loaded_qty = loaded_qty + ?, box_size = ? WHERE po_number = ? AND product_name = ?', 
+                       (box_size, box_size, po_no, name_weight))
         conn.commit()
-    
     conn.close()
     return redirect('/')
 
@@ -308,14 +333,23 @@ def manual_barcode():
 def scan_update():
     if not session.get('logged_in'): return '', 403
     barcode = request.form.get('barcode')
+    box_size = int(request.form.get('box_size', 50))
+    
     conn = sqlite3.connect('factory.db')
     cursor = conn.cursor()
-    cursor.execute('SELECT item_name, weight, po_number FROM po_items WHERE barcode = ?', (barcode,))
+    cursor.execute('SELECT item_name, weight, po_number, ordered_qty FROM po_items WHERE barcode = ?', (barcode,))
     item = cursor.fetchone()
     if item:
         name_weight = f"{item[0]} ({item[1]})"
         po_no = item[2]
-        cursor.execute('UPDATE loading_log SET loaded_qty = loaded_qty + 25 WHERE po_number = ? AND product_name = ?', (po_no, name_weight))
+        target_qty = item[3]
+        
+        cursor.execute('SELECT id FROM loading_log WHERE po_number = ? AND product_name = ?', (po_no, name_weight))
+        if not cursor.fetchone():
+            cursor.execute('INSERT INTO loading_log (po_number, product_name, total_ordered, box_size, loaded_qty, barcode) VALUES (?, ?, ?, ?, 0, ?)',
+                           (po_no, name_weight, target_qty, box_size, barcode))
+            
+        cursor.execute('UPDATE loading_log SET loaded_qty = loaded_qty + ? WHERE po_number = ? AND product_name = ?', (box_size, po_no, name_weight))
         conn.commit()
     conn.close()
     return '', 204
@@ -334,7 +368,7 @@ def load_po():
         b_code = item[3]
         cursor.execute('SELECT id FROM loading_log WHERE po_number = ? AND product_name = ?', (po_number, name_weight))
         if not cursor.fetchone():
-            cursor.execute('INSERT INTO loading_log (po_number, product_name, total_ordered, box_size, loaded_qty, barcode) VALUES (?, ?, ?, 25, 0, ?)',
+            cursor.execute('INSERT INTO loading_log (po_number, product_name, total_ordered, box_size, loaded_qty, barcode) VALUES (?, ?, ?, 50, 0, ?)',
                            (po_number, name_weight, qty, b_code))
     conn.commit()
     conn.close()
@@ -360,7 +394,7 @@ def upload_file():
                     
                     if po_no and desc:
                         cursor.execute('SELECT id FROM po_items WHERE po_number = ? AND item_name = ?', (po_no, desc))
-                        if not cursor.fetchone():
+                        if not Ctrl := cursor.fetchone():
                             cursor.execute('INSERT INTO po_items (po_number, item_name, weight, ordered_qty, barcode) VALUES (?, ?, ?, ?, ?)',
                                            (po_no, desc, "1 pack", int(float(qty)) if qty else 0, ean))
                 conn.commit()
@@ -372,10 +406,18 @@ def upload_file():
 @app.route('/update_load', methods=['POST'])
 def update_load():
     if not session.get('logged_in'): return redirect('/')
+    item_id = request.form['id']
+    action_type = request.form.get('action_type', 'add')
+    qty = int(request.form['qty'])
+    
     conn = sqlite3.connect('factory.db')
     cursor = conn.cursor()
-    cursor.execute('UPDATE loading_log SET loaded_qty = loaded_qty + ? WHERE id = ?', 
-                   (int(request.form['add_qty']), request.form['id']))
+    if action_type == 'edit':
+        # सीधे लोड हुई मात्रा को सेट/एडिट करना (शॉर्ट या अधिक होने पर)
+        cursor.execute('UPDATE loading_log SET loaded_qty = ? WHERE id = ?', (qty, item_id))
+    else:
+        # प्लस करना
+        cursor.execute('UPDATE loading_log SET loaded_qty = loaded_qty + ? WHERE id = ?', (qty, item_id))
     conn.commit()
     conn.close()
     return redirect('/')
