@@ -220,14 +220,14 @@ STYLE_BLOCK = """
     /* Animated factory hero scene */
     .hero-factory {
         position: relative;
-        height: 220px;
+        height: 280px;
         border-radius: var(--radius);
         overflow: hidden;
         margin-bottom: 26px;
         border: 1px solid var(--border);
         background:
-            radial-gradient(circle at 20% 20%, rgba(59,130,246,0.20), transparent 55%),
-            radial-gradient(circle at 80% 10%, rgba(139,92,246,0.18), transparent 50%),
+            radial-gradient(circle at 20% 15%, rgba(59,130,246,0.20), transparent 55%),
+            radial-gradient(circle at 85% 75%, rgba(139,92,246,0.16), transparent 50%),
             repeating-linear-gradient(90deg, rgba(255,255,255,0.025) 0, rgba(255,255,255,0.025) 1px, transparent 1px, transparent 40px),
             repeating-linear-gradient(0deg, rgba(255,255,255,0.025) 0, rgba(255,255,255,0.025) 1px, transparent 1px, transparent 40px),
             linear-gradient(160deg, #0b1120 0%, #131c30 50%, #0b1120 100%);
@@ -236,15 +236,58 @@ STYLE_BLOCK = """
         position: absolute; top: 0; left: -30%; width: 30%; height: 100%;
         background: linear-gradient(90deg, transparent, rgba(59,130,246,0.10), transparent);
         animation: scanMove 5s linear infinite;
+        z-index: 1;
     }
     @keyframes scanMove {
         0% { left: -30%; }
         100% { left: 100%; }
     }
+
+    /* Distant factory skyline silhouette, sits behind everything */
+    .hero-skyline {
+        position: absolute; bottom: 78px; left: 0; width: 100%; height: 60px;
+        background:
+            linear-gradient(to top, rgba(15,23,42,0.9), transparent),
+            repeating-linear-gradient(90deg, rgba(148,163,184,0.10) 0 26px, transparent 26px 60px);
+        opacity: 0.6;
+    }
+    .hero-chimney {
+        position: absolute; bottom: 78px; width: 10px; height: 44px;
+        background: rgba(148,163,184,0.22); border-radius: 2px 2px 0 0;
+    }
+    .hero-smoke {
+        position: absolute; bottom: 122px; width: 10px; height: 10px;
+        border-radius: 50%; background: rgba(226,232,240,0.18);
+        animation: smokeRise 4s ease-in infinite;
+    }
+    .hero-smoke.s2 { animation-delay: 1.3s; left: 4px; }
+    .hero-smoke.s3 { animation-delay: 2.6s; left: -3px; }
+    @keyframes smokeRise {
+        0% { transform: translateY(0) scale(0.6); opacity: 0; }
+        20% { opacity: 0.5; }
+        100% { transform: translateY(-70px) scale(1.6); opacity: 0; }
+    }
+
+    /* Floating dust / light particles for atmosphere */
+    .hero-particle {
+        position: absolute; width: 3px; height: 3px; border-radius: 50%;
+        background: rgba(147,197,253,0.55);
+        animation: particleFloat 6s linear infinite;
+    }
+    @keyframes particleFloat {
+        0% { transform: translateY(20px) translateX(0); opacity: 0; }
+        15% { opacity: 0.8; }
+        85% { opacity: 0.4; }
+        100% { transform: translateY(-160px) translateX(20px); opacity: 0; }
+    }
+
     .hero-content {
-        position: relative; z-index: 2; height: 100%;
-        display: flex; flex-direction: column; justify-content: center;
-        padding: 0 32px;
+        position: relative; z-index: 2;
+        display: flex; flex-direction: column; justify-content: flex-start;
+        padding: 26px 32px 0;
+        max-width: 640px;
+        background: linear-gradient(90deg, rgba(11,17,32,0.55) 0%, rgba(11,17,32,0.25) 70%, transparent 100%);
+        height: 155px;
     }
     .hero-tag {
         display: inline-flex; align-items: center; gap: 6px; width: fit-content;
@@ -257,21 +300,22 @@ STYLE_BLOCK = """
         background: linear-gradient(90deg, #ffffff, #bcd4ff);
         -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
     }
-    .hero-sub { color: var(--text-muted); font-size: 14px; font-weight: 500; }
-    .hero-clock { color: var(--text-muted); font-size: 12.5px; font-weight: 600; margin-top: 10px; font-family: monospace; }
+    .hero-sub { color: var(--text-muted); font-size: 14px; font-weight: 500; max-width: 460px; }
+    .hero-clock { color: #93c5fd; font-size: 12.5px; font-weight: 700; margin-top: 14px; font-family: monospace; }
 
     .conveyor-track {
         position: absolute; bottom: 0; left: 0; width: 100%; height: 46px;
         background: repeating-linear-gradient(90deg, #1e293b 0, #1e293b 22px, #16213a 22px, #16213a 44px);
         border-top: 3px solid #334155;
         animation: conveyorMove 1.2s linear infinite;
+        z-index: 1;
     }
     @keyframes conveyorMove {
         from { background-position: 0 0; }
         to { background-position: -44px 0; }
     }
     .factory-box {
-        position: absolute; bottom: 40px; font-size: 26px;
+        position: absolute; bottom: 40px; font-size: 26px; z-index: 1;
         animation: boxSlide 7s linear infinite;
         filter: drop-shadow(0 4px 6px rgba(0,0,0,0.4));
     }
@@ -284,7 +328,7 @@ STYLE_BLOCK = """
         100% { left: 106%; opacity: 0; }
     }
     .factory-truck {
-        position: absolute; bottom: 44px; font-size: 34px;
+        position: absolute; bottom: 44px; font-size: 34px; z-index: 1;
         animation: truckDrive 9s ease-in-out infinite;
         filter: drop-shadow(0 4px 6px rgba(0,0,0,0.4));
     }
@@ -296,7 +340,7 @@ STYLE_BLOCK = """
         100% { left: -12%; transform: scaleX(1); }
     }
     .factory-worker {
-        position: absolute; bottom: 44px; font-size: 22px;
+        position: absolute; bottom: 44px; font-size: 22px; z-index: 1;
         animation: workerBob 2.2s ease-in-out infinite;
     }
     @keyframes workerBob {
@@ -305,9 +349,10 @@ STYLE_BLOCK = """
     }
 
     @media (max-width: 640px) {
-        .hero-factory { height: 190px; }
-        .hero-title { font-size: 24px; }
-        .hero-content { padding: 0 20px; }
+        .hero-factory { height: 250px; }
+        .hero-title { font-size: 22px; }
+        .hero-content { padding: 18px 20px 0; height: 130px; max-width: 100%; }
+        .hero-sub { font-size: 12.5px; }
         .topbar { flex-direction: column; align-items: flex-start; }
         .nav { width: 100%; overflow-x: auto; }
     }
@@ -346,6 +391,18 @@ DASHBOARD_HTML = STYLE_BLOCK + """
 <div class="container">
 """ + TOPBAR_TEMPLATE.replace("__NAV__", nav_html('dashboard')) + """
     <div class="hero-factory">
+        <div class="hero-skyline"></div>
+        <div class="hero-chimney" style="left:72%;">
+            <div class="hero-smoke"></div>
+            <div class="hero-smoke s2"></div>
+            <div class="hero-smoke s3"></div>
+        </div>
+        <div class="hero-chimney" style="left:88%; height:34px;"></div>
+        <div class="hero-particle" style="left:30%; animation-delay:0s;"></div>
+        <div class="hero-particle" style="left:45%; animation-delay:1.5s;"></div>
+        <div class="hero-particle" style="left:60%; animation-delay:3s;"></div>
+        <div class="hero-particle" style="left:75%; animation-delay:2s;"></div>
+        <div class="hero-particle" style="left:90%; animation-delay:4s;"></div>
         <div class="hero-scan"></div>
         <div class="hero-content">
             <span class="hero-tag">⚡ AI-Powered ERP &middot; Live</span>
@@ -856,21 +913,34 @@ HISTORY_HTML = STYLE_BLOCK + """
 LOGIN_HTML = STYLE_BLOCK + """
 <title>Login | REAL INSTANT FOODS</title>
 </head>
-<body>
-<div style="display:flex; justify-content:center; align-items:center; min-height:100vh;">
-    <div class="card" style="width:320px; text-align:center; padding:36px 28px;">
-        <div class="brand-logo" style="margin:0 auto 16px;">RIF</div>
-        <h2 style="margin:0 0 4px; font-size:19px;">REAL INSTANT FOODS</h2>
-        <div style="color:var(--text-muted); font-size:12.5px; margin-bottom:20px;">AI Dispatch &amp; Packing ERP</div>
-        <form method="POST">
-            <input type="password" name="password" placeholder="Password" autofocus>
-            <button type="submit" class="btn btn-block" style="margin-top:10px;">Login</button>
-        </form>
-        {% if error %}
-        <div style="color:#fca5a5; font-size:12.5px; margin-top:12px;">Incorrect password, please try again.</div>
-        {% endif %}
+<body style="background-color:#0b1120; background-image:
+        radial-gradient(circle at 15% 20%, rgba(59,130,246,0.20), transparent 45%),
+        radial-gradient(circle at 85% 80%, rgba(139,92,246,0.16), transparent 50%);
+    background-attachment:fixed; margin:0; min-height:100vh; position:relative; overflow:hidden;">
+    <div class="hero-particle" style="left:12%; animation-delay:0s;"></div>
+    <div class="hero-particle" style="left:30%; animation-delay:2s;"></div>
+    <div class="hero-particle" style="left:55%; animation-delay:1s;"></div>
+    <div class="hero-particle" style="left:70%; animation-delay:3.5s;"></div>
+    <div class="hero-particle" style="left:88%; animation-delay:2.6s;"></div>
+    <div class="conveyor-track" style="opacity:0.6;"></div>
+    <div class="factory-box b1">📦</div>
+    <div class="factory-box b2">📦</div>
+    <div class="factory-box b3">📦</div>
+    <div class="factory-truck">🚚</div>
+    <div style="display:flex; justify-content:center; align-items:center; min-height:100vh; position:relative; z-index:3;">
+        <div class="card" style="width:320px; text-align:center; padding:36px 28px; backdrop-filter:blur(16px);">
+            <div class="brand-logo" style="margin:0 auto 16px;">RIF</div>
+            <h2 style="margin:0 0 4px; font-size:19px;">REAL INSTANT FOODS</h2>
+            <div style="color:var(--text-muted); font-size:12.5px; margin-bottom:20px;">AI Dispatch &amp; Packing ERP</div>
+            <form method="POST">
+                <input type="password" name="password" placeholder="Password" autofocus>
+                <button type="submit" class="btn btn-block" style="margin-top:10px;">Login</button>
+            </form>
+            {% if error %}
+            <div style="color:#fca5a5; font-size:12.5px; margin-top:12px;">Incorrect password, please try again.</div>
+            {% endif %}
+        </div>
     </div>
-</div>
 </body>
 </html>
 """
