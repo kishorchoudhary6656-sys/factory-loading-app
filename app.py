@@ -340,11 +340,11 @@ STYLE_BLOCK = """
         filter: drop-shadow(0 4px 6px rgba(0,0,0,0.4));
     }
     @keyframes truckDrive {
-        0% { left: -12%; transform: scaleX(1); }
-        45% { left: 78%; transform: scaleX(1); }
-        50% { left: 78%; transform: scaleX(-1); }
-        95% { left: -12%; transform: scaleX(-1); }
-        100% { left: -12%; transform: scaleX(1); }
+        0% { left: -12%; transform: scaleX(-1); }
+        45% { left: 78%; transform: scaleX(-1); }
+        50% { left: 78%; transform: scaleX(1); }
+        95% { left: -12%; transform: scaleX(1); }
+        100% { left: -12%; transform: scaleX(-1); }
     }
     .factory-worker {
         position: absolute; bottom: 44px; font-size: 22px; z-index: 1;
