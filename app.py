@@ -1,16 +1,22 @@
 from flask import Flask, render_template_string, request, redirect, session, Response
 import sqlite3, csv, io, re
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from urllib.parse import quote
 
 app = Flask(__name__)
 app.secret_key = 'real_instant_foods_final_2026'
+
+IST = timezone(timedelta(hours=5, minutes=30))
+def now_ist():
+    return datetime.now(timezone.utc).astimezone(IST)
 
 def init_db():
     conn = sqlite3.connect('factory.db')
     cursor = conn.cursor()
     cursor.execute('''CREATE TABLE IF NOT EXISTS po_items (id INTEGER PRIMARY KEY AUTOINCREMENT, po_number TEXT, item_name TEXT, weight TEXT, ordered_qty INTEGER, barcode TEXT)''')
     cursor.execute('''CREATE TABLE IF NOT EXISTS dispatch_log (id INTEGER PRIMARY KEY AUTOINCREMENT, po_number TEXT, vehicle_no TEXT, location TEXT, product_name TEXT, loaded_qty INTEGER, timestamp TEXT)''')
+    # Shared, global state (NOT per-browser) so every device sees the same active dispatch session live
+    cursor.execute('''CREATE TABLE IF NOT EXISTS app_state (key TEXT PRIMARY KEY, value TEXT)''')
     # Add barcode column to dispatch_log if migrating from an older schema
     try:
         cursor.execute('ALTER TABLE dispatch_log ADD COLUMN barcode TEXT')
@@ -19,6 +25,26 @@ def init_db():
     conn.commit()
     conn.close()
 init_db()
+
+def get_active_session():
+    conn = sqlite3.connect('factory.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT key, value FROM app_state WHERE key IN ('cur_po', 'cur_vehicle', 'cur_location')")
+    rows = dict(cursor.fetchall())
+    conn.close()
+    return {
+        'cur_po': rows.get('cur_po', ''),
+        'cur_vehicle': rows.get('cur_vehicle', ''),
+        'cur_location': rows.get('cur_location', ''),
+    }
+
+def set_active_session(po_number, vehicle_no, location):
+    conn = sqlite3.connect('factory.db')
+    cursor = conn.cursor()
+    for key, value in [('cur_po', po_number), ('cur_vehicle', vehicle_no), ('cur_location', location)]:
+        cursor.execute('INSERT INTO app_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value', (key, value))
+    conn.commit()
+    conn.close()
 
 # ---------------------------------------------------------------------------
 # Shared design system (plain CSS - no Jinja braces used, safe to concatenate)
@@ -178,6 +204,12 @@ STYLE_BLOCK = """
 
     footer { text-align: center; color: var(--text-muted); font-size: 12px; margin-top: 34px; opacity: 0.7; }
 
+    @keyframes pulse {
+        0% { opacity: 1; box-shadow: 0 0 0 0 rgba(74,222,128,0.5); }
+        70% { opacity: 0.6; box-shadow: 0 0 0 5px rgba(74,222,128,0); }
+        100% { opacity: 1; box-shadow: 0 0 0 0 rgba(74,222,128,0); }
+    }
+
     @media (max-width: 640px) {
         .topbar { flex-direction: column; align-items: flex-start; }
         .nav { width: 100%; overflow-x: auto; }
@@ -237,7 +269,7 @@ DASHBOARD_HTML = STYLE_BLOCK + """
 
     <div class="card">
         <div class="card-header">
-            <h2>🧾 Active Dispatch Session</h2>
+            <h2>🧾 Active Dispatch Session <span style="display:inline-flex; align-items:center; gap:5px; font-size:11px; font-weight:700; color:#4ade80; background:rgba(34,197,94,0.12); padding:3px 9px; border-radius:20px; vertical-align:middle; margin-left:4px;"><span style="width:6px; height:6px; border-radius:50%; background:#4ade80; display:inline-block; animation:pulse 1.5s infinite;"></span>LIVE</span></h2>
             {% if session_set %}
             <button class="btn btn-outline btn-sm" onclick="document.getElementById('sessionModal').style.display='flex'">Change</button>
             {% endif %}
@@ -425,6 +457,14 @@ DASHBOARD_HTML = STYLE_BLOCK + """
         document.getElementById('editQtyInput').value = currentQty;
         document.getElementById('editLogModal').style.display = 'flex';
     }
+
+    // Keep every device (loading staff, owner, etc.) in sync automatically.
+    // Skips the refresh while any modal is open so it never interrupts data entry.
+    setInterval(() => {
+        const modalsOpen = Array.from(document.querySelectorAll('.modal')).some(m => getComputedStyle(m).display === 'flex');
+        const typing = document.activeElement && ['INPUT', 'SELECT', 'TEXTAREA'].includes(document.activeElement.tagName);
+        if (!modalsOpen && !typing) location.reload();
+    }, 12000);
 </script>
 </body>
 </html>
@@ -638,6 +678,8 @@ def home():
     dispatched_map = {(r[0], r[1]): (r[2] or 0) for r in cursor.fetchall()}
     conn.close()
 
+    active = get_active_session()
+
     item_progress = []
     for po_number, barcode, item_name, weight, ordered in po_item_rows:
         ordered = ordered or 0
@@ -650,7 +692,7 @@ def home():
             'ordered': ordered, 'dispatched': dispatched, 'pending': pending, 'percent': percent
         })
 
-    session_set = bool(session.get('cur_po') and session.get('cur_vehicle') and session.get('cur_location'))
+    session_set = bool(active['cur_po'] and active['cur_vehicle'] and active['cur_location'])
     return render_template_string(
         DASHBOARD_HTML,
         po_list=po_list,
@@ -658,9 +700,9 @@ def home():
         total_loaded=total_loaded,
         item_progress=item_progress,
         session_set=session_set,
-        cur_po=session.get('cur_po'),
-        cur_vehicle=session.get('cur_vehicle'),
-        cur_location=session.get('cur_location')
+        cur_po=active['cur_po'],
+        cur_vehicle=active['cur_vehicle'],
+        cur_location=active['cur_location']
     )
 
 @app.route('/history')
@@ -811,9 +853,10 @@ def pos_delete(item_id):
 @app.route('/start_session', methods=['POST'])
 def start_session():
     if not session.get('logged_in'): return redirect('/login')
-    session['cur_po'] = request.form.get('po_number', '').strip()
-    session['cur_vehicle'] = request.form.get('vehicle_no', '').strip()
-    session['cur_location'] = request.form.get('location', '').strip()
+    po_number = request.form.get('po_number', '').strip()
+    vehicle_no = request.form.get('vehicle_no', '').strip()
+    location = request.form.get('location', '').strip()
+    set_active_session(po_number, vehicle_no, location)
     return redirect('/')
 
 @app.route('/lookup_barcode')
@@ -833,9 +876,10 @@ def lookup_barcode():
 def process_scan():
     barcode = request.form['barcode'].strip()
     m_units = request.form['qty']
-    po_number = session.get('cur_po', 'Unknown')
-    vehicle_no = session.get('cur_vehicle', 'Unknown')
-    location = session.get('cur_location', 'Unknown')
+    active = get_active_session()
+    po_number = active['cur_po'] or 'Unknown'
+    vehicle_no = active['cur_vehicle'] or 'Unknown'
+    location = active['cur_location'] or 'Unknown'
     conn = sqlite3.connect('factory.db')
     cursor = conn.cursor()
     cursor.execute('SELECT item_name, weight FROM po_items WHERE barcode = ?', (barcode,))
@@ -843,7 +887,7 @@ def process_scan():
     if item:
         total_qty = calculate_qty(item[1], m_units)
         cursor.execute('INSERT INTO dispatch_log (po_number, vehicle_no, location, product_name, loaded_qty, timestamp, barcode) VALUES (?, ?, ?, ?, ?, ?, ?)',
-                       (po_number, vehicle_no, location, f"{item[0]} ({item[1]})", total_qty, datetime.now().strftime("%H:%M"), barcode))
+                       (po_number, vehicle_no, location, f"{item[0]} ({item[1]})", total_qty, now_ist().strftime("%d %b %Y, %I:%M %p"), barcode))
         conn.commit()
         conn.close()
         return {'ok': True}, 200
