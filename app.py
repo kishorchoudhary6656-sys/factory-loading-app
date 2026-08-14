@@ -957,7 +957,7 @@ def home():
     if not session.get('logged_in'): return redirect('/login')
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute('SELECT DISTINCT po_number, company FROM po_items GROUP BY po_number')
+    cursor.execute('SELECT DISTINCT po_number, company FROM po_items')
     po_list = cursor.fetchall()
     cursor.execute('SELECT id, po_number, vehicle_no, location, product_name, loaded_qty, timestamp FROM dispatch_log ORDER BY id DESC LIMIT 200')
     logs = cursor.fetchall()
@@ -965,7 +965,7 @@ def home():
     total_loaded = cursor.fetchone()[0]
 
     # Item-level progress: ordered vs dispatched per (po_number, barcode)
-    cursor.execute('SELECT po_number, barcode, item_name, weight, company, SUM(ordered_qty) FROM po_items GROUP BY po_number, barcode')
+    cursor.execute('SELECT po_number, barcode, item_name, weight, company, SUM(ordered_qty) FROM po_items GROUP BY po_number, barcode, item_name, weight, company')
     po_item_rows = cursor.fetchall()
     cursor.execute('SELECT po_number, barcode, SUM(loaded_qty) FROM dispatch_log GROUP BY po_number, barcode')
     dispatched_map = {(r[0], r[1]): (r[2] or 0) for r in cursor.fetchall()}
@@ -1037,7 +1037,7 @@ def history_page():
     conn = get_conn()
     cursor = conn.cursor()
     if search_po:
-        cursor.execute('SELECT po_number, vehicle_no, location, product_name, loaded_qty, timestamp FROM dispatch_log WHERE po_number LIKE %s ORDER BY id DESC', (f'%{search_po}%',))
+        cursor.execute('SELECT po_number, vehicle_no, location, product_name, loaded_qty, timestamp FROM dispatch_log WHERE po_number ILIKE %s ORDER BY id DESC', (f'%{search_po}%',))
     else:
         cursor.execute('SELECT po_number, vehicle_no, location, product_name, loaded_qty, timestamp FROM dispatch_log ORDER BY id DESC LIMIT 200')
     records = cursor.fetchall()
@@ -1304,7 +1304,7 @@ def export_progress_csv():
     if not session.get('logged_in'): return redirect('/login')
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute('SELECT po_number, barcode, item_name, weight, company, SUM(ordered_qty) FROM po_items GROUP BY po_number, barcode')
+    cursor.execute('SELECT po_number, barcode, item_name, weight, company, SUM(ordered_qty) FROM po_items GROUP BY po_number, barcode, item_name, weight, company')
     po_item_rows = cursor.fetchall()
     cursor.execute('SELECT po_number, barcode, SUM(loaded_qty) FROM dispatch_log GROUP BY po_number, barcode')
     dispatched_map = {(r[0], r[1]): (r[2] or 0) for r in cursor.fetchall()}
