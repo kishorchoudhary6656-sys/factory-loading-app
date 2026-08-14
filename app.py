@@ -17,9 +17,16 @@ def init_db():
     cursor.execute('''CREATE TABLE IF NOT EXISTS dispatch_log (id INTEGER PRIMARY KEY AUTOINCREMENT, po_number TEXT, vehicle_no TEXT, location TEXT, product_name TEXT, loaded_qty INTEGER, timestamp TEXT)''')
     # Shared, global state (NOT per-browser) so every device sees the same active dispatch session live
     cursor.execute('''CREATE TABLE IF NOT EXISTS app_state (key TEXT PRIMARY KEY, value TEXT)''')
+    # Companies (Zepto, Flipkart, Reliance, Anand Sweets, etc.) — each PO belongs to one company/folder
+    cursor.execute('''CREATE TABLE IF NOT EXISTS companies (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE)''')
     # Add barcode column to dispatch_log if migrating from an older schema
     try:
         cursor.execute('ALTER TABLE dispatch_log ADD COLUMN barcode TEXT')
+    except sqlite3.OperationalError:
+        pass
+    # Add company column to po_items if migrating from an older schema
+    try:
+        cursor.execute('ALTER TABLE po_items ADD COLUMN company TEXT')
     except sqlite3.OperationalError:
         pass
     conn.commit()
@@ -223,6 +230,7 @@ def nav_html(active):
     return f"""
     <div class="nav">
         <a href="/" class="{cls('dashboard')}">Dashboard</a>
+        <a href="/companies" class="{cls('companies')}">Companies</a>
         <a href="/pos" class="{cls('pos')}">Manage POs</a>
         <a href="/history" class="{cls('history')}">History</a>
     </div>
@@ -294,12 +302,13 @@ DASHBOARD_HTML = STYLE_BLOCK + """
     <div class="card">
         <div class="card-header">
             <h2>📊 Item Progress (Ordered vs Loaded)</h2>
+            <a href="/export_progress_csv" class="btn btn-outline btn-sm" style="text-decoration:none;">⬇ Export Progress CSV</a>
         </div>
         {% if item_progress|length > 0 %}
         {% for p in item_progress %}
         <div style="margin-bottom:16px;">
             <div style="display:flex; justify-content:space-between; font-size:13.5px; margin-bottom:2px; gap:10px;">
-                <span style="font-weight:600;">{{ p.item_name }} <span style="color:var(--text-muted); font-weight:500;">({{ p.po_number }})</span></span>
+                <span style="font-weight:600;">{{ p.item_name }} <span style="color:var(--text-muted); font-weight:500;">({{ p.po_number }}{% if p.company %} &middot; {{ p.company }}{% endif %})</span></span>
                 <span style="color:var(--text-muted); white-space:nowrap;">{{ p.dispatched }} / {{ p.ordered }} &middot; {{ p.pending }} pending</span>
             </div>
             <div class="progress-track"><div class="progress-fill" style="width:{{ p.percent }}%;"></div></div>
@@ -382,7 +391,7 @@ DASHBOARD_HTML = STYLE_BLOCK + """
             <select name="po_number" required>
                 <option value="" disabled selected>Select PO Number</option>
                 {% for po in po_list %}
-                <option value="{{ po[0] }}">{{ po[0] }}</option>
+                <option value="{{ po[0] }}">{{ po[0] }}{% if po[1] %} — {{ po[1] }}{% endif %}</option>
                 {% endfor %}
             </select>
             <input type="text" name="vehicle_no" placeholder="Vehicle Number (e.g. KA-01-AB-1234)" required>
@@ -476,14 +485,29 @@ POS_HTML = STYLE_BLOCK + """
 <body>
 <div class="container">
 """ + TOPBAR_TEMPLATE.replace("__NAV__", nav_html('pos')) + """
+    {% if filter_company %}
+    <div style="margin-bottom:18px; display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+        <span style="color:var(--text-muted); font-size:13px;">Showing POs for:</span>
+        <span class="badge badge-blue" style="font-size:13px;">{{ filter_company }}</span>
+        <a href="/pos" class="btn btn-outline btn-sm" style="text-decoration:none;">Show All</a>
+    </div>
+    {% endif %}
+
     <div class="card">
         <div class="card-header">
-            <h2>📤 CSV Se Bulk Import Karo</h2>
+            <h2>📤 Bulk Import from CSV</h2>
         </div>
         {% if import_msg %}
         <div class="badge {% if import_ok %}badge-green{% else %}badge-amber{% endif %}" style="display:block; padding:10px 14px; margin-bottom:14px; font-size:13px;">{{ import_msg }}</div>
         {% endif %}
         <form method="POST" action="/pos/import_csv" enctype="multipart/form-data">
+            <label>Company / Client</label>
+            <select name="company" required>
+                <option value="" disabled {% if not filter_company %}selected{% endif %}>Select company</option>
+                {% for c in companies %}
+                <option value="{{ c }}" {% if c == filter_company %}selected{% endif %}>{{ c }}</option>
+                {% endfor %}
+            </select>
             <label>Choose CSV File</label>
             <input type="file" name="csv_file" accept=".csv" required style="padding:10px;">
             <button type="submit" class="btn" style="margin-top:10px;">Upload &amp; Import</button>
@@ -491,7 +515,8 @@ POS_HTML = STYLE_BLOCK + """
         <div style="color:var(--text-muted); font-size:12.5px; margin-top:12px; line-height:1.6;">
             Your CSV should have these columns (any order, header row required):<br>
             <span style="font-family:monospace; color:var(--text);">po_number, item_name, weight, ordered_qty, barcode</span><br>
-            Example: <span style="font-family:monospace;">PO-2026-014, Instant Noodles, 1kg, 500, 8901234567890</span>
+            Example: <span style="font-family:monospace;">PO-2026-014, Instant Noodles, 1kg, 500, 8901234567890</span><br>
+            No company yet? <a href="/companies" style="color:var(--primary);">Add one here</a> first.
         </div>
     </div>
 
@@ -501,6 +526,15 @@ POS_HTML = STYLE_BLOCK + """
         </div>
         <form method="POST" action="/pos/add">
             <div class="form-grid">
+                <div>
+                    <label>Company / Client</label>
+                    <select name="company" required>
+                        <option value="" disabled {% if not filter_company %}selected{% endif %}>Select company</option>
+                        {% for c in companies %}
+                        <option value="{{ c }}" {% if c == filter_company %}selected{% endif %}>{{ c }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
                 <div>
                     <label>PO Number</label>
                     <input type="text" name="po_number" placeholder="e.g. PO-2026-014" required>
@@ -524,23 +558,27 @@ POS_HTML = STYLE_BLOCK + """
             </div>
             <button type="submit" class="btn" style="margin-top:14px;">Add PO Item</button>
         </form>
+        {% if companies|length == 0 %}
+        <div style="color:var(--text-muted); font-size:12.5px; margin-top:10px;">No companies yet — <a href="/companies" style="color:var(--primary);">add one first</a>.</div>
+        {% endif %}
     </div>
 
     <div class="card">
         <div class="card-header">
-            <h2>📋 All PO Items</h2>
+            <h2>📋 {% if filter_company %}{{ filter_company }}'s PO Items{% else %}All PO Items{% endif %}</h2>
         </div>
         {% if items|length > 0 %}
         <table>
             <thead><tr>
-                <th>PO Number</th><th>Item</th><th>Weight</th><th>Ordered Qty</th><th>Barcode</th><th></th>
+                <th>Company</th><th>PO Number</th><th>Item</th><th>Weight</th><th>Ordered Qty</th><th>Barcode</th><th></th>
             </tr></thead>
             <tbody>
             {% for it in items %}
             <tr>
+                <td><span class="badge badge-blue">{{ it[6] or 'Unassigned' }}</span></td>
                 <td style="font-weight:600;">{{ it[1] }}</td>
                 <td>{{ it[2] }}</td>
-                <td><span class="badge badge-blue">{{ it[3] }}</span></td>
+                <td>{{ it[3] }}</td>
                 <td>{{ it[4] }}</td>
                 <td style="color:var(--text-muted); font-family:monospace;">{{ it[5] }}</td>
                 <td>
@@ -554,6 +592,54 @@ POS_HTML = STYLE_BLOCK + """
         </table>
         {% else %}
         <div class="empty-state">No PO items added yet. Use the form above to add one.</div>
+        {% endif %}
+    </div>
+
+    <footer>REAL INSTANT FOODS &middot; AI ERP System</footer>
+</div>
+</body>
+</html>
+"""
+
+COMPANIES_HTML = STYLE_BLOCK + """
+<title>Companies | REAL INSTANT FOODS</title>
+</head>
+<body>
+<div class="container">
+""" + TOPBAR_TEMPLATE.replace("__NAV__", nav_html('companies')) + """
+    <div class="card">
+        <div class="card-header">
+            <h2>➕ Add New Company</h2>
+        </div>
+        {% if error_msg %}
+        <div class="badge badge-amber" style="display:block; padding:10px 14px; margin-bottom:14px; font-size:13px;">{{ error_msg }}</div>
+        {% endif %}
+        <form method="POST" action="/companies/add">
+            <div style="display:flex; gap:10px; flex-wrap:wrap;">
+                <input type="text" name="name" placeholder="e.g. Zepto, Flipkart, Reliance, Anand Sweets" style="flex:1; min-width:220px; margin:0;" required>
+                <button type="submit" class="btn" style="white-space:nowrap;">Add Company</button>
+            </div>
+        </form>
+    </div>
+
+    <div class="card">
+        <div class="card-header">
+            <h2>🏢 Company Folders</h2>
+        </div>
+        {% if companies|length > 0 %}
+        <div style="display:grid; grid-template-columns:repeat(auto-fill, minmax(220px, 1fr)); gap:14px;">
+            {% for c in companies %}
+            <a href="/pos?company={{ c.name }}" style="text-decoration:none; color:inherit;">
+                <div style="background:rgba(255,255,255,0.03); border:1px solid var(--border); border-radius:12px; padding:18px; transition:background 0.15s;" onmouseover="this.style.background='rgba(255,255,255,0.06)'" onmouseout="this.style.background='rgba(255,255,255,0.03)'">
+                    <div style="font-size:26px; margin-bottom:8px;">🏢</div>
+                    <div style="font-weight:700; font-size:15px; margin-bottom:6px;">{{ c.name }}</div>
+                    <div style="color:var(--text-muted); font-size:12.5px;">{{ c.po_count }} PO(s) &middot; {{ c.item_count }} item(s)</div>
+                </div>
+            </a>
+            {% endfor %}
+        </div>
+        {% else %}
+        <div class="empty-state">No companies added yet. Add one above — e.g. Zepto, Flipkart, Reliance, Anand Sweets.</div>
         {% endif %}
     </div>
 
@@ -664,7 +750,7 @@ def home():
     if not session.get('logged_in'): return redirect('/login')
     conn = sqlite3.connect('factory.db')
     cursor = conn.cursor()
-    cursor.execute('SELECT DISTINCT po_number FROM po_items')
+    cursor.execute('SELECT DISTINCT po_number, company FROM po_items GROUP BY po_number')
     po_list = cursor.fetchall()
     cursor.execute('SELECT id, po_number, vehicle_no, location, product_name, loaded_qty, timestamp FROM dispatch_log ORDER BY id DESC LIMIT 200')
     logs = cursor.fetchall()
@@ -672,7 +758,7 @@ def home():
     total_loaded = cursor.fetchone()[0]
 
     # Item-level progress: ordered vs dispatched per (po_number, barcode)
-    cursor.execute('SELECT po_number, barcode, item_name, weight, SUM(ordered_qty) FROM po_items GROUP BY po_number, barcode')
+    cursor.execute('SELECT po_number, barcode, item_name, weight, company, SUM(ordered_qty) FROM po_items GROUP BY po_number, barcode')
     po_item_rows = cursor.fetchall()
     cursor.execute('SELECT po_number, barcode, SUM(loaded_qty) FROM dispatch_log GROUP BY po_number, barcode')
     dispatched_map = {(r[0], r[1]): (r[2] or 0) for r in cursor.fetchall()}
@@ -681,14 +767,14 @@ def home():
     active = get_active_session()
 
     item_progress = []
-    for po_number, barcode, item_name, weight, ordered in po_item_rows:
+    for po_number, barcode, item_name, weight, company, ordered in po_item_rows:
         ordered = ordered or 0
         dispatched = dispatched_map.get((po_number, barcode), 0)
         pending = max(ordered - dispatched, 0)
         percent = min(100, round((dispatched / ordered) * 100)) if ordered else 0
         label = f"{item_name} ({weight})" if weight else item_name
         item_progress.append({
-            'po_number': po_number, 'item_name': label,
+            'po_number': po_number, 'item_name': label, 'company': company,
             'ordered': ordered, 'dispatched': dispatched, 'pending': pending, 'percent': percent
         })
 
@@ -704,6 +790,37 @@ def home():
         cur_vehicle=active['cur_vehicle'],
         cur_location=active['cur_location']
     )
+
+@app.route('/companies')
+def companies_page():
+    if not session.get('logged_in'): return redirect('/login')
+    conn = sqlite3.connect('factory.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT name FROM companies ORDER BY name')
+    names = [r[0] for r in cursor.fetchall()]
+    cursor.execute('SELECT company, COUNT(DISTINCT po_number), COUNT(*) FROM po_items WHERE company IS NOT NULL GROUP BY company')
+    stats = {r[0]: (r[1], r[2]) for r in cursor.fetchall()}
+    conn.close()
+    companies = [{'name': n, 'po_count': stats.get(n, (0, 0))[0], 'item_count': stats.get(n, (0, 0))[1]} for n in names]
+    error_msg = request.args.get('error')
+    return render_template_string(COMPANIES_HTML, companies=companies, error_msg=error_msg)
+
+@app.route('/companies/add', methods=['POST'])
+def companies_add():
+    if not session.get('logged_in'): return redirect('/login')
+    name = request.form.get('name', '').strip()
+    if not name:
+        return redirect('/companies')
+    conn = sqlite3.connect('factory.db')
+    cursor = conn.cursor()
+    try:
+        cursor.execute('INSERT INTO companies (name) VALUES (?)', (name,))
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.close()
+        return redirect('/companies?error=' + quote(f'"{name}" already exists.'))
+    conn.close()
+    return redirect('/companies')
 
 @app.route('/history')
 def history_page():
@@ -732,18 +849,25 @@ def history_page():
 @app.route('/pos')
 def pos_page():
     if not session.get('logged_in'): return redirect('/login')
+    filter_company = request.args.get('company', '').strip()
     conn = sqlite3.connect('factory.db')
     cursor = conn.cursor()
-    cursor.execute('SELECT id, po_number, item_name, weight, ordered_qty, barcode FROM po_items ORDER BY id DESC')
+    if filter_company:
+        cursor.execute('SELECT id, po_number, item_name, weight, ordered_qty, barcode, company FROM po_items WHERE company = ? ORDER BY id DESC', (filter_company,))
+    else:
+        cursor.execute('SELECT id, po_number, item_name, weight, ordered_qty, barcode, company FROM po_items ORDER BY id DESC')
     items = cursor.fetchall()
+    cursor.execute('SELECT name FROM companies ORDER BY name')
+    companies = [r[0] for r in cursor.fetchall()]
     conn.close()
     import_msg = request.args.get('msg')
     import_ok = request.args.get('ok') == '1'
-    return render_template_string(POS_HTML, items=items, import_msg=import_msg, import_ok=import_ok)
+    return render_template_string(POS_HTML, items=items, import_msg=import_msg, import_ok=import_ok, companies=companies, filter_company=filter_company)
 
 @app.route('/pos/add', methods=['POST'])
 def pos_add():
     if not session.get('logged_in'): return redirect('/login')
+    company = request.form.get('company', '').strip()
     po_number = request.form.get('po_number', '').strip()
     item_name = request.form.get('item_name', '').strip()
     weight = request.form.get('weight', '').strip()
@@ -751,11 +875,11 @@ def pos_add():
     barcode = request.form.get('barcode', '').strip()
     conn = sqlite3.connect('factory.db')
     cursor = conn.cursor()
-    cursor.execute('INSERT INTO po_items (po_number, item_name, weight, ordered_qty, barcode) VALUES (?, ?, ?, ?, ?)',
-                   (po_number, item_name, weight, int(ordered_qty), barcode))
+    cursor.execute('INSERT INTO po_items (po_number, item_name, weight, ordered_qty, barcode, company) VALUES (?, ?, ?, ?, ?, ?)',
+                   (po_number, item_name, weight, int(ordered_qty), barcode, company))
     conn.commit()
     conn.close()
-    return redirect('/pos')
+    return redirect('/pos?company=' + quote(company) if company else '/pos')
 
 # Accepts flexible header names (English or common Hindi-transliterated variants),
 # plus real-world PO export formats (e.g. PoNumber, SkuDesc, EAN, Quantity)
@@ -790,6 +914,9 @@ def _map_csv_headers(fieldnames):
 @app.route('/pos/import_csv', methods=['POST'])
 def pos_import_csv():
     if not session.get('logged_in'): return redirect('/login')
+    company = request.form.get('company', '').strip()
+    if not company:
+        return redirect('/pos?ok=0&msg=' + quote('Please select a company for this import.'))
     file = request.files.get('csv_file')
     if not file or file.filename == '':
         return redirect('/pos?ok=0&msg=' + quote('No file selected.'))
@@ -829,16 +956,16 @@ def pos_import_csv():
         except ValueError:
             skipped += 1
             continue
-        cursor.execute('INSERT INTO po_items (po_number, item_name, weight, ordered_qty, barcode) VALUES (?, ?, ?, ?, ?)',
-                       (po_number, item_name, weight, ordered_qty, barcode))
+        cursor.execute('INSERT INTO po_items (po_number, item_name, weight, ordered_qty, barcode, company) VALUES (?, ?, ?, ?, ?, ?)',
+                       (po_number, item_name, weight, ordered_qty, barcode, company))
         inserted += 1
     conn.commit()
     conn.close()
 
-    msg = f'{inserted} items imported successfully.'
+    msg = f'{inserted} items imported successfully for {company}.'
     if skipped:
         msg += f' {skipped} rows skipped (incomplete data).'
-    return redirect('/pos?ok=1&msg=' + quote(msg))
+    return redirect('/pos?company=' + quote(company) + '&ok=1&msg=' + quote(msg))
 
 @app.route('/pos/delete/<int:item_id>', methods=['POST'])
 def pos_delete(item_id):
@@ -937,6 +1064,33 @@ def export_csv():
         output.getvalue(),
         mimetype='text/csv',
         headers={'Content-Disposition': 'attachment; filename=dispatch_log.csv'}
+    )
+
+@app.route('/export_progress_csv')
+def export_progress_csv():
+    if not session.get('logged_in'): return redirect('/login')
+    conn = sqlite3.connect('factory.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT po_number, barcode, item_name, weight, company, SUM(ordered_qty) FROM po_items GROUP BY po_number, barcode')
+    po_item_rows = cursor.fetchall()
+    cursor.execute('SELECT po_number, barcode, SUM(loaded_qty) FROM dispatch_log GROUP BY po_number, barcode')
+    dispatched_map = {(r[0], r[1]): (r[2] or 0) for r in cursor.fetchall()}
+    conn.close()
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(['Company', 'PO Number', 'Item', 'Weight', 'Barcode', 'Ordered Qty', 'Loaded Qty', 'Pending Qty', '% Complete'])
+    for po_number, barcode, item_name, weight, company, ordered in po_item_rows:
+        ordered = ordered or 0
+        dispatched = dispatched_map.get((po_number, barcode), 0)
+        pending = max(ordered - dispatched, 0)
+        percent = min(100, round((dispatched / ordered) * 100)) if ordered else 0
+        writer.writerow([company or '', po_number, item_name, weight, barcode, ordered, dispatched, pending, f'{percent}%'])
+
+    return Response(
+        output.getvalue(),
+        mimetype='text/csv',
+        headers={'Content-Disposition': 'attachment; filename=po_progress.csv'}
     )
 
 def calculate_qty(weight, master_units):
