@@ -217,7 +217,97 @@ STYLE_BLOCK = """
         100% { opacity: 1; box-shadow: 0 0 0 0 rgba(74,222,128,0); }
     }
 
+    /* Animated factory hero scene */
+    .hero-factory {
+        position: relative;
+        height: 220px;
+        border-radius: var(--radius);
+        overflow: hidden;
+        margin-bottom: 26px;
+        border: 1px solid var(--border);
+        background:
+            radial-gradient(circle at 20% 20%, rgba(59,130,246,0.20), transparent 55%),
+            radial-gradient(circle at 80% 10%, rgba(139,92,246,0.18), transparent 50%),
+            repeating-linear-gradient(90deg, rgba(255,255,255,0.025) 0, rgba(255,255,255,0.025) 1px, transparent 1px, transparent 40px),
+            repeating-linear-gradient(0deg, rgba(255,255,255,0.025) 0, rgba(255,255,255,0.025) 1px, transparent 1px, transparent 40px),
+            linear-gradient(160deg, #0b1120 0%, #131c30 50%, #0b1120 100%);
+    }
+    .hero-scan {
+        position: absolute; top: 0; left: -30%; width: 30%; height: 100%;
+        background: linear-gradient(90deg, transparent, rgba(59,130,246,0.10), transparent);
+        animation: scanMove 5s linear infinite;
+    }
+    @keyframes scanMove {
+        0% { left: -30%; }
+        100% { left: 100%; }
+    }
+    .hero-content {
+        position: relative; z-index: 2; height: 100%;
+        display: flex; flex-direction: column; justify-content: center;
+        padding: 0 32px;
+    }
+    .hero-tag {
+        display: inline-flex; align-items: center; gap: 6px; width: fit-content;
+        background: rgba(59,130,246,0.14); color: #93c5fd; font-size: 11.5px; font-weight: 700;
+        padding: 5px 12px; border-radius: 20px; letter-spacing: 0.05em; text-transform: uppercase;
+        margin-bottom: 12px;
+    }
+    .hero-title {
+        font-size: 34px; font-weight: 800; letter-spacing: -0.5px; margin: 0 0 6px;
+        background: linear-gradient(90deg, #ffffff, #bcd4ff);
+        -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
+    }
+    .hero-sub { color: var(--text-muted); font-size: 14px; font-weight: 500; }
+    .hero-clock { color: var(--text-muted); font-size: 12.5px; font-weight: 600; margin-top: 10px; font-family: monospace; }
+
+    .conveyor-track {
+        position: absolute; bottom: 0; left: 0; width: 100%; height: 46px;
+        background: repeating-linear-gradient(90deg, #1e293b 0, #1e293b 22px, #16213a 22px, #16213a 44px);
+        border-top: 3px solid #334155;
+        animation: conveyorMove 1.2s linear infinite;
+    }
+    @keyframes conveyorMove {
+        from { background-position: 0 0; }
+        to { background-position: -44px 0; }
+    }
+    .factory-box {
+        position: absolute; bottom: 40px; font-size: 26px;
+        animation: boxSlide 7s linear infinite;
+        filter: drop-shadow(0 4px 6px rgba(0,0,0,0.4));
+    }
+    .factory-box.b2 { animation-delay: 2.3s; }
+    .factory-box.b3 { animation-delay: 4.6s; }
+    @keyframes boxSlide {
+        0% { left: -8%; opacity: 0; transform: translateY(0); }
+        6% { opacity: 1; }
+        94% { opacity: 1; }
+        100% { left: 106%; opacity: 0; }
+    }
+    .factory-truck {
+        position: absolute; bottom: 44px; font-size: 34px;
+        animation: truckDrive 9s ease-in-out infinite;
+        filter: drop-shadow(0 4px 6px rgba(0,0,0,0.4));
+    }
+    @keyframes truckDrive {
+        0% { left: -12%; transform: scaleX(1); }
+        45% { left: 78%; transform: scaleX(1); }
+        50% { left: 78%; transform: scaleX(-1); }
+        95% { left: -12%; transform: scaleX(-1); }
+        100% { left: -12%; transform: scaleX(1); }
+    }
+    .factory-worker {
+        position: absolute; bottom: 44px; font-size: 22px;
+        animation: workerBob 2.2s ease-in-out infinite;
+    }
+    @keyframes workerBob {
+        0%, 100% { transform: translateY(0); }
+        50% { transform: translateY(-4px); }
+    }
+
     @media (max-width: 640px) {
+        .hero-factory { height: 190px; }
+        .hero-title { font-size: 24px; }
+        .hero-content { padding: 0 20px; }
         .topbar { flex-direction: column; align-items: flex-start; }
         .nav { width: 100%; overflow-x: auto; }
     }
@@ -255,6 +345,23 @@ DASHBOARD_HTML = STYLE_BLOCK + """
 <body>
 <div class="container">
 """ + TOPBAR_TEMPLATE.replace("__NAV__", nav_html('dashboard')) + """
+    <div class="hero-factory">
+        <div class="hero-scan"></div>
+        <div class="hero-content">
+            <span class="hero-tag">⚡ AI-Powered ERP &middot; Live</span>
+            <h1 class="hero-title">REAL INSTANT FOODS</h1>
+            <div class="hero-sub">Dispatch, packing &amp; loading — tracked in real time, floor to office</div>
+            <div class="hero-clock" id="heroClock">—</div>
+        </div>
+        <div class="factory-worker" style="left:6%;">👷</div>
+        <div class="factory-worker" style="left:16%; animation-delay:0.6s;">👷‍♂️</div>
+        <div class="factory-box b1">📦</div>
+        <div class="factory-box b2">📦</div>
+        <div class="factory-box b3">📦</div>
+        <div class="factory-truck">🚚</div>
+        <div class="conveyor-track"></div>
+    </div>
+
     <div class="stats-grid">
         <div class="stat-card">
             <div class="icon">📦</div>
@@ -409,6 +516,15 @@ DASHBOARD_HTML = STYLE_BLOCK + """
 <script src="https://unpkg.com/html5-qrcode"></script>
 <script>
     let lastBarcode = "";
+    function updateHeroClock() {
+        const el = document.getElementById('heroClock');
+        if (!el) return;
+        const now = new Date();
+        const opts = { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true };
+        el.textContent = now.toLocaleString('en-IN', opts) + ' IST';
+    }
+    updateHeroClock();
+    setInterval(updateHeroClock, 1000);
     function startScanner() {
         const reader = document.getElementById('reader');
         reader.style.display = 'block';
@@ -567,29 +683,43 @@ POS_HTML = STYLE_BLOCK + """
         <div class="card-header">
             <h2>📋 {% if filter_company %}{{ filter_company }}'s PO Items{% else %}All PO Items{% endif %}</h2>
         </div>
-        {% if items|length > 0 %}
-        <table>
-            <thead><tr>
-                <th>Company</th><th>PO Number</th><th>Item</th><th>Weight</th><th>Ordered Qty</th><th>Barcode</th><th></th>
-            </tr></thead>
-            <tbody>
-            {% for it in items %}
-            <tr>
-                <td><span class="badge badge-blue">{{ it[6] or 'Unassigned' }}</span></td>
-                <td style="font-weight:600;">{{ it[1] }}</td>
-                <td>{{ it[2] }}</td>
-                <td>{{ it[3] }}</td>
-                <td>{{ it[4] }}</td>
-                <td style="color:var(--text-muted); font-family:monospace;">{{ it[5] }}</td>
-                <td>
-                    <form method="POST" action="/pos/delete/{{ it[0] }}" onsubmit="return confirm('Delete this item?');">
-                        <button type="submit" class="btn btn-danger btn-sm">Delete</button>
-                    </form>
-                </td>
-            </tr>
-            {% endfor %}
-            </tbody>
-        </table>
+        {% if po_groups|length > 0 %}
+        {% for g in po_groups %}
+        <div style="border:1px solid var(--border); border-radius:12px; margin-bottom:16px; overflow:hidden;">
+            <div style="display:flex; justify-content:space-between; align-items:center; padding:12px 16px; background:rgba(255,255,255,0.03); flex-wrap:wrap; gap:8px;">
+                <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+                    <span class="badge badge-blue">{{ g.company or 'Unassigned' }}</span>
+                    <span style="font-weight:700; font-size:14px;">{{ g.po_number }}</span>
+                    <span style="color:var(--text-muted); font-size:12.5px;">{{ g.rows|length }} item(s) &middot; {{ g.total_ordered }} total ordered</span>
+                </div>
+                <form method="POST" action="/pos/delete_po" onsubmit="return confirm('Delete the ENTIRE PO {{ g.po_number }} ({{ g.rows|length }} items)? This cannot be undone.');">
+                    <input type="hidden" name="po_number" value="{{ g.po_number }}">
+                    <input type="hidden" name="company" value="{{ g.company }}">
+                    <button type="submit" class="btn btn-danger btn-sm">🗑 Delete Entire PO</button>
+                </form>
+            </div>
+            <table>
+                <thead><tr>
+                    <th>Item</th><th>Weight</th><th>Ordered Qty</th><th>Barcode</th><th></th>
+                </tr></thead>
+                <tbody>
+                {% for it in g.rows %}
+                <tr>
+                    <td>{{ it[2] }}</td>
+                    <td>{{ it[3] }}</td>
+                    <td>{{ it[4] }}</td>
+                    <td style="color:var(--text-muted); font-family:monospace;">{{ it[5] }}</td>
+                    <td>
+                        <form method="POST" action="/pos/delete/{{ it[0] }}" onsubmit="return confirm('Delete this item?');">
+                            <button type="submit" class="btn btn-danger btn-sm">Delete</button>
+                        </form>
+                    </td>
+                </tr>
+                {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% endfor %}
         {% else %}
         <div class="empty-state">No PO items added yet. Use the form above to add one.</div>
         {% endif %}
@@ -853,16 +983,41 @@ def pos_page():
     conn = sqlite3.connect('factory.db')
     cursor = conn.cursor()
     if filter_company:
-        cursor.execute('SELECT id, po_number, item_name, weight, ordered_qty, barcode, company FROM po_items WHERE company = ? ORDER BY id DESC', (filter_company,))
+        cursor.execute('SELECT id, po_number, item_name, weight, ordered_qty, barcode, company FROM po_items WHERE company = ? ORDER BY po_number, id DESC', (filter_company,))
     else:
-        cursor.execute('SELECT id, po_number, item_name, weight, ordered_qty, barcode, company FROM po_items ORDER BY id DESC')
-    items = cursor.fetchall()
+        cursor.execute('SELECT id, po_number, item_name, weight, ordered_qty, barcode, company FROM po_items ORDER BY po_number, id DESC')
+    rows = cursor.fetchall()
     cursor.execute('SELECT name FROM companies ORDER BY name')
     companies = [r[0] for r in cursor.fetchall()]
     conn.close()
+
+    # Group items by (company, po_number) so a whole wrongly-uploaded PO can be deleted in one go
+    groups_map = {}
+    order = []
+    for it in rows:
+        key = (it[6] or '', it[1])
+        if key not in groups_map:
+            groups_map[key] = {'company': it[6] or '', 'po_number': it[1], 'rows': [], 'total_ordered': 0}
+            order.append(key)
+        groups_map[key]['rows'].append(it)
+        groups_map[key]['total_ordered'] += it[4] or 0
+    po_groups = [groups_map[k] for k in order]
+
     import_msg = request.args.get('msg')
     import_ok = request.args.get('ok') == '1'
-    return render_template_string(POS_HTML, items=items, import_msg=import_msg, import_ok=import_ok, companies=companies, filter_company=filter_company)
+    return render_template_string(POS_HTML, po_groups=po_groups, import_msg=import_msg, import_ok=import_ok, companies=companies, filter_company=filter_company)
+
+@app.route('/pos/delete_po', methods=['POST'])
+def pos_delete_po():
+    if not session.get('logged_in'): return redirect('/login')
+    po_number = request.form.get('po_number', '').strip()
+    company = request.form.get('company', '').strip()
+    conn = sqlite3.connect('factory.db')
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM po_items WHERE po_number = ? AND company = ?', (po_number, company))
+    conn.commit()
+    conn.close()
+    return redirect('/pos?company=' + quote(company) if company else '/pos')
 
 @app.route('/pos/add', methods=['POST'])
 def pos_add():
