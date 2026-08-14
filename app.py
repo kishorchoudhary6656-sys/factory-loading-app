@@ -1,40 +1,47 @@
 from flask import Flask, render_template_string, request, redirect, session, Response
-import sqlite3, csv, io, re
+import os, csv, io, re
+import psycopg2
 from datetime import datetime, timezone, timedelta
 from urllib.parse import quote
 
 app = Flask(__name__)
 app.secret_key = 'real_instant_foods_final_2026'
 
+# --- Database (PostgreSQL via Neon — persists forever, unlike Render's local disk) ---
+DATABASE_URL = os.environ.get('DATABASE_URL')
+if not DATABASE_URL:
+    raise RuntimeError(
+        "DATABASE_URL environment variable is not set. "
+        "This app needs a persistent Postgres database (e.g. from neon.tech) "
+        "so data is never lost on redeploy/restart. "
+        "Set DATABASE_URL in your Render service's Environment settings."
+    )
+
+def get_conn():
+    return psycopg2.connect(DATABASE_URL, sslmode='require')
+
 IST = timezone(timedelta(hours=5, minutes=30))
 def now_ist():
     return datetime.now(timezone.utc).astimezone(IST)
 
 def init_db():
-    conn = sqlite3.connect('factory.db')
+    conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute('''CREATE TABLE IF NOT EXISTS po_items (id INTEGER PRIMARY KEY AUTOINCREMENT, po_number TEXT, item_name TEXT, weight TEXT, ordered_qty INTEGER, barcode TEXT)''')
-    cursor.execute('''CREATE TABLE IF NOT EXISTS dispatch_log (id INTEGER PRIMARY KEY AUTOINCREMENT, po_number TEXT, vehicle_no TEXT, location TEXT, product_name TEXT, loaded_qty INTEGER, timestamp TEXT)''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS po_items (id SERIAL PRIMARY KEY, po_number TEXT, item_name TEXT, weight TEXT, ordered_qty INTEGER, barcode TEXT, company TEXT)''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS dispatch_log (id SERIAL PRIMARY KEY, po_number TEXT, vehicle_no TEXT, location TEXT, product_name TEXT, loaded_qty INTEGER, timestamp TEXT, barcode TEXT)''')
     # Shared, global state (NOT per-browser) so every device sees the same active dispatch session live
     cursor.execute('''CREATE TABLE IF NOT EXISTS app_state (key TEXT PRIMARY KEY, value TEXT)''')
     # Companies (Zepto, Flipkart, Reliance, Anand Sweets, etc.) — each PO belongs to one company/folder
-    cursor.execute('''CREATE TABLE IF NOT EXISTS companies (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE)''')
-    # Add barcode column to dispatch_log if migrating from an older schema
-    try:
-        cursor.execute('ALTER TABLE dispatch_log ADD COLUMN barcode TEXT')
-    except sqlite3.OperationalError:
-        pass
-    # Add company column to po_items if migrating from an older schema
-    try:
-        cursor.execute('ALTER TABLE po_items ADD COLUMN company TEXT')
-    except sqlite3.OperationalError:
-        pass
+    cursor.execute('''CREATE TABLE IF NOT EXISTS companies (id SERIAL PRIMARY KEY, name TEXT UNIQUE)''')
+    # Defensive migrations in case an older schema already exists
+    cursor.execute('ALTER TABLE dispatch_log ADD COLUMN IF NOT EXISTS barcode TEXT')
+    cursor.execute('ALTER TABLE po_items ADD COLUMN IF NOT EXISTS company TEXT')
     conn.commit()
     conn.close()
 init_db()
 
 def get_active_session():
-    conn = sqlite3.connect('factory.db')
+    conn = get_conn()
     cursor = conn.cursor()
     cursor.execute("SELECT key, value FROM app_state WHERE key IN ('cur_po', 'cur_vehicle', 'cur_location')")
     rows = dict(cursor.fetchall())
@@ -46,10 +53,10 @@ def get_active_session():
     }
 
 def set_active_session(po_number, vehicle_no, location):
-    conn = sqlite3.connect('factory.db')
+    conn = get_conn()
     cursor = conn.cursor()
     for key, value in [('cur_po', po_number), ('cur_vehicle', vehicle_no), ('cur_location', location)]:
-        cursor.execute('INSERT INTO app_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value', (key, value))
+        cursor.execute('INSERT INTO app_state (key, value) VALUES (%s, %s) ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value', (key, value))
     conn.commit()
     conn.close()
 
@@ -948,7 +955,7 @@ LOGIN_HTML = STYLE_BLOCK + """
 @app.route('/')
 def home():
     if not session.get('logged_in'): return redirect('/login')
-    conn = sqlite3.connect('factory.db')
+    conn = get_conn()
     cursor = conn.cursor()
     cursor.execute('SELECT DISTINCT po_number, company FROM po_items GROUP BY po_number')
     po_list = cursor.fetchall()
@@ -994,7 +1001,7 @@ def home():
 @app.route('/companies')
 def companies_page():
     if not session.get('logged_in'): return redirect('/login')
-    conn = sqlite3.connect('factory.db')
+    conn = get_conn()
     cursor = conn.cursor()
     cursor.execute('SELECT name FROM companies ORDER BY name')
     names = [r[0] for r in cursor.fetchall()]
@@ -1011,12 +1018,13 @@ def companies_add():
     name = request.form.get('name', '').strip()
     if not name:
         return redirect('/companies')
-    conn = sqlite3.connect('factory.db')
+    conn = get_conn()
     cursor = conn.cursor()
     try:
-        cursor.execute('INSERT INTO companies (name) VALUES (?)', (name,))
+        cursor.execute('INSERT INTO companies (name) VALUES (%s)', (name,))
         conn.commit()
-    except sqlite3.IntegrityError:
+    except psycopg2.IntegrityError:
+        conn.rollback()
         conn.close()
         return redirect('/companies?error=' + quote(f'"{name}" already exists.'))
     conn.close()
@@ -1026,10 +1034,10 @@ def companies_add():
 def history_page():
     if not session.get('logged_in'): return redirect('/login')
     search_po = request.args.get('po', '').strip()
-    conn = sqlite3.connect('factory.db')
+    conn = get_conn()
     cursor = conn.cursor()
     if search_po:
-        cursor.execute('SELECT po_number, vehicle_no, location, product_name, loaded_qty, timestamp FROM dispatch_log WHERE po_number LIKE ? ORDER BY id DESC', (f'%{search_po}%',))
+        cursor.execute('SELECT po_number, vehicle_no, location, product_name, loaded_qty, timestamp FROM dispatch_log WHERE po_number LIKE %s ORDER BY id DESC', (f'%{search_po}%',))
     else:
         cursor.execute('SELECT po_number, vehicle_no, location, product_name, loaded_qty, timestamp FROM dispatch_log ORDER BY id DESC LIMIT 200')
     records = cursor.fetchall()
@@ -1050,10 +1058,10 @@ def history_page():
 def pos_page():
     if not session.get('logged_in'): return redirect('/login')
     filter_company = request.args.get('company', '').strip()
-    conn = sqlite3.connect('factory.db')
+    conn = get_conn()
     cursor = conn.cursor()
     if filter_company:
-        cursor.execute('SELECT id, po_number, item_name, weight, ordered_qty, barcode, company FROM po_items WHERE company = ? ORDER BY po_number, id DESC', (filter_company,))
+        cursor.execute('SELECT id, po_number, item_name, weight, ordered_qty, barcode, company FROM po_items WHERE company = %s ORDER BY po_number, id DESC', (filter_company,))
     else:
         cursor.execute('SELECT id, po_number, item_name, weight, ordered_qty, barcode, company FROM po_items ORDER BY po_number, id DESC')
     rows = cursor.fetchall()
@@ -1082,9 +1090,9 @@ def pos_delete_po():
     if not session.get('logged_in'): return redirect('/login')
     po_number = request.form.get('po_number', '').strip()
     company = request.form.get('company', '').strip()
-    conn = sqlite3.connect('factory.db')
+    conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute('DELETE FROM po_items WHERE po_number = ? AND company = ?', (po_number, company))
+    cursor.execute('DELETE FROM po_items WHERE po_number = %s AND company = %s', (po_number, company))
     conn.commit()
     conn.close()
     return redirect('/pos?company=' + quote(company) if company else '/pos')
@@ -1098,9 +1106,9 @@ def pos_add():
     weight = request.form.get('weight', '').strip()
     ordered_qty = request.form.get('ordered_qty', '').strip() or 0
     barcode = request.form.get('barcode', '').strip()
-    conn = sqlite3.connect('factory.db')
+    conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute('INSERT INTO po_items (po_number, item_name, weight, ordered_qty, barcode, company) VALUES (?, ?, ?, ?, ?, ?)',
+    cursor.execute('INSERT INTO po_items (po_number, item_name, weight, ordered_qty, barcode, company) VALUES (%s, %s, %s, %s, %s, %s)',
                    (po_number, item_name, weight, int(ordered_qty), barcode, company))
     conn.commit()
     conn.close()
@@ -1161,7 +1169,7 @@ def pos_import_csv():
     if missing:
         return redirect('/pos?ok=0&msg=' + quote(f'These columns were not found in the CSV: {", ".join(missing)}'))
 
-    conn = sqlite3.connect('factory.db')
+    conn = get_conn()
     cursor = conn.cursor()
     inserted, skipped = 0, 0
     for row in reader:
@@ -1181,7 +1189,7 @@ def pos_import_csv():
         except ValueError:
             skipped += 1
             continue
-        cursor.execute('INSERT INTO po_items (po_number, item_name, weight, ordered_qty, barcode, company) VALUES (?, ?, ?, ?, ?, ?)',
+        cursor.execute('INSERT INTO po_items (po_number, item_name, weight, ordered_qty, barcode, company) VALUES (%s, %s, %s, %s, %s, %s)',
                        (po_number, item_name, weight, ordered_qty, barcode, company))
         inserted += 1
     conn.commit()
@@ -1195,9 +1203,9 @@ def pos_import_csv():
 @app.route('/pos/delete/<int:item_id>', methods=['POST'])
 def pos_delete(item_id):
     if not session.get('logged_in'): return redirect('/login')
-    conn = sqlite3.connect('factory.db')
+    conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute('DELETE FROM po_items WHERE id = ?', (item_id,))
+    cursor.execute('DELETE FROM po_items WHERE id = %s', (item_id,))
     conn.commit()
     conn.close()
     return redirect('/pos')
@@ -1215,9 +1223,9 @@ def start_session():
 def lookup_barcode():
     if not session.get('logged_in'): return {'found': False}, 401
     barcode = request.args.get('barcode', '').strip()
-    conn = sqlite3.connect('factory.db')
+    conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute('SELECT item_name, weight FROM po_items WHERE barcode = ? LIMIT 1', (barcode,))
+    cursor.execute('SELECT item_name, weight FROM po_items WHERE barcode = %s LIMIT 1', (barcode,))
     item = cursor.fetchone()
     conn.close()
     if item:
@@ -1232,13 +1240,13 @@ def process_scan():
     po_number = active['cur_po'] or 'Unknown'
     vehicle_no = active['cur_vehicle'] or 'Unknown'
     location = active['cur_location'] or 'Unknown'
-    conn = sqlite3.connect('factory.db')
+    conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute('SELECT item_name, weight FROM po_items WHERE barcode = ?', (barcode,))
+    cursor.execute('SELECT item_name, weight FROM po_items WHERE barcode = %s', (barcode,))
     item = cursor.fetchone()
     if item:
         total_qty = calculate_qty(item[1], m_units)
-        cursor.execute('INSERT INTO dispatch_log (po_number, vehicle_no, location, product_name, loaded_qty, timestamp, barcode) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        cursor.execute('INSERT INTO dispatch_log (po_number, vehicle_no, location, product_name, loaded_qty, timestamp, barcode) VALUES (%s, %s, %s, %s, %s, %s, %s)',
                        (po_number, vehicle_no, location, f"{item[0]} ({item[1]})", total_qty, now_ist().strftime("%d %b %Y, %I:%M %p"), barcode))
         conn.commit()
         conn.close()
@@ -1254,9 +1262,9 @@ def dispatch_edit(log_id):
         new_qty = int(float(new_qty))
     except ValueError:
         return redirect('/')
-    conn = sqlite3.connect('factory.db')
+    conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute('UPDATE dispatch_log SET loaded_qty = ? WHERE id = ?', (new_qty, log_id))
+    cursor.execute('UPDATE dispatch_log SET loaded_qty = %s WHERE id = %s', (new_qty, log_id))
     conn.commit()
     conn.close()
     return redirect('/')
@@ -1264,9 +1272,9 @@ def dispatch_edit(log_id):
 @app.route('/dispatch/delete/<int:log_id>', methods=['POST'])
 def dispatch_delete(log_id):
     if not session.get('logged_in'): return redirect('/login')
-    conn = sqlite3.connect('factory.db')
+    conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute('DELETE FROM dispatch_log WHERE id = ?', (log_id,))
+    cursor.execute('DELETE FROM dispatch_log WHERE id = %s', (log_id,))
     conn.commit()
     conn.close()
     return redirect('/')
@@ -1274,7 +1282,7 @@ def dispatch_delete(log_id):
 @app.route('/export_csv')
 def export_csv():
     if not session.get('logged_in'): return redirect('/login')
-    conn = sqlite3.connect('factory.db')
+    conn = get_conn()
     cursor = conn.cursor()
     cursor.execute('SELECT po_number, vehicle_no, location, product_name, loaded_qty, timestamp FROM dispatch_log ORDER BY id DESC')
     rows = cursor.fetchall()
@@ -1294,7 +1302,7 @@ def export_csv():
 @app.route('/export_progress_csv')
 def export_progress_csv():
     if not session.get('logged_in'): return redirect('/login')
-    conn = sqlite3.connect('factory.db')
+    conn = get_conn()
     cursor = conn.cursor()
     cursor.execute('SELECT po_number, barcode, item_name, weight, company, SUM(ordered_qty) FROM po_items GROUP BY po_number, barcode')
     po_item_rows = cursor.fetchall()
