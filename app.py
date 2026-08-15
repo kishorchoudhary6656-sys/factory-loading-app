@@ -1,5 +1,5 @@
 from flask import Flask, render_template_string, request, redirect, session, Response
-import os, csv, io, re
+import os, csv, io, re, json
 import psycopg2
 from datetime import datetime, timezone, timedelta
 from urllib.parse import quote
@@ -32,10 +32,26 @@ def init_db():
     # Shared, global state (NOT per-browser) so every device sees the same active dispatch session live
     cursor.execute('''CREATE TABLE IF NOT EXISTS app_state (key TEXT PRIMARY KEY, value TEXT)''')
     # Companies (Zepto, Flipkart, Reliance, Anand Sweets, etc.) — each PO belongs to one company/folder
-    cursor.execute('''CREATE TABLE IF NOT EXISTS companies (id SERIAL PRIMARY KEY, name TEXT UNIQUE)''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS companies (id SERIAL PRIMARY KEY, name TEXT UNIQUE, sub_brands TEXT)''')
+    # Quality Checkers — registered with a reference photo for identity check-in
+    cursor.execute('''CREATE TABLE IF NOT EXISTS quality_checkers (id SERIAL PRIMARY KEY, name TEXT UNIQUE, photo_data TEXT, created_at TEXT)''')
+    # A pre-loaded catalog of barcodes (independent of any single PO) so scanning always matches
+    cursor.execute('''CREATE TABLE IF NOT EXISTS barcode_catalog (id SERIAL PRIMARY KEY, barcode TEXT UNIQUE, item_name TEXT)''')
+    # Daily Production log — one row per packed unit logged by a Quality Checker
+    cursor.execute('''CREATE TABLE IF NOT EXISTS daily_production (
+        id SERIAL PRIMARY KEY,
+        company TEXT, sub_brand TEXT, item_name_entered TEXT, item_name TEXT, barcode TEXT,
+        packing_date TEXT, use_by_date TEXT, batch_number TEXT, quantity INTEGER,
+        qc_name TEXT, qc_photo TEXT,
+        prod_date TEXT, prod_time TEXT, created_at TEXT
+    )''')
     # Defensive migrations in case an older schema already exists
     cursor.execute('ALTER TABLE dispatch_log ADD COLUMN IF NOT EXISTS barcode TEXT')
     cursor.execute('ALTER TABLE po_items ADD COLUMN IF NOT EXISTS company TEXT')
+    cursor.execute('ALTER TABLE companies ADD COLUMN IF NOT EXISTS sub_brands TEXT')
+    # Convenience defaults for the three companies named in the spec, only if not already set
+    for cname, subs in [('Zepto', 'Daily Good,Unbranded'), ('Flipkart', 'Unbranded,My Kitchen'), ('Reliance', 'Good Life')]:
+        cursor.execute('UPDATE companies SET sub_brands = %s WHERE name = %s AND (sub_brands IS NULL OR sub_brands = %s)', (subs, cname, ''))
     conn.commit()
     conn.close()
 init_db()
@@ -374,6 +390,7 @@ def nav_html(active):
         <a href="/" class="{cls('dashboard')}">Dashboard</a>
         <a href="/companies" class="{cls('companies')}">Companies</a>
         <a href="/pos" class="{cls('pos')}">Manage POs</a>
+        <a href="/production" class="{cls('production')}">Daily Production</a>
         <a href="/history" class="{cls('history')}">History</a>
     </div>
     """
@@ -653,7 +670,7 @@ DASHBOARD_HTML = STYLE_BLOCK + """
         const modalsOpen = Array.from(document.querySelectorAll('.modal')).some(m => getComputedStyle(m).display === 'flex');
         const typing = document.activeElement && ['INPUT', 'SELECT', 'TEXTAREA'].includes(document.activeElement.tagName);
         if (!modalsOpen && !typing) location.reload();
-    }, 12000);
+    }, 60000);
 </script>
 </body>
 </html>
@@ -675,7 +692,7 @@ POS_HTML = STYLE_BLOCK + """
 
     <div class="card">
         <div class="card-header">
-            <h2>📤 Bulk Import from CSV</h2>
+            <h2>📤 Bulk Import from CSV / Excel</h2>
         </div>
         {% if import_msg %}
         <div class="badge {% if import_ok %}badge-green{% else %}badge-amber{% endif %}" style="display:block; padding:10px 14px; margin-bottom:14px; font-size:13px;">{{ import_msg }}</div>
@@ -688,12 +705,12 @@ POS_HTML = STYLE_BLOCK + """
                 <option value="{{ c }}" {% if c == filter_company %}selected{% endif %}>{{ c }}</option>
                 {% endfor %}
             </select>
-            <label>Choose CSV File</label>
-            <input type="file" name="csv_file" accept=".csv" required style="padding:10px;">
+            <label>Choose CSV or Excel File</label>
+            <input type="file" name="csv_file" accept=".csv,.xlsx" required style="padding:10px;">
             <button type="submit" class="btn" style="margin-top:10px;">Upload &amp; Import</button>
         </form>
         <div style="color:var(--text-muted); font-size:12.5px; margin-top:12px; line-height:1.6;">
-            Your CSV should have these columns (any order, header row required):<br>
+            Both .csv and .xlsx (Excel) files work. Your file should have these columns (any order, header row required):<br>
             <span style="font-family:monospace; color:var(--text);">po_number, item_name, weight, ordered_qty, barcode</span><br>
             Example: <span style="font-family:monospace;">PO-2026-014, Instant Noodles, 1kg, 500, 8901234567890</span><br>
             No company yet? <a href="/companies" style="color:var(--primary);">Add one here</a> first.
@@ -811,6 +828,7 @@ COMPANIES_HTML = STYLE_BLOCK + """
         <form method="POST" action="/companies/add">
             <div style="display:flex; gap:10px; flex-wrap:wrap;">
                 <input type="text" name="name" placeholder="e.g. Zepto, Flipkart, Reliance, Anand Sweets" style="flex:1; min-width:220px; margin:0;" required>
+                <input type="text" name="sub_brands" placeholder="Sub-brands, comma separated (optional)" style="flex:1; min-width:220px; margin:0;">
                 <button type="submit" class="btn" style="white-space:nowrap;">Add Company</button>
             </div>
         </form>
@@ -821,15 +839,27 @@ COMPANIES_HTML = STYLE_BLOCK + """
             <h2>🏢 Company Folders</h2>
         </div>
         {% if companies|length > 0 %}
-        <div style="display:grid; grid-template-columns:repeat(auto-fill, minmax(220px, 1fr)); gap:14px;">
+        <div style="display:grid; grid-template-columns:repeat(auto-fill, minmax(240px, 1fr)); gap:14px;">
             {% for c in companies %}
-            <a href="/pos?company={{ c.name }}" style="text-decoration:none; color:inherit;">
-                <div style="background:rgba(255,255,255,0.03); border:1px solid var(--border); border-radius:12px; padding:18px; transition:background 0.15s;" onmouseover="this.style.background='rgba(255,255,255,0.06)'" onmouseout="this.style.background='rgba(255,255,255,0.03)'">
+            <div style="background:rgba(255,255,255,0.03); border:1px solid var(--border); border-radius:12px; padding:18px;">
+                <a href="/pos?company={{ c.name }}" style="text-decoration:none; color:inherit;">
                     <div style="font-size:26px; margin-bottom:8px;">🏢</div>
                     <div style="font-weight:700; font-size:15px; margin-bottom:6px;">{{ c.name }}</div>
-                    <div style="color:var(--text-muted); font-size:12.5px;">{{ c.po_count }} PO(s) &middot; {{ c.item_count }} item(s)</div>
+                    <div style="color:var(--text-muted); font-size:12.5px; margin-bottom:8px;">{{ c.po_count }} PO(s) &middot; {{ c.item_count }} item(s)</div>
+                </a>
+                {% if c.sub_brands %}
+                <div style="margin-bottom:8px;">
+                    {% for sb in c.sub_brands.split(',') %}
+                    <span class="badge badge-blue" style="margin:2px 3px 0 0;">{{ sb.strip() }}</span>
+                    {% endfor %}
                 </div>
-            </a>
+                {% endif %}
+                <form method="POST" action="/companies/edit_subbrands" style="display:flex; gap:6px;" onsubmit="return true;">
+                    <input type="hidden" name="name" value="{{ c.name }}">
+                    <input type="text" name="sub_brands" value="{{ c.sub_brands or '' }}" placeholder="Sub-brands, comma separated" style="margin:0; font-size:12px; padding:8px;">
+                    <button type="submit" class="btn btn-outline btn-sm" style="white-space:nowrap;">Save</button>
+                </form>
+            </div>
             {% endfor %}
         </div>
         {% else %}
@@ -839,6 +869,393 @@ COMPANIES_HTML = STYLE_BLOCK + """
 
     <footer>REAL INSTANT FOODS &middot; AI ERP System</footer>
 </div>
+</body>
+</html>
+"""
+
+PRODUCTION_HTML = STYLE_BLOCK + """
+<title>Daily Production | REAL INSTANT FOODS</title>
+</head>
+<body>
+<div class="container">
+""" + TOPBAR_TEMPLATE.replace("__NAV__", nav_html('production')) + """
+    <div class="nav" style="margin-bottom:20px; width:fit-content;">
+        <a href="/production?tab=log" class="{% if tab == 'log' %}active{% endif %}">📝 Log Entry</a>
+        <a href="/production?tab=history" class="{% if tab == 'history' %}active{% endif %}">📅 History</a>
+        <a href="/production?tab=summary" class="{% if tab == 'summary' %}active{% endif %}">📊 Master Summary</a>
+        <a href="/production?tab=admin" class="{% if tab == 'admin' %}active{% endif %}">⚙️ Admin</a>
+    </div>
+
+    {% if msg %}
+    <div class="badge {% if msg_ok %}badge-green{% else %}badge-amber{% endif %}" style="display:block; padding:10px 14px; margin-bottom:18px; font-size:13px;">{{ msg }}</div>
+    {% endif %}
+
+    {% if tab == 'log' %}
+    <div class="card">
+        <div class="card-header"><h2>📝 Log a Production Entry</h2></div>
+
+        {% if companies|length == 0 %}
+        <div class="empty-state">No companies yet — <a href="/companies" style="color:var(--primary);">add one first</a>.</div>
+        {% elif quality_checkers|length == 0 %}
+        <div class="empty-state">No Quality Checkers registered yet — go to the <a href="/production?tab=admin" style="color:var(--primary);">Admin tab</a> to register one first.</div>
+        {% else %}
+        <form method="POST" action="/production/add" id="prodForm">
+            <div class="form-grid">
+                <div>
+                    <label>Company</label>
+                    <select name="company" id="prodCompany" required onchange="updateSubBrands()">
+                        <option value="" disabled selected>Select company</option>
+                        {% for c in companies %}
+                        <option value="{{ c.name }}">{{ c.name }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div>
+                    <label>Sub-brand</label>
+                    <select name="sub_brand" id="prodSubBrand" required>
+                        <option value="" disabled selected>Select company first</option>
+                    </select>
+                </div>
+                <div>
+                    <label>Item Being Packed</label>
+                    <input type="text" name="item_name_entered" placeholder="e.g. Raw Peanut 500g" required>
+                </div>
+            </div>
+
+            <div style="margin-top:18px; padding:16px; background:rgba(255,255,255,0.03); border-radius:12px;">
+                <label style="margin-top:0;">Quality Checker Check-in</label>
+                <select name="qc_name" id="qcSelect" required onchange="showQcPhoto()">
+                    <option value="" disabled selected>Select your name</option>
+                    {% for qc in quality_checkers %}
+                    <option value="{{ qc.name }}">{{ qc.name }}</option>
+                    {% endfor %}
+                </select>
+                <div id="qcRefPhotoWrap" style="display:none; margin:10px 0; align-items:center; gap:10px;">
+                    <span style="font-size:12px; color:var(--text-muted);">Registered photo:</span>
+                    <img id="qcRefPhoto" style="width:52px; height:52px; border-radius:8px; object-fit:cover; vertical-align:middle; margin-left:8px; border:1px solid var(--border);">
+                </div>
+                <label>Take a check-in selfie to confirm it's you</label>
+                <input type="file" accept="image/*" capture="user" id="qcPhotoFile" onchange="compressImage(this, 'qcPhotoData', 'qcPhotoPreview')">
+                <input type="hidden" name="qc_photo" id="qcPhotoData" required>
+                <img id="qcPhotoPreview" style="display:none; width:64px; height:64px; border-radius:8px; object-fit:cover; margin-top:8px; border:2px solid var(--primary);">
+            </div>
+
+            <div style="margin-top:18px; padding:16px; background:rgba(255,255,255,0.03); border-radius:12px;">
+                <label style="margin-top:0;">Scan Packet Barcode</label>
+                <div id="prodReader" style="width:100%; border-radius:10px; display:none; margin-bottom:10px;"></div>
+                <div style="display:flex; gap:8px; flex-wrap:wrap;">
+                    <button type="button" class="btn btn-outline" onclick="startProdScanner()">📷 Scan Barcode</button>
+                    <input type="text" id="prodManualBarcode" placeholder="Or type barcode manually" style="margin:0; flex:1; min-width:160px;">
+                    <button type="button" class="btn btn-outline" onclick="lookupProdBarcode()">Look Up</button>
+                </div>
+                <div id="prodScannedInfo" style="display:none; margin-top:12px; background:rgba(255,255,255,0.04); border-radius:10px; padding:12px;">
+                    <div style="font-size:12px; color:var(--text-muted); font-weight:600;">SCANNED ITEM</div>
+                    <div id="prodScannedName" style="font-weight:700;">—</div>
+                    <div style="font-size:12px; color:var(--text-muted); margin-top:4px;">EAN / Barcode: <span id="prodScannedBarcode" style="font-family:monospace;">—</span></div>
+                </div>
+                <input type="hidden" name="barcode" id="prodBarcodeField" required>
+                <input type="hidden" name="item_name" id="prodItemNameField">
+            </div>
+
+            <div class="form-grid" style="margin-top:18px;">
+                <div>
+                    <label>Packing Date</label>
+                    <input type="date" name="packing_date" required>
+                </div>
+                <div>
+                    <label>Use-by Date</label>
+                    <input type="date" name="use_by_date" required>
+                </div>
+                <div>
+                    <label>Batch Number</label>
+                    <input type="text" name="batch_number" placeholder="e.g. B-2026-081" required>
+                </div>
+                <div>
+                    <label>Quantity</label>
+                    <input type="number" name="quantity" placeholder="e.g. 100" required>
+                </div>
+            </div>
+
+            <button type="submit" class="btn" style="margin-top:18px;">Log Production Entry</button>
+        </form>
+        {% endif %}
+    </div>
+
+    {% elif tab == 'history' %}
+    {% if grouped_history|length > 0 %}
+    {% for group in grouped_history %}
+    <div class="card">
+        <div class="card-header">
+            <h2>📅 {{ group.date }}</h2>
+            <span class="badge badge-blue">{{ group.entries|length }} entries &middot; {{ group.total_qty }} total qty</span>
+        </div>
+        <table>
+            <thead><tr>
+                <th>Time</th><th>Company</th><th>Sub-brand</th><th>Item</th><th>Batch</th><th>Qty</th><th>QC</th><th></th>
+            </tr></thead>
+            <tbody>
+            {% for e in group.entries %}
+            <tr>
+                <td style="color:var(--text-muted);">{{ e.prod_time }}</td>
+                <td>{{ e.company }}</td>
+                <td><span class="badge badge-blue">{{ e.sub_brand }}</span></td>
+                <td>{{ e.item_name }}</td>
+                <td>{{ e.batch_number }}</td>
+                <td><span class="badge badge-green">{{ e.quantity }}</span></td>
+                <td>{{ e.qc_name }}</td>
+                <td style="white-space:nowrap;">
+                    {% if e.editable %}
+                    <button class="btn btn-outline btn-sm" onclick="openEditProd('{{ e.id }}', '{{ e.packing_date }}', '{{ e.use_by_date }}', '{{ e.batch_number }}', '{{ e.quantity }}')">Edit</button>
+                    <form method="POST" action="/production/delete/{{ e.id }}" style="display:inline;" onsubmit="return confirm('Delete this entry?');">
+                        <button type="submit" class="btn btn-danger btn-sm">Delete</button>
+                    </form>
+                    {% else %}
+                    <span class="badge badge-amber">🔒 Locked</span>
+                    {% endif %}
+                </td>
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% endfor %}
+    {% else %}
+    <div class="card"><div class="empty-state">No production entries yet.</div></div>
+    {% endif %}
+
+    <div id="editProdModal" class="modal">
+        <div class="modal-content">
+            <h3>Edit Production Entry</h3>
+            <form method="POST" id="editProdForm" action="/production/edit/0">
+                <label style="text-align:left;">Packing Date</label>
+                <input type="date" name="packing_date" id="editPackingDate" required>
+                <label style="text-align:left;">Use-by Date</label>
+                <input type="date" name="use_by_date" id="editUseByDate" required>
+                <label style="text-align:left;">Batch Number</label>
+                <input type="text" name="batch_number" id="editBatchNumber" required>
+                <label style="text-align:left;">Quantity</label>
+                <input type="number" name="quantity" id="editQuantity" required>
+                <button type="submit" class="btn btn-block" style="margin-top:10px;">Save</button>
+            </form>
+            <button class="btn btn-outline btn-block" style="margin-top:8px;" onclick="document.getElementById('editProdModal').style.display='none'">Cancel</button>
+        </div>
+    </div>
+
+    {% elif tab == 'summary' %}
+    <div class="stats-grid">
+        <div class="stat-card">
+            <div class="icon">📦</div>
+            <div class="label">Total Production (All Time)</div>
+            <div class="value">{{ grand_total }}</div>
+        </div>
+        <div class="stat-card">
+            <div class="icon">🏢</div>
+            <div class="label">Companies</div>
+            <div class="value">{{ by_company|length }}</div>
+        </div>
+        <div class="stat-card">
+            <div class="icon">📋</div>
+            <div class="label">Total Entries Logged</div>
+            <div class="value">{{ total_entries }}</div>
+        </div>
+    </div>
+
+    <div class="card">
+        <div class="card-header"><h2>🏢 Production by Company</h2></div>
+        {% if by_company|length > 0 %}
+        {% for c in by_company %}
+        <div style="margin-bottom:14px;">
+            <div style="display:flex; justify-content:space-between; font-size:13.5px; margin-bottom:2px;">
+                <span style="font-weight:600;">{{ c.company }}</span>
+                <span style="color:var(--text-muted);">{{ c.total }}</span>
+            </div>
+            <div class="progress-track"><div class="progress-fill" style="width:{{ c.percent }}%;"></div></div>
+        </div>
+        {% endfor %}
+        {% else %}
+        <div class="empty-state">No production data yet.</div>
+        {% endif %}
+    </div>
+
+    <div class="card">
+        <div class="card-header"><h2>📦 Top Items Produced</h2></div>
+        {% if by_item|length > 0 %}
+        <table>
+            <thead><tr><th>Item</th><th>Total Quantity</th></tr></thead>
+            <tbody>
+            {% for it in by_item %}
+            <tr><td>{{ it.item_name }}</td><td><span class="badge badge-green">{{ it.total }}</span></td></tr>
+            {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <div class="empty-state">No production data yet.</div>
+        {% endif %}
+    </div>
+
+    {% elif tab == 'admin' %}
+    <div class="card">
+        <div class="card-header"><h2>👤 Register Quality Checker</h2></div>
+        <form method="POST" action="/production/qc/add" id="qcRegisterForm">
+            <label>Name</label>
+            <input type="text" name="name" placeholder="Quality Checker's full name" required>
+            <label>Reference Photo</label>
+            <input type="file" accept="image/*" capture="user" id="qcRegPhotoFile" onchange="compressImage(this, 'qcRegPhotoData', 'qcRegPhotoPreview')">
+            <input type="hidden" name="photo_data" id="qcRegPhotoData" required>
+            <img id="qcRegPhotoPreview" style="display:none; width:70px; height:70px; border-radius:10px; object-fit:cover; margin-top:8px; border:2px solid var(--primary);">
+            <button type="submit" class="btn" style="margin-top:12px;">Register</button>
+        </form>
+    </div>
+
+    <div class="card">
+        <div class="card-header"><h2>👥 Registered Quality Checkers</h2></div>
+        {% if quality_checkers|length > 0 %}
+        <div style="display:grid; grid-template-columns:repeat(auto-fill, minmax(160px, 1fr)); gap:14px;">
+            {% for qc in quality_checkers %}
+            <div style="background:rgba(255,255,255,0.03); border:1px solid var(--border); border-radius:12px; padding:14px; text-align:center;">
+                <img src="{{ qc.photo_data }}" style="width:56px; height:56px; border-radius:50%; object-fit:cover; margin-bottom:8px;">
+                <div style="font-weight:600; font-size:13px; margin-bottom:8px;">{{ qc.name }}</div>
+                <form method="POST" action="/production/qc/delete/{{ qc.id }}" onsubmit="return confirm('Remove this Quality Checker?');">
+                    <button type="submit" class="btn btn-danger btn-sm" style="width:100%;">Remove</button>
+                </form>
+            </div>
+            {% endfor %}
+        </div>
+        {% else %}
+        <div class="empty-state">No Quality Checkers registered yet.</div>
+        {% endif %}
+    </div>
+
+    <div class="card">
+        <div class="card-header"><h2>📇 Barcode Catalog</h2></div>
+        <div style="color:var(--text-muted); font-size:12.5px; margin-bottom:14px;">
+            Pre-load every known barcode/EAN here so scanning in Daily Production and Dispatch always finds a match, even for items not on a specific PO. Currently <strong style="color:var(--text);">{{ catalog_count }}</strong> barcode(s) loaded.
+        </div>
+        <form method="POST" action="/production/barcode_catalog/import" enctype="multipart/form-data" style="margin-bottom:18px;">
+            <label>Bulk Import (CSV or Excel — columns: barcode, item_name)</label>
+            <input type="file" name="catalog_file" accept=".csv,.xlsx" required style="padding:10px;">
+            <button type="submit" class="btn" style="margin-top:10px;">Upload &amp; Import</button>
+        </form>
+        <form method="POST" action="/production/barcode_catalog/add">
+            <div style="display:flex; gap:10px; flex-wrap:wrap;">
+                <input type="text" name="barcode" placeholder="Barcode / EAN" style="flex:1; min-width:160px; margin:0;" required>
+                <input type="text" name="item_name" placeholder="Item name" style="flex:1; min-width:160px; margin:0;" required>
+                <button type="submit" class="btn btn-outline" style="white-space:nowrap;">Add Single Barcode</button>
+            </div>
+        </form>
+    </div>
+    {% endif %}
+
+    <footer>REAL INSTANT FOODS &middot; AI ERP System</footer>
+</div>
+
+<script src="https://unpkg.com/html5-qrcode"></script>
+<script>
+    const companySubBrands = {{ company_subbrands_json | safe }};
+    const qcPhotos = {{ qc_photos_json | safe }};
+
+    function updateSubBrands() {
+        const company = document.getElementById('prodCompany').value;
+        const subSelect = document.getElementById('prodSubBrand');
+        const subs = companySubBrands[company] || [];
+        subSelect.innerHTML = '';
+        if (subs.length === 0) {
+            subSelect.innerHTML = '<option value="" disabled selected>No sub-brands set for this company</option>';
+            return;
+        }
+        subSelect.innerHTML = '<option value="" disabled selected>Select sub-brand</option>' +
+            subs.map(s => `<option value="${s}">${s}</option>`).join('');
+    }
+
+    function showQcPhoto() {
+        const name = document.getElementById('qcSelect').value;
+        const wrap = document.getElementById('qcRefPhotoWrap');
+        const img = document.getElementById('qcRefPhoto');
+        if (qcPhotos[name]) {
+            img.src = qcPhotos[name];
+            wrap.style.display = 'flex';
+        } else {
+            wrap.style.display = 'none';
+        }
+    }
+
+    // Resizes/compresses a captured photo client-side before it's ever sent to
+    // the server, so photo storage stays small and the page never hangs on upload.
+    function compressImage(inputEl, hiddenFieldId, previewId) {
+        const file = inputEl.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = function(e) {
+            const img = new Image();
+            img.onload = function() {
+                const maxDim = 220;
+                let w = img.width, h = img.height;
+                if (w > h && w > maxDim) { h = h * (maxDim / w); w = maxDim; }
+                else if (h > maxDim) { w = w * (maxDim / h); h = maxDim; }
+                const canvas = document.createElement('canvas');
+                canvas.width = w; canvas.height = h;
+                canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+                const dataUrl = canvas.toDataURL('image/jpeg', 0.6);
+                document.getElementById(hiddenFieldId).value = dataUrl;
+                if (previewId) {
+                    const prev = document.getElementById(previewId);
+                    prev.src = dataUrl;
+                    prev.style.display = 'inline-block';
+                }
+            };
+            img.src = e.target.result;
+        };
+        reader.readAsDataURL(file);
+    }
+
+    let prodLastBarcode = "";
+    function startProdScanner() {
+        const reader = document.getElementById('prodReader');
+        reader.style.display = 'block';
+        const scanner = new Html5Qrcode("prodReader");
+        scanner.start({facingMode: "environment"}, {fps: 30, qrbox: 200}, (data) => {
+            scanner.stop();
+            reader.style.display = 'none';
+            resolveProdBarcode(data);
+        });
+    }
+    function lookupProdBarcode() {
+        const val = document.getElementById('prodManualBarcode').value.trim();
+        if (!val) return;
+        resolveProdBarcode(val);
+    }
+    function resolveProdBarcode(barcode) {
+        prodLastBarcode = barcode;
+        document.getElementById('prodScannedInfo').style.display = 'block';
+        document.getElementById('prodScannedName').textContent = 'Looking up…';
+        document.getElementById('prodScannedBarcode').textContent = barcode;
+        fetch('/production/lookup_barcode?barcode=' + encodeURIComponent(barcode))
+            .then(res => res.json())
+            .then(info => {
+                if (info.found) {
+                    document.getElementById('prodScannedName').textContent = info.item_name;
+                    document.getElementById('prodBarcodeField').value = barcode;
+                    document.getElementById('prodItemNameField').value = info.item_name;
+                } else {
+                    document.getElementById('prodScannedName').textContent = 'Not found in catalog — add it in Admin tab first';
+                    document.getElementById('prodBarcodeField').value = '';
+                    document.getElementById('prodItemNameField').value = '';
+                }
+            })
+            .catch(() => {
+                document.getElementById('prodScannedName').textContent = 'Could not look up item';
+            });
+    }
+
+    function openEditProd(id, packingDate, useByDate, batchNumber, quantity) {
+        document.getElementById('editProdForm').action = '/production/edit/' + id;
+        document.getElementById('editPackingDate').value = packingDate;
+        document.getElementById('editUseByDate').value = useByDate;
+        document.getElementById('editBatchNumber').value = batchNumber;
+        document.getElementById('editQuantity').value = quantity;
+        document.getElementById('editProdModal').style.display = 'flex';
+    }
+</script>
 </body>
 </html>
 """
@@ -1003,12 +1420,12 @@ def companies_page():
     if not session.get('logged_in'): return redirect('/login')
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute('SELECT name FROM companies ORDER BY name')
-    names = [r[0] for r in cursor.fetchall()]
+    cursor.execute('SELECT name, sub_brands FROM companies ORDER BY name')
+    rows = cursor.fetchall()
     cursor.execute('SELECT company, COUNT(DISTINCT po_number), COUNT(*) FROM po_items WHERE company IS NOT NULL GROUP BY company')
     stats = {r[0]: (r[1], r[2]) for r in cursor.fetchall()}
     conn.close()
-    companies = [{'name': n, 'po_count': stats.get(n, (0, 0))[0], 'item_count': stats.get(n, (0, 0))[1]} for n in names]
+    companies = [{'name': n, 'sub_brands': sb, 'po_count': stats.get(n, (0, 0))[0], 'item_count': stats.get(n, (0, 0))[1]} for n, sb in rows]
     error_msg = request.args.get('error')
     return render_template_string(COMPANIES_HTML, companies=companies, error_msg=error_msg)
 
@@ -1016,12 +1433,13 @@ def companies_page():
 def companies_add():
     if not session.get('logged_in'): return redirect('/login')
     name = request.form.get('name', '').strip()
+    sub_brands = request.form.get('sub_brands', '').strip()
     if not name:
         return redirect('/companies')
     conn = get_conn()
     cursor = conn.cursor()
     try:
-        cursor.execute('INSERT INTO companies (name) VALUES (%s)', (name,))
+        cursor.execute('INSERT INTO companies (name, sub_brands) VALUES (%s, %s)', (name, sub_brands))
         conn.commit()
     except psycopg2.IntegrityError:
         conn.rollback()
@@ -1029,6 +1447,288 @@ def companies_add():
         return redirect('/companies?error=' + quote(f'"{name}" already exists.'))
     conn.close()
     return redirect('/companies')
+
+@app.route('/companies/edit_subbrands', methods=['POST'])
+def companies_edit_subbrands():
+    if not session.get('logged_in'): return redirect('/login')
+    name = request.form.get('name', '').strip()
+    sub_brands = request.form.get('sub_brands', '').strip()
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute('UPDATE companies SET sub_brands = %s WHERE name = %s', (sub_brands, name))
+    conn.commit()
+    conn.close()
+    return redirect('/companies')
+
+@app.route('/production')
+def production_page():
+    if not session.get('logged_in'): return redirect('/login')
+    tab = request.args.get('tab', 'log')
+    msg = request.args.get('msg')
+    msg_ok = request.args.get('ok') == '1'
+
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute('SELECT name, sub_brands FROM companies ORDER BY name')
+    company_rows = cursor.fetchall()
+    companies = [{'name': n, 'sub_brands': sb} for n, sb in company_rows]
+    company_subbrands = {n: [s.strip() for s in (sb or '').split(',') if s.strip()] for n, sb in company_rows}
+
+    cursor.execute('SELECT id, name, photo_data FROM quality_checkers ORDER BY name')
+    qc_rows = cursor.fetchall()
+    quality_checkers = [{'id': r[0], 'name': r[1], 'photo_data': r[2]} for r in qc_rows]
+    qc_photos = {r[1]: r[2] for r in qc_rows}
+
+    grouped_history = []
+    by_company, by_item, grand_total, total_entries = [], [], 0, 0
+    catalog_count = 0
+
+    if tab == 'history':
+        cursor.execute('''SELECT id, company, sub_brand, item_name, batch_number, quantity, qc_name,
+                           packing_date, use_by_date, prod_date, prod_time, created_at
+                           FROM daily_production ORDER BY id DESC LIMIT 500''')
+        rows = cursor.fetchall()
+        now = now_ist()
+        groups = {}
+        order = []
+        for r in rows:
+            (pid, company, sub_brand, item_name, batch_number, quantity, qc_name,
+             packing_date, use_by_date, prod_date, prod_time, created_at) = r
+            try:
+                created_dt = datetime.fromisoformat(created_at)
+            except Exception:
+                created_dt = now
+            editable = (now - created_dt) <= timedelta(hours=12)
+            entry = {
+                'id': pid, 'company': company, 'sub_brand': sub_brand, 'item_name': item_name,
+                'batch_number': batch_number, 'quantity': quantity, 'qc_name': qc_name,
+                'packing_date': packing_date, 'use_by_date': use_by_date,
+                'prod_time': prod_time, 'editable': editable
+            }
+            if prod_date not in groups:
+                groups[prod_date] = {'date': prod_date, 'entries': [], 'total_qty': 0}
+                order.append(prod_date)
+            groups[prod_date]['entries'].append(entry)
+            groups[prod_date]['total_qty'] += quantity or 0
+        grouped_history = [groups[d] for d in order]
+
+    elif tab == 'summary':
+        cursor.execute('SELECT company, SUM(quantity) FROM daily_production GROUP BY company ORDER BY SUM(quantity) DESC')
+        company_totals = cursor.fetchall()
+        grand_total = sum(t or 0 for _, t in company_totals)
+        by_company = [{'company': c, 'total': t or 0, 'percent': round(((t or 0) / grand_total) * 100) if grand_total else 0} for c, t in company_totals]
+
+        cursor.execute('SELECT item_name, SUM(quantity) FROM daily_production GROUP BY item_name ORDER BY SUM(quantity) DESC LIMIT 20')
+        by_item = [{'item_name': i, 'total': t or 0} for i, t in cursor.fetchall()]
+
+        cursor.execute('SELECT COUNT(*) FROM daily_production')
+        total_entries = cursor.fetchone()[0]
+
+    elif tab == 'admin':
+        cursor.execute('SELECT COUNT(*) FROM barcode_catalog')
+        catalog_count = cursor.fetchone()[0]
+
+    conn.close()
+
+    return render_template_string(
+        PRODUCTION_HTML,
+        tab=tab, msg=msg, msg_ok=msg_ok,
+        companies=companies, quality_checkers=quality_checkers,
+        company_subbrands_json=json.dumps(company_subbrands),
+        qc_photos_json=json.dumps(qc_photos),
+        grouped_history=grouped_history,
+        by_company=by_company, by_item=by_item, grand_total=grand_total, total_entries=total_entries,
+        catalog_count=catalog_count
+    )
+
+@app.route('/production/add', methods=['POST'])
+def production_add():
+    if not session.get('logged_in'): return redirect('/login')
+    company = request.form.get('company', '').strip()
+    sub_brand = request.form.get('sub_brand', '').strip()
+    item_name_entered = request.form.get('item_name_entered', '').strip()
+    barcode = request.form.get('barcode', '').strip()
+    item_name = request.form.get('item_name', '').strip()
+    packing_date = request.form.get('packing_date', '').strip()
+    use_by_date = request.form.get('use_by_date', '').strip()
+    batch_number = request.form.get('batch_number', '').strip()
+    quantity_raw = request.form.get('quantity', '').strip()
+    qc_name = request.form.get('qc_name', '').strip()
+    qc_photo = request.form.get('qc_photo', '').strip()
+
+    if not barcode or not item_name:
+        return redirect('/production?tab=log&ok=0&msg=' + quote('Please scan and confirm a barcode before submitting.'))
+    if not qc_name or not qc_photo:
+        return redirect('/production?tab=log&ok=0&msg=' + quote('Quality Checker check-in (name + photo) is required.'))
+    try:
+        quantity = int(float(quantity_raw))
+    except ValueError:
+        return redirect('/production?tab=log&ok=0&msg=' + quote('Quantity must be a number.'))
+
+    now = now_ist()
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute('''INSERT INTO daily_production
+        (company, sub_brand, item_name_entered, item_name, barcode, packing_date, use_by_date,
+         batch_number, quantity, qc_name, qc_photo, prod_date, prod_time, created_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
+        (company, sub_brand, item_name_entered, item_name, barcode, packing_date, use_by_date,
+         batch_number, quantity, qc_name, qc_photo, now.strftime('%d %b %Y'), now.strftime('%I:%M %p'), now.isoformat()))
+    conn.commit()
+    conn.close()
+    return redirect('/production?tab=history&ok=1&msg=' + quote('Production entry logged successfully.'))
+
+@app.route('/production/edit/<int:entry_id>', methods=['POST'])
+def production_edit(entry_id):
+    if not session.get('logged_in'): return redirect('/login')
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute('SELECT created_at FROM daily_production WHERE id = %s', (entry_id,))
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        return redirect('/production?tab=history')
+    try:
+        created_dt = datetime.fromisoformat(row[0])
+    except Exception:
+        created_dt = now_ist()
+    if (now_ist() - created_dt) > timedelta(hours=12):
+        conn.close()
+        return redirect('/production?tab=history&ok=0&msg=' + quote('This entry is locked (older than 12 hours) and can no longer be edited.'))
+
+    packing_date = request.form.get('packing_date', '').strip()
+    use_by_date = request.form.get('use_by_date', '').strip()
+    batch_number = request.form.get('batch_number', '').strip()
+    quantity_raw = request.form.get('quantity', '').strip()
+    try:
+        quantity = int(float(quantity_raw))
+    except ValueError:
+        conn.close()
+        return redirect('/production?tab=history&ok=0&msg=' + quote('Quantity must be a number.'))
+
+    cursor.execute('UPDATE daily_production SET packing_date=%s, use_by_date=%s, batch_number=%s, quantity=%s WHERE id=%s',
+                   (packing_date, use_by_date, batch_number, quantity, entry_id))
+    conn.commit()
+    conn.close()
+    return redirect('/production?tab=history&ok=1&msg=' + quote('Entry updated.'))
+
+@app.route('/production/delete/<int:entry_id>', methods=['POST'])
+def production_delete(entry_id):
+    if not session.get('logged_in'): return redirect('/login')
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute('SELECT created_at FROM daily_production WHERE id = %s', (entry_id,))
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        return redirect('/production?tab=history')
+    try:
+        created_dt = datetime.fromisoformat(row[0])
+    except Exception:
+        created_dt = now_ist()
+    if (now_ist() - created_dt) > timedelta(hours=12):
+        conn.close()
+        return redirect('/production?tab=history&ok=0&msg=' + quote('This entry is locked (older than 12 hours) and can no longer be deleted.'))
+    cursor.execute('DELETE FROM daily_production WHERE id = %s', (entry_id,))
+    conn.commit()
+    conn.close()
+    return redirect('/production?tab=history&ok=1&msg=' + quote('Entry deleted.'))
+
+@app.route('/production/qc/add', methods=['POST'])
+def production_qc_add():
+    if not session.get('logged_in'): return redirect('/login')
+    name = request.form.get('name', '').strip()
+    photo_data = request.form.get('photo_data', '').strip()
+    if not name or not photo_data:
+        return redirect('/production?tab=admin&ok=0&msg=' + quote('Name and a photo are both required.'))
+    conn = get_conn()
+    cursor = conn.cursor()
+    try:
+        cursor.execute('INSERT INTO quality_checkers (name, photo_data, created_at) VALUES (%s, %s, %s)',
+                       (name, photo_data, now_ist().isoformat()))
+        conn.commit()
+    except psycopg2.IntegrityError:
+        conn.rollback()
+        conn.close()
+        return redirect('/production?tab=admin&ok=0&msg=' + quote(f'"{name}" is already registered.'))
+    conn.close()
+    return redirect('/production?tab=admin&ok=1&msg=' + quote(f'{name} registered successfully.'))
+
+@app.route('/production/qc/delete/<int:qc_id>', methods=['POST'])
+def production_qc_delete(qc_id):
+    if not session.get('logged_in'): return redirect('/login')
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM quality_checkers WHERE id = %s', (qc_id,))
+    conn.commit()
+    conn.close()
+    return redirect('/production?tab=admin')
+
+@app.route('/production/barcode_catalog/add', methods=['POST'])
+def barcode_catalog_add():
+    if not session.get('logged_in'): return redirect('/login')
+    barcode = request.form.get('barcode', '').strip()
+    item_name = request.form.get('item_name', '').strip()
+    if not barcode or not item_name:
+        return redirect('/production?tab=admin')
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute('INSERT INTO barcode_catalog (barcode, item_name) VALUES (%s, %s) ON CONFLICT (barcode) DO UPDATE SET item_name = EXCLUDED.item_name', (barcode, item_name))
+    conn.commit()
+    conn.close()
+    return redirect('/production?tab=admin&ok=1&msg=' + quote('Barcode added to catalog.'))
+
+@app.route('/production/barcode_catalog/import', methods=['POST'])
+def barcode_catalog_import():
+    if not session.get('logged_in'): return redirect('/login')
+    file = request.files.get('catalog_file')
+    if not file or file.filename == '':
+        return redirect('/production?tab=admin&ok=0&msg=' + quote('No file selected.'))
+    filename_lower = file.filename.lower()
+    if not (filename_lower.endswith('.csv') or filename_lower.endswith('.xlsx')):
+        return redirect('/production?tab=admin&ok=0&msg=' + quote('Please upload a .csv or .xlsx file.'))
+
+    fieldnames, rows = _read_spreadsheet_rows(file)
+    if fieldnames is None:
+        return redirect('/production?tab=admin&ok=0&msg=' + quote('Could not read the file — check it has a header row.'))
+
+    colmap = _map_csv_headers(fieldnames)
+    if 'barcode' not in colmap or 'item_name' not in colmap:
+        return redirect('/production?tab=admin&ok=0&msg=' + quote('File must have barcode and item_name columns.'))
+
+    conn = get_conn()
+    cursor = conn.cursor()
+    inserted, skipped = 0, 0
+    for row in rows:
+        barcode = (row.get(colmap['barcode']) or '').strip()
+        item_name = (row.get(colmap['item_name']) or '').strip()
+        if not barcode or not item_name:
+            skipped += 1
+            continue
+        cursor.execute('INSERT INTO barcode_catalog (barcode, item_name) VALUES (%s, %s) ON CONFLICT (barcode) DO UPDATE SET item_name = EXCLUDED.item_name', (barcode, item_name))
+        inserted += 1
+    conn.commit()
+    conn.close()
+    msg = f'{inserted} barcodes imported into the catalog.'
+    if skipped:
+        msg += f' {skipped} rows skipped (incomplete data).'
+    return redirect('/production?tab=admin&ok=1&msg=' + quote(msg))
+
+@app.route('/production/lookup_barcode')
+def production_lookup_barcode():
+    if not session.get('logged_in'): return {'found': False}, 401
+    barcode = request.args.get('barcode', '').strip()
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute('SELECT item_name FROM barcode_catalog WHERE barcode = %s', (barcode,))
+    row = cursor.fetchone()
+    if not row:
+        cursor.execute('SELECT item_name FROM po_items WHERE barcode = %s LIMIT 1', (barcode,))
+        row = cursor.fetchone()
+    conn.close()
+    if row:
+        return {'found': True, 'item_name': row[0]}
+    return {'found': False}
 
 @app.route('/history')
 def history_page():
@@ -1144,6 +1844,51 @@ def _map_csv_headers(fieldnames):
                 break
     return resolved
 
+def _read_spreadsheet_rows(file_storage):
+    """Reads an uploaded CSV or XLSX file and returns (fieldnames, rows) where
+    rows is an iterable of dicts, matching csv.DictReader's shape either way.
+    Returns (None, None) if the file type isn't supported or has no header row."""
+    filename = (file_storage.filename or '').lower()
+    raw_bytes = file_storage.read()
+
+    if filename.endswith('.xlsx'):
+        try:
+            import openpyxl
+            wb = openpyxl.load_workbook(io.BytesIO(raw_bytes), read_only=True, data_only=True)
+            ws = wb.active
+            rows_iter = ws.iter_rows(values_only=True)
+            header = next(rows_iter, None)
+            if not header or all(h is None for h in header):
+                return None, None
+            fieldnames = [str(h).strip() if h is not None else '' for h in header]
+            data_rows = []
+            for row in rows_iter:
+                if row is None or all(v is None for v in row):
+                    continue
+                row_dict = {}
+                for fname, val in zip(fieldnames, row):
+                    if val is None:
+                        val = ''
+                    elif isinstance(val, float) and val.is_integer():
+                        val = str(int(val))
+                    else:
+                        val = str(val)
+                    row_dict[fname] = val
+                data_rows.append(row_dict)
+            return fieldnames, data_rows
+        except Exception:
+            return None, None
+    else:
+        # Default to CSV (also covers files without a .csv extension)
+        try:
+            raw = raw_bytes.decode('utf-8-sig', errors='ignore')
+        except Exception:
+            return None, None
+        reader = csv.DictReader(io.StringIO(raw))
+        if not reader.fieldnames:
+            return None, None
+        return reader.fieldnames, list(reader)
+
 @app.route('/pos/import_csv', methods=['POST'])
 def pos_import_csv():
     if not session.get('logged_in'): return redirect('/login')
@@ -1154,25 +1899,24 @@ def pos_import_csv():
     if not file or file.filename == '':
         return redirect('/pos?ok=0&msg=' + quote('No file selected.'))
 
-    try:
-        raw = file.read().decode('utf-8-sig', errors='ignore')
-    except Exception:
-        return redirect('/pos?ok=0&msg=' + quote('Could not read the file, please try again.'))
+    filename_lower = file.filename.lower()
+    if not (filename_lower.endswith('.csv') or filename_lower.endswith('.xlsx')):
+        return redirect('/pos?ok=0&msg=' + quote('Please upload a .csv or .xlsx file.'))
 
-    reader = csv.DictReader(io.StringIO(raw))
-    if not reader.fieldnames:
-        return redirect('/pos?ok=0&msg=' + quote('No header row found in the CSV.'))
+    fieldnames, rows = _read_spreadsheet_rows(file)
+    if fieldnames is None:
+        return redirect('/pos?ok=0&msg=' + quote('Could not read the file — check it has a header row and try again.'))
 
-    colmap = _map_csv_headers(reader.fieldnames)
+    colmap = _map_csv_headers(fieldnames)
     required = ['po_number', 'item_name', 'ordered_qty', 'barcode']
     missing = [k for k in required if k not in colmap]
     if missing:
-        return redirect('/pos?ok=0&msg=' + quote(f'These columns were not found in the CSV: {", ".join(missing)}'))
+        return redirect('/pos?ok=0&msg=' + quote(f'These columns were not found in the file: {", ".join(missing)}'))
 
     conn = get_conn()
     cursor = conn.cursor()
     inserted, skipped = 0, 0
-    for row in reader:
+    for row in rows:
         po_number = (row.get(colmap['po_number']) or '').strip()
         item_name = (row.get(colmap['item_name']) or '').strip()
         barcode = (row.get(colmap['barcode']) or '').strip()
