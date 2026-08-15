@@ -1,5 +1,7 @@
-from flask import Flask, render_template_string, request, redirect, session, Response
-import os, csv, io, re, json
+Content is user-generated and unverified.
+Learn about artifacts
+from flask import Flask, render_template_string, request, redirect, session, Response, jsonify
+import os, csv, io, re, json, secrets
 import psycopg2
 from datetime import datetime, timezone, timedelta
 from urllib.parse import quote
@@ -44,6 +46,32 @@ def init_db():
         packing_date TEXT, use_by_date TEXT, batch_number TEXT, quantity INTEGER,
         qc_name TEXT, qc_photo TEXT,
         prod_date TEXT, prod_time TEXT, created_at TEXT
+    )''')
+    # --- Vehicle Loading & Live Tracking (multi-PO per vehicle + driver GPS tracking) ---
+    cursor.execute('''CREATE TABLE IF NOT EXISTS vehicles (
+        id SERIAL PRIMARY KEY,
+        vehicle_number TEXT, driver_name TEXT, driver_mobile TEXT, start_location TEXT,
+        vehicle_status TEXT DEFAULT 'Loading',
+        loading_started_at TEXT,
+        current_latitude DOUBLE PRECISION, current_longitude DOUBLE PRECISION, current_accuracy DOUBLE PRECISION,
+        last_location_at TEXT,
+        tracking_token TEXT UNIQUE,
+        tracking_status TEXT DEFAULT 'stopped',
+        dispatched_at TEXT, delivered_at TEXT
+    )''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS vehicle_po_map (
+        id SERIAL PRIMARY KEY,
+        vehicle_id INTEGER REFERENCES vehicles(id) ON DELETE CASCADE,
+        po_number TEXT, company TEXT,
+        is_hold BOOLEAN DEFAULT FALSE, is_cancelled BOOLEAN DEFAULT FALSE,
+        created_at TEXT,
+        UNIQUE(vehicle_id, po_number)
+    )''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS location_history (
+        id SERIAL PRIMARY KEY,
+        vehicle_id INTEGER REFERENCES vehicles(id) ON DELETE CASCADE,
+        latitude DOUBLE PRECISION, longitude DOUBLE PRECISION, accuracy DOUBLE PRECISION,
+        recorded_at TEXT
     )''')
     # Defensive migrations in case an older schema already exists
     cursor.execute('ALTER TABLE dispatch_log ADD COLUMN IF NOT EXISTS barcode TEXT')
@@ -391,6 +419,7 @@ def nav_html(active):
         <a href="/companies" class="{cls('companies')}">Companies</a>
         <a href="/pos" class="{cls('pos')}">Manage POs</a>
         <a href="/production" class="{cls('production')}">Daily Production</a>
+        <a href="/vehicles" class="{cls('vehicles')}">Vehicles</a>
         <a href="/history" class="{cls('history')}">History</a>
     </div>
     """
@@ -2073,6 +2102,610 @@ def export_progress_csv():
 def calculate_qty(weight, master_units):
     # Quantity entered on scan is the direct bag/unit count — no multiplier applied.
     return int(master_units)
+
+
+# ===========================================================================
+# VEHICLE LOADING & LIVE GPS TRACKING
+# ===========================================================================
+
+def gen_tracking_token():
+    return secrets.token_urlsafe(24)
+
+def po_progress(cursor, po_number, vehicle_number):
+    cursor.execute('SELECT COALESCE(SUM(ordered_qty),0) FROM po_items WHERE po_number = %s', (po_number,))
+    ordered = cursor.fetchone()[0] or 0
+    cursor.execute('SELECT COALESCE(SUM(loaded_qty),0) FROM dispatch_log WHERE po_number = %s AND vehicle_no = %s', (po_number, vehicle_number))
+    loaded = cursor.fetchone()[0] or 0
+    return ordered, loaded
+
+def po_status_label(ordered, loaded, is_hold, is_cancelled):
+    if is_cancelled: return ('Cancelled', 'badge-amber')
+    if is_hold: return ('Hold', 'badge-amber')
+    if ordered and loaded >= ordered: return ('Completed', 'badge-green')
+    if loaded > 0: return ('Loading', 'badge-blue')
+    return ('Pending', 'badge-amber')
+
+def freshness_info(last_location_at):
+    if not last_location_at:
+        return ('No location yet', 'grey', 999999)
+    try:
+        then = datetime.fromisoformat(last_location_at)
+    except Exception:
+        return ('Unknown', 'grey', 999999)
+    secs = (now_ist() - then).total_seconds()
+    if secs < 60: label = f"{int(secs)} sec ago"
+    elif secs < 3600: label = f"{int(secs//60)} min ago"
+    else: label = f"{int(secs//3600)} hr ago"
+    if secs <= 60: color = 'green'
+    elif secs <= 600: color = 'yellow'
+    else: color = 'red'
+    return (label, color, secs)
+
+def recompute_vehicle_status(cursor, vehicle_id):
+    cursor.execute('SELECT vehicle_status FROM vehicles WHERE id = %s', (vehicle_id,))
+    row = cursor.fetchone()
+    if not row: return
+    current = row[0]
+    if current in ('In Transit', 'Delivered', 'Cancelled'):
+        return  # dispatched/delivered/cancelled vehicles are not auto-changed
+    cursor.execute('SELECT vehicle_number FROM vehicles WHERE id = %s', (vehicle_id,))
+    vehicle_number = cursor.fetchone()[0]
+    cursor.execute('SELECT po_number, is_hold, is_cancelled FROM vehicle_po_map WHERE vehicle_id = %s', (vehicle_id,))
+    pos = cursor.fetchall()
+    if not pos:
+        return
+    all_done = True
+    for po_number, is_hold, is_cancelled in pos:
+        if is_cancelled: continue
+        ordered, loaded = po_progress(cursor, po_number, vehicle_number)
+        if is_hold or not (ordered and loaded >= ordered):
+            all_done = False
+            break
+    new_status = 'Ready to Dispatch' if all_done else 'Loading'
+    if new_status != current:
+        cursor.execute('UPDATE vehicles SET vehicle_status = %s WHERE id = %s', (new_status, vehicle_id))
+
+VEHICLES_LIST_HTML = STYLE_BLOCK + """
+<title>Vehicles | REAL INSTANT FOODS</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css">
+</head>
+<body>
+<div class="container">
+""" + TOPBAR_TEMPLATE.replace("__NAV__", nav_html('vehicles')) + """
+    <div class="card">
+        <div class="card-header"><h2>🚚 Live Vehicle Tracking</h2></div>
+        <div id="liveMap" style="height:340px; border-radius:12px; overflow:hidden;"></div>
+        <div style="font-size:12px; color:var(--text-dim); margin-top:8px;">🟢 recently updated &nbsp; 🟡 a few minutes old &nbsp; 🔴 stale / no signal</div>
+    </div>
+
+    <div class="card">
+        <div class="card-header">
+            <h2>➕ Start New Vehicle Loading</h2>
+        </div>
+        <form method="POST" action="/vehicles/create" id="createVehicleForm">
+            <div class="form-grid">
+                <div><label>Vehicle Number *</label><input type="text" name="vehicle_number" required placeholder="e.g. RJ14GA1234"></div>
+                <div><label>Driver Name *</label><input type="text" name="driver_name" required></div>
+                <div><label>Driver Mobile Number *</label><input type="tel" name="driver_mobile" required pattern="[0-9]{10}" maxlength="10" placeholder="10 digit mobile"></div>
+                <div><label>Starting Location *</label><input type="text" name="start_location" required></div>
+            </div>
+            <div style="margin-top:6px;">
+                <label>Attach PO(s) *</label>
+                <div id="poRows"></div>
+                <button type="button" class="btn btn-outline btn-sm" onclick="addPoRow()">+ Add PO</button>
+            </div>
+            <button type="submit" class="btn btn-primary btn-block" style="margin-top:14px;">Start Loading</button>
+        </form>
+    </div>
+
+    <div class="card">
+        <div class="card-header"><h2>🟢 Active Vehicles</h2></div>
+        <table class="table">
+            <tr><th>Vehicle</th><th>Driver</th><th>Status</th><th>POs</th><th>Progress</th><th>Location</th><th></th></tr>
+            {% for v in active_vehicles %}
+            <tr>
+                <td>{{ v.vehicle_number }}</td>
+                <td>{{ v.driver_name }}<br><span style="color:var(--text-dim); font-size:11px;">{{ v.driver_mobile }}</span></td>
+                <td><span class="badge {{ v.status_class }}">{{ v.vehicle_status }}</span></td>
+                <td>{{ v.completed_count }}/{{ v.po_count }} done</td>
+                <td style="min-width:120px;">
+                    <div class="progress-track"><div class="progress-fill" style="width:{{ v.percent }}%;"></div></div>
+                </td>
+                <td><span style="color:{{ v.freshness_color }};">●</span> {{ v.freshness_label }}</td>
+                <td><a href="/vehicles/{{ v.id }}" class="btn btn-outline btn-sm">Open</a></td>
+            </tr>
+            {% endfor %}
+            {% if not active_vehicles %}<tr><td colspan="7" style="text-align:center; color:var(--text-dim); padding:20px;">No active vehicles right now.</td></tr>{% endif %}
+        </table>
+    </div>
+
+    <div class="card">
+        <div class="card-header"><h2>📜 Completed / Past Vehicles</h2></div>
+        <table class="table">
+            <tr><th>Vehicle</th><th>Driver</th><th>Status</th><th>Started</th><th></th></tr>
+            {% for v in past_vehicles %}
+            <tr>
+                <td>{{ v.vehicle_number }}</td><td>{{ v.driver_name }}</td>
+                <td><span class="badge {{ v.status_class }}">{{ v.vehicle_status }}</span></td>
+                <td>{{ v.loading_started_at }}</td>
+                <td><a href="/vehicles/{{ v.id }}" class="btn btn-outline btn-sm">Open</a></td>
+            </tr>
+            {% endfor %}
+            {% if not past_vehicles %}<tr><td colspan="5" style="text-align:center; color:var(--text-dim); padding:20px;">Nothing here yet.</td></tr>{% endif %}
+        </table>
+    </div>
+</div>
+<script>
+const ALL_POS = {{ all_po_numbers|tojson }};
+let poRowCount = 0;
+function addPoRow() {
+    poRowCount++;
+    const div = document.createElement('div');
+    div.style.cssText = 'display:flex; gap:8px; margin-bottom:8px; align-items:center;';
+    div.innerHTML = `<select name="po_numbers" required style="flex:1;"><option value="">Select PO...</option>` +
+        ALL_POS.map(p => `<option value="${p}">${p}</option>`).join('') +
+        `</select><button type="button" class="btn btn-danger btn-sm" onclick="this.parentElement.remove()">Remove</button>`;
+    document.getElementById('poRows').appendChild(div);
+}
+addPoRow();
+document.getElementById('createVehicleForm').addEventListener('submit', function(e){
+    const selects = Array.from(document.querySelectorAll('select[name="po_numbers"]')).map(s => s.value).filter(Boolean);
+    const unique = new Set(selects);
+    if (selects.length === 0) { alert('Kam se kam 1 PO add karo.'); e.preventDefault(); return; }
+    if (unique.size !== selects.length) { alert('Same PO do baar add nahi ho sakta.'); e.preventDefault(); return; }
+});
+
+const map = L.map('liveMap').setView([20.5937, 78.9629], 5);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '&copy; OpenStreetMap' }).addTo(map);
+const markers = {{ map_markers|tojson }};
+const bounds = [];
+markers.forEach(m => {
+    const color = m.color === 'green' ? '#4ade80' : (m.color === 'yellow' ? '#fbbf24' : '#94a3b8');
+    const icon = L.divIcon({html: `<div style="background:${color}; width:16px; height:16px; border-radius:50%; border:2px solid white; box-shadow:0 0 6px rgba(0,0,0,0.5);"></div>`, className: ''});
+    const mk = L.marker([m.lat, m.lng], {icon}).addTo(map);
+    mk.bindPopup(`<b>${m.vehicle_number}</b><br>Driver: ${m.driver_name} (${m.driver_mobile})<br>Status: ${m.vehicle_status}<br>POs: ${m.po_count}<br>Last update: ${m.freshness}<br><a href="/vehicles/${m.id}">Open →</a>`);
+    bounds.push([m.lat, m.lng]);
+});
+if (bounds.length) map.fitBounds(bounds, {padding:[30,30]});
+</script>
+</body></html>
+"""
+
+VEHICLE_DETAIL_HTML = STYLE_BLOCK + """
+<title>{{ v.vehicle_number }} | Vehicle Tracking</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css">
+</head>
+<body>
+<div class="container">
+""" + TOPBAR_TEMPLATE.replace("__NAV__", nav_html('vehicles')) + """
+    <div class="card">
+        <div class="card-header">
+            <h2>🚛 {{ v.vehicle_number }} <span class="badge {{ v.status_class }}">{{ v.vehicle_status }}</span></h2>
+            <a href="/vehicles" class="btn btn-outline btn-sm">← Back</a>
+        </div>
+        <div class="form-grid">
+            <div><strong>Driver:</strong> {{ v.driver_name }}</div>
+            <div><strong>Mobile:</strong> {{ v.driver_mobile }}</div>
+            <div><strong>Start Location:</strong> {{ v.start_location }}</div>
+            <div><strong>Loading Started:</strong> {{ v.loading_started_at }}</div>
+            <div><strong>Tracking:</strong> {{ v.tracking_status }} — <span style="color:{{ v.freshness_color }};">●</span> {{ v.freshness_label }}</div>
+        </div>
+        <div style="margin-top:14px; display:flex; gap:8px; flex-wrap:wrap;">
+            {% if v.vehicle_status not in ['In Transit','Delivered','Cancelled'] %}
+                <form method="POST" action="/vehicles/{{ v.id }}/regen_token" style="display:inline;"><button class="btn btn-outline btn-sm">🔗 Generate/Reset Tracking Link</button></form>
+                {% if v.tracking_token %}
+                <button class="btn btn-outline btn-sm" onclick="navigator.clipboard.writeText('{{ track_url }}'); alert('Link copied!');">📋 Copy Tracking Link</button>
+                <a class="btn btn-outline btn-sm" target="_blank" href="https://wa.me/91{{ v.driver_mobile }}?text={{ track_url_encoded }}">📲 Share on WhatsApp</a>
+                {% endif %}
+                {% if v.tracking_status == 'active' %}
+                <form method="POST" action="/vehicles/{{ v.id }}/stop_tracking" style="display:inline;"><button class="btn btn-danger btn-sm">⛔ Stop Tracking</button></form>
+                {% endif %}
+            {% endif %}
+            {% if v.vehicle_status == 'Ready to Dispatch' %}
+                <form method="POST" action="/vehicles/{{ v.id }}/dispatch" style="display:inline;"><button class="btn btn-primary btn-sm">🚀 Dispatch Vehicle</button></form>
+            {% endif %}
+            {% if v.vehicle_status == 'In Transit' %}
+                <form method="POST" action="/vehicles/{{ v.id }}/deliver" style="display:inline;"><button class="btn btn-primary btn-sm">✅ Mark Delivered</button></form>
+            {% endif %}
+        </div>
+    </div>
+
+    {% if v.current_latitude %}
+    <div class="card">
+        <div class="card-header"><h2>📍 Live Location &amp; Route</h2></div>
+        <div id="routeMap" style="height:300px; border-radius:12px;"></div>
+    </div>
+    {% endif %}
+
+    <div class="card">
+        <div class="card-header">
+            <h2>📦 Attached POs — {{ v.completed_count }}/{{ v.po_count }} completed ({{ v.percent }}% overall)</h2>
+        </div>
+        <div class="progress-track" style="margin-bottom:14px;"><div class="progress-fill" style="width:{{ v.percent }}%;"></div></div>
+        <table class="table">
+            <tr><th>PO Number</th><th>Ordered</th><th>Loaded</th><th>Pending</th><th>Status</th><th></th></tr>
+            {% for p in pos %}
+            <tr>
+                <td>{{ p.po_number }} <span style="color:var(--text-dim); font-size:11px;">({{ p.company }})</span></td>
+                <td>{{ p.ordered }}</td><td>{{ p.loaded }}</td><td>{{ p.pending }}</td>
+                <td><span class="badge {{ p.status_class }}">{{ p.status }}</span></td>
+                <td style="white-space:nowrap;">
+                    {% if v.vehicle_status not in ['In Transit','Delivered','Cancelled'] %}
+                    <form method="POST" action="/vehicles/{{ v.id }}/set_active_po" style="display:inline;">
+                        <input type="hidden" name="po_number" value="{{ p.po_number }}">
+                        <button class="btn btn-outline btn-sm">Scan This</button>
+                    </form>
+                    <form method="POST" action="/vehicles/{{ v.id }}/po_status" style="display:inline;">
+                        <input type="hidden" name="po_number" value="{{ p.po_number }}">
+                        <input type="hidden" name="action" value="{{ 'resume' if p.is_hold else 'hold' }}">
+                        <button class="btn btn-outline btn-sm">{{ 'Resume' if p.is_hold else 'Hold' }}</button>
+                    </form>
+                    <form method="POST" action="/vehicles/{{ v.id }}/remove_po" style="display:inline;" onsubmit="return confirm('Is PO ko vehicle se remove karein?');">
+                        <input type="hidden" name="po_number" value="{{ p.po_number }}">
+                        <button class="btn btn-danger btn-sm">Remove</button>
+                    </form>
+                    {% endif %}
+                </td>
+            </tr>
+            {% endfor %}
+        </table>
+        {% if v.vehicle_status not in ['In Transit','Delivered','Cancelled'] %}
+        <form method="POST" action="/vehicles/{{ v.id }}/add_po" style="margin-top:14px; display:flex; gap:8px;">
+            <select name="po_number" required style="flex:1;">
+                <option value="">+ Add another PO...</option>
+                {% for po in available_pos %}<option value="{{ po }}">{{ po }}</option>{% endfor %}
+            </select>
+            <button class="btn btn-outline btn-sm">Add PO</button>
+        </form>
+        {% endif %}
+    </div>
+</div>
+<script>
+{% if v.current_latitude %}
+const map = L.map('routeMap').setView([{{ v.current_latitude }}, {{ v.current_longitude }}], 13);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '&copy; OpenStreetMap' }).addTo(map);
+const route = {{ route_points|tojson }};
+if (route.length > 1) L.polyline(route, {color:'#3b82f6', weight:4}).addTo(map);
+L.marker([{{ v.current_latitude }}, {{ v.current_longitude }}]).addTo(map).bindPopup('Current location — {{ v.freshness_label }}').openPopup();
+{% endif %}
+</script>
+</body></html>
+"""
+
+TRACK_HTML = STYLE_BLOCK + """
+<title>Live Tracking | {{ v.vehicle_number }}</title>
+</head>
+<body>
+<div class="container" style="max-width:480px;">
+    <div class="card" style="text-align:center; margin-top:40px;">
+        <div style="font-size:40px;">🚚</div>
+        <h2 style="margin:10px 0 4px;">{{ v.vehicle_number }}</h2>
+        <div style="color:var(--text-dim);">Driver: {{ v.driver_name }}</div>
+        <div class="badge {{ v.status_class }}" style="margin-top:10px; display:inline-block;">{{ v.vehicle_status }}</div>
+
+        {% if not trackable %}
+        <p style="margin-top:24px; color:var(--text-dim);">Yeh tracking link ab active nahi hai. Trip complete ho chuki hai ya tracking band kar di gayi hai.</p>
+        {% else %}
+        <p style="margin-top:20px; font-size:13px; color:var(--text-dim);">आपकी live location vehicle tracking के लिए share की जा रही है।</p>
+        <button id="startBtn" class="btn btn-primary btn-block" style="margin-top:16px;" onclick="startTracking()">Start Location Tracking</button>
+        <div id="status" style="margin-top:14px; font-size:13px; color:var(--text-dim);"></div>
+        {% endif %}
+    </div>
+</div>
+<script>
+const TOKEN = "{{ token }}";
+let watchId = null;
+function startTracking() {
+    if (!navigator.geolocation) { document.getElementById('status').innerText = 'GPS is not supported on this browser.'; return; }
+    document.getElementById('startBtn').innerText = '📡 Tracking Live...';
+    document.getElementById('startBtn').disabled = true;
+    function send(pos) {
+        fetch('/track/' + TOKEN + '/ping', {
+            method: 'POST', headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({lat: pos.coords.latitude, lng: pos.coords.longitude, accuracy: pos.coords.accuracy})
+        }).then(r => r.json()).then(d => {
+            document.getElementById('status').innerText = d.ok ? ('Last sent: ' + new Date().toLocaleTimeString()) : 'Tracking stopped by admin.';
+            if (!d.ok && watchId) { navigator.geolocation.clearWatch(watchId); }
+        }).catch(()=>{});
+    }
+    navigator.geolocation.getCurrentPosition(send, err => { document.getElementById('status').innerText = 'Location permission denied.'; }, {enableHighAccuracy:true});
+    watchId = navigator.geolocation.watchPosition(send, err => {}, {enableHighAccuracy:true, maximumAge: 15000});
+    setInterval(() => { navigator.geolocation.getCurrentPosition(send, ()=>{}, {enableHighAccuracy:true}); }, 20000);
+}
+</script>
+</body></html>
+"""
+
+def _vehicle_row_dict(cursor, row):
+    (vid, vehicle_number, driver_name, driver_mobile, start_location, vehicle_status,
+     loading_started_at, cur_lat, cur_lng, cur_acc, last_loc_at, tracking_token,
+     tracking_status, dispatched_at, delivered_at) = row
+    cursor.execute('SELECT po_number, is_hold, is_cancelled FROM vehicle_po_map WHERE vehicle_id = %s', (vid,))
+    pos = cursor.fetchall()
+    completed, total_ordered, total_loaded = 0, 0, 0
+    active_count = 0
+    for po_number, is_hold, is_cancelled in pos:
+        if is_cancelled: continue
+        active_count += 1
+        ordered, loaded = po_progress(cursor, po_number, vehicle_number)
+        total_ordered += ordered
+        total_loaded += min(loaded, ordered) if ordered else loaded
+        if ordered and loaded >= ordered: completed += 1
+    percent = min(100, round((total_loaded / total_ordered) * 100)) if total_ordered else 0
+    label, color, _ = freshness_info(last_loc_at)
+    status_class = {'Loading':'badge-blue','Ready to Dispatch':'badge-green','In Transit':'badge-blue','Delivered':'badge-green','Cancelled':'badge-amber'}.get(vehicle_status, 'badge-amber')
+    return {
+        'id': vid, 'vehicle_number': vehicle_number, 'driver_name': driver_name, 'driver_mobile': driver_mobile,
+        'start_location': start_location, 'vehicle_status': vehicle_status, 'loading_started_at': loading_started_at,
+        'current_latitude': cur_lat, 'current_longitude': cur_lng, 'tracking_token': tracking_token,
+        'tracking_status': tracking_status, 'po_count': active_count, 'completed_count': completed,
+        'percent': percent, 'freshness_label': label, 'freshness_color': color, 'status_class': status_class,
+    }
+
+@app.route('/vehicles')
+def vehicles_page():
+    if not session.get('logged_in'): return redirect('/login')
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute('SELECT DISTINCT po_number FROM po_items ORDER BY po_number')
+    all_po_numbers = [r[0] for r in cursor.fetchall()]
+    cursor.execute('''SELECT id, vehicle_number, driver_name, driver_mobile, start_location, vehicle_status,
+        loading_started_at, current_latitude, current_longitude, current_accuracy, last_location_at,
+        tracking_token, tracking_status, dispatched_at, delivered_at FROM vehicles ORDER BY id DESC''')
+    rows = cursor.fetchall()
+    active_vehicles, past_vehicles, map_markers = [], [], []
+    for row in rows:
+        recompute_vehicle_status(cursor, row[0])
+        d = _vehicle_row_dict(cursor, row)
+        if d['vehicle_status'] in ('Delivered', 'Cancelled'):
+            past_vehicles.append(d)
+        else:
+            active_vehicles.append(d)
+        if d['current_latitude'] is not None:
+            map_markers.append({'id': d['id'], 'lat': d['current_latitude'], 'lng': d['current_longitude'],
+                                 'vehicle_number': d['vehicle_number'], 'driver_name': d['driver_name'],
+                                 'driver_mobile': d['driver_mobile'], 'vehicle_status': d['vehicle_status'],
+                                 'po_count': d['po_count'], 'color': d['freshness_color'], 'freshness': d['freshness_label']})
+    conn.commit()
+    conn.close()
+    return render_template_string(VEHICLES_LIST_HTML, active_vehicles=active_vehicles, past_vehicles=past_vehicles,
+                                   all_po_numbers=all_po_numbers, map_markers=map_markers)
+
+@app.route('/vehicles/create', methods=['POST'])
+def vehicles_create():
+    if not session.get('logged_in'): return redirect('/login')
+    vehicle_number = request.form.get('vehicle_number', '').strip().upper()
+    driver_name = request.form.get('driver_name', '').strip()
+    driver_mobile = request.form.get('driver_mobile', '').strip()
+    start_location = request.form.get('start_location', '').strip()
+    po_numbers = [p.strip() for p in request.form.getlist('po_numbers') if p.strip()]
+    po_numbers = list(dict.fromkeys(po_numbers))  # de-dupe, keep order
+
+    if not (vehicle_number and driver_name and driver_mobile and start_location and po_numbers):
+        return "Sabhi required fields aur kam se kam 1 PO zaroori hai. <a href='/vehicles'>Back</a>", 400
+    if not re.match(r'^[0-9]{10}$', driver_mobile):
+        return "Driver mobile number 10 digit ka valid number hona chahiye. <a href='/vehicles'>Back</a>", 400
+
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM vehicles WHERE vehicle_number = %s AND vehicle_status NOT IN ('Delivered','Cancelled')", (vehicle_number,))
+    if cursor.fetchone():
+        conn.close()
+        return f"Vehicle {vehicle_number} already has an active loading session. <a href='/vehicles'>Back</a>", 400
+
+    for po in po_numbers:
+        cursor.execute('''SELECT v.vehicle_number FROM vehicle_po_map m JOIN vehicles v ON v.id = m.vehicle_id
+                           WHERE m.po_number = %s AND m.is_cancelled = FALSE AND v.vehicle_status NOT IN ('Delivered','Cancelled')''', (po,))
+        clash = cursor.fetchone()
+        if clash:
+            conn.close()
+            return f"PO {po} pehle se vehicle {clash[0]} mein active hai. <a href='/vehicles'>Back</a>", 400
+
+    token = gen_tracking_token()
+    cursor.execute('''INSERT INTO vehicles (vehicle_number, driver_name, driver_mobile, start_location, vehicle_status,
+                       loading_started_at, tracking_token, tracking_status) VALUES (%s,%s,%s,%s,'Loading',%s,%s,'active') RETURNING id''',
+                   (vehicle_number, driver_name, driver_mobile, start_location, now_ist().strftime("%d %b %Y, %I:%M %p"), token))
+    vehicle_id = cursor.fetchone()[0]
+    for po in po_numbers:
+        cursor.execute('SELECT company FROM po_items WHERE po_number = %s LIMIT 1', (po,))
+        comp = cursor.fetchone()
+        company = comp[0] if comp else ''
+        cursor.execute('INSERT INTO vehicle_po_map (vehicle_id, po_number, company, created_at) VALUES (%s,%s,%s,%s)',
+                       (vehicle_id, po, company, now_ist().isoformat()))
+    conn.commit()
+    conn.close()
+    return redirect(f'/vehicles/{vehicle_id}')
+
+@app.route('/vehicles/<int:vehicle_id>')
+def vehicle_detail(vehicle_id):
+    if not session.get('logged_in'): return redirect('/login')
+    conn = get_conn()
+    cursor = conn.cursor()
+    recompute_vehicle_status(cursor, vehicle_id)
+    cursor.execute('''SELECT id, vehicle_number, driver_name, driver_mobile, start_location, vehicle_status,
+        loading_started_at, current_latitude, current_longitude, current_accuracy, last_location_at,
+        tracking_token, tracking_status, dispatched_at, delivered_at FROM vehicles WHERE id = %s''', (vehicle_id,))
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        return "Vehicle not found. <a href='/vehicles'>Back</a>", 404
+    v = _vehicle_row_dict(cursor, row)
+
+    cursor.execute('SELECT po_number, company, is_hold, is_cancelled FROM vehicle_po_map WHERE vehicle_id = %s ORDER BY id', (vehicle_id,))
+    pos = []
+    for po_number, company, is_hold, is_cancelled in cursor.fetchall():
+        ordered, loaded = po_progress(cursor, po_number, v['vehicle_number'])
+        pending = max(ordered - loaded, 0)
+        status, status_class = po_status_label(ordered, loaded, is_hold, is_cancelled)
+        pos.append({'po_number': po_number, 'company': company, 'ordered': ordered, 'loaded': loaded,
+                    'pending': pending, 'status': status, 'status_class': status_class, 'is_hold': is_hold})
+
+    attached = {p['po_number'] for p in pos}
+    cursor.execute('SELECT DISTINCT po_number FROM po_items ORDER BY po_number')
+    available_pos = [p[0] for p in cursor.fetchall() if p[0] not in attached]
+
+    cursor.execute('SELECT latitude, longitude FROM location_history WHERE vehicle_id = %s ORDER BY id ASC LIMIT 500', (vehicle_id,))
+    route_points = [[r[0], r[1]] for r in cursor.fetchall()]
+
+    conn.commit()
+    conn.close()
+    track_url = request.url_root.rstrip('/') + f"/track/{v['tracking_token']}" if v['tracking_token'] else ''
+    return render_template_string(VEHICLE_DETAIL_HTML, v=v, pos=pos, available_pos=available_pos,
+                                   route_points=route_points, track_url=track_url, track_url_encoded=quote(track_url))
+
+@app.route('/vehicles/<int:vehicle_id>/add_po', methods=['POST'])
+def vehicle_add_po(vehicle_id):
+    if not session.get('logged_in'): return redirect('/login')
+    po = request.form.get('po_number', '').strip()
+    if not po: return redirect(f'/vehicles/{vehicle_id}')
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute('SELECT vehicle_number FROM vehicles WHERE id = %s', (vehicle_id,))
+    vrow = cursor.fetchone()
+    if not vrow:
+        conn.close(); return redirect('/vehicles')
+    cursor.execute('''SELECT v.vehicle_number FROM vehicle_po_map m JOIN vehicles v ON v.id = m.vehicle_id
+                       WHERE m.po_number = %s AND m.is_cancelled = FALSE AND v.vehicle_status NOT IN ('Delivered','Cancelled')''', (po,))
+    clash = cursor.fetchone()
+    if clash:
+        conn.close()
+        return f"PO {po} already active on vehicle {clash[0]}. <a href='/vehicles/{vehicle_id}'>Back</a>", 400
+    cursor.execute('SELECT company FROM po_items WHERE po_number = %s LIMIT 1', (po,))
+    comp = cursor.fetchone()
+    company = comp[0] if comp else ''
+    cursor.execute('INSERT INTO vehicle_po_map (vehicle_id, po_number, company, created_at) VALUES (%s,%s,%s,%s) ON CONFLICT (vehicle_id, po_number) DO NOTHING',
+                   (vehicle_id, po, company, now_ist().isoformat()))
+    recompute_vehicle_status(cursor, vehicle_id)
+    conn.commit()
+    conn.close()
+    return redirect(f'/vehicles/{vehicle_id}')
+
+@app.route('/vehicles/<int:vehicle_id>/remove_po', methods=['POST'])
+def vehicle_remove_po(vehicle_id):
+    if not session.get('logged_in'): return redirect('/login')
+    po = request.form.get('po_number', '').strip()
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM vehicle_po_map WHERE vehicle_id = %s AND po_number = %s', (vehicle_id, po))
+    recompute_vehicle_status(cursor, vehicle_id)
+    conn.commit()
+    conn.close()
+    return redirect(f'/vehicles/{vehicle_id}')
+
+@app.route('/vehicles/<int:vehicle_id>/po_status', methods=['POST'])
+def vehicle_po_status(vehicle_id):
+    if not session.get('logged_in'): return redirect('/login')
+    po = request.form.get('po_number', '').strip()
+    action = request.form.get('action', '')
+    conn = get_conn()
+    cursor = conn.cursor()
+    if action == 'hold':
+        cursor.execute('UPDATE vehicle_po_map SET is_hold = TRUE WHERE vehicle_id = %s AND po_number = %s', (vehicle_id, po))
+    elif action == 'resume':
+        cursor.execute('UPDATE vehicle_po_map SET is_hold = FALSE WHERE vehicle_id = %s AND po_number = %s', (vehicle_id, po))
+    recompute_vehicle_status(cursor, vehicle_id)
+    conn.commit()
+    conn.close()
+    return redirect(f'/vehicles/{vehicle_id}')
+
+@app.route('/vehicles/<int:vehicle_id>/set_active_po', methods=['POST'])
+def vehicle_set_active_po(vehicle_id):
+    if not session.get('logged_in'): return redirect('/login')
+    po = request.form.get('po_number', '').strip()
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute('SELECT vehicle_number, start_location FROM vehicles WHERE id = %s', (vehicle_id,))
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        set_active_session(po, row[0], row[1])
+    return redirect('/')
+
+@app.route('/vehicles/<int:vehicle_id>/regen_token', methods=['POST'])
+def vehicle_regen_token(vehicle_id):
+    if not session.get('logged_in'): return redirect('/login')
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE vehicles SET tracking_token = %s, tracking_status = 'active' WHERE id = %s", (gen_tracking_token(), vehicle_id))
+    conn.commit()
+    conn.close()
+    return redirect(f'/vehicles/{vehicle_id}')
+
+@app.route('/vehicles/<int:vehicle_id>/stop_tracking', methods=['POST'])
+def vehicle_stop_tracking(vehicle_id):
+    if not session.get('logged_in'): return redirect('/login')
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE vehicles SET tracking_status = 'stopped' WHERE id = %s", (vehicle_id,))
+    conn.commit()
+    conn.close()
+    return redirect(f'/vehicles/{vehicle_id}')
+
+@app.route('/vehicles/<int:vehicle_id>/dispatch', methods=['POST'])
+def vehicle_dispatch(vehicle_id):
+    if not session.get('logged_in'): return redirect('/login')
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE vehicles SET vehicle_status = 'In Transit', dispatched_at = %s WHERE id = %s",
+                   (now_ist().strftime("%d %b %Y, %I:%M %p"), vehicle_id))
+    conn.commit()
+    conn.close()
+    return redirect(f'/vehicles/{vehicle_id}')
+
+@app.route('/vehicles/<int:vehicle_id>/deliver', methods=['POST'])
+def vehicle_deliver(vehicle_id):
+    if not session.get('logged_in'): return redirect('/login')
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE vehicles SET vehicle_status = 'Delivered', delivered_at = %s, tracking_status = 'stopped' WHERE id = %s",
+                   (now_ist().strftime("%d %b %Y, %I:%M %p"), vehicle_id))
+    conn.commit()
+    conn.close()
+    return redirect(f'/vehicles/{vehicle_id}')
+
+@app.route('/track/<token>')
+def track_page(token):
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute('''SELECT id, vehicle_number, driver_name, driver_mobile, start_location, vehicle_status,
+        tracking_status FROM vehicles WHERE tracking_token = %s''', (token,))
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return "Invalid or expired tracking link.", 404
+    vid, vehicle_number, driver_name, driver_mobile, start_location, vehicle_status, tracking_status = row
+    status_class = {'Loading':'badge-blue','Ready to Dispatch':'badge-green','In Transit':'badge-blue','Delivered':'badge-green','Cancelled':'badge-amber'}.get(vehicle_status, 'badge-amber')
+    v = {'vehicle_number': vehicle_number, 'driver_name': driver_name, 'vehicle_status': vehicle_status, 'status_class': status_class}
+    trackable = tracking_status == 'active' and vehicle_status not in ('Delivered', 'Cancelled')
+    return render_template_string(TRACK_HTML, v=v, token=token, trackable=trackable)
+
+@app.route('/track/<token>/ping', methods=['POST'])
+def track_ping(token):
+    data = request.get_json(silent=True) or {}
+    lat, lng, acc = data.get('lat'), data.get('lng'), data.get('accuracy')
+    if lat is None or lng is None:
+        return jsonify({'ok': False, 'error': 'missing coordinates'}), 400
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, vehicle_status, tracking_status FROM vehicles WHERE tracking_token = %s", (token,))
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        return jsonify({'ok': False, 'error': 'invalid token'}), 404
+    vid, vehicle_status, tracking_status = row
+    if tracking_status != 'active' or vehicle_status in ('Delivered', 'Cancelled'):
+        conn.close()
+        return jsonify({'ok': False, 'error': 'tracking not active'}), 403
+    ts = now_ist().isoformat()
+    cursor.execute('''UPDATE vehicles SET current_latitude=%s, current_longitude=%s, current_accuracy=%s, last_location_at=%s WHERE id=%s''',
+                   (lat, lng, acc, ts, vid))
+    cursor.execute('INSERT INTO location_history (vehicle_id, latitude, longitude, accuracy, recorded_at) VALUES (%s,%s,%s,%s,%s)',
+                   (vid, lat, lng, acc, ts))
+    conn.commit()
+    conn.close()
+    return jsonify({'ok': True})
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
