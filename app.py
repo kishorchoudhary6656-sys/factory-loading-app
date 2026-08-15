@@ -1,5 +1,3 @@
-Content is user-generated and unverified.
-Learn about artifacts
 from flask import Flask, render_template_string, request, redirect, session, Response, jsonify
 import os, csv, io, re, json, secrets
 import psycopg2
