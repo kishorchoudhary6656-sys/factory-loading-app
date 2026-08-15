@@ -3,6 +3,7 @@ import os, csv, io, re, json, secrets
 import psycopg2
 from datetime import datetime, timezone, timedelta
 from urllib.parse import quote
+from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
 app.secret_key = 'real_instant_foods_final_2026'
@@ -27,65 +28,302 @@ def now_ist():
 def init_db():
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute('''CREATE TABLE IF NOT EXISTS po_items (id SERIAL PRIMARY KEY, po_number TEXT, item_name TEXT, weight TEXT, ordered_qty INTEGER, barcode TEXT, company TEXT)''')
-    cursor.execute('''CREATE TABLE IF NOT EXISTS dispatch_log (id SERIAL PRIMARY KEY, po_number TEXT, vehicle_no TEXT, location TEXT, product_name TEXT, loaded_qty INTEGER, timestamp TEXT, barcode TEXT)''')
-    # Shared, global state (NOT per-browser) so every device sees the same active dispatch session live
-    cursor.execute('''CREATE TABLE IF NOT EXISTS app_state (key TEXT PRIMARY KEY, value TEXT)''')
-    # Companies (Zepto, Flipkart, Reliance, Anand Sweets, etc.) — each PO belongs to one company/folder
-    cursor.execute('''CREATE TABLE IF NOT EXISTS companies (id SERIAL PRIMARY KEY, name TEXT UNIQUE, sub_brands TEXT)''')
+
+    # --- Multi-tenant foundation: factories (companies using this platform) + users (people who log in) ---
+    cursor.execute('''CREATE TABLE IF NOT EXISTS factories (
+        id SERIAL PRIMARY KEY,
+        company_name TEXT, display_name TEXT, logo_url TEXT,
+        address TEXT, city TEXT, state TEXT, country TEXT,
+        phone TEXT, email TEXT, website TEXT, tax_number TEXT,
+        status TEXT DEFAULT 'Active',
+        plan TEXT DEFAULT 'Free', user_limit INTEGER DEFAULT 5, vehicle_limit INTEGER DEFAULT 10,
+        subscription_status TEXT DEFAULT 'Active', plan_start_date TEXT, plan_end_date TEXT,
+        created_at TEXT, updated_at TEXT, created_by TEXT
+    )''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        factory_id INTEGER REFERENCES factories(id),
+        name TEXT, mobile TEXT, email TEXT,
+        username TEXT UNIQUE,
+        password_hash TEXT,
+        role TEXT DEFAULT 'Factory Admin',
+        status TEXT DEFAULT 'Active',
+        last_login TEXT,
+        created_at TEXT, updated_at TEXT
+    )''')
+    # Audit trail — who did what, when, scoped per factory (Super Admin actions have factory_id = the affected factory)
+    cursor.execute('''CREATE TABLE IF NOT EXISTS audit_log (
+        id SERIAL PRIMARY KEY,
+        factory_id INTEGER,
+        user_id INTEGER, user_name TEXT,
+        action TEXT, module TEXT, record_id TEXT, details TEXT,
+        timestamp TEXT
+    )''')
+
+    cursor.execute('''CREATE TABLE IF NOT EXISTS po_items (id SERIAL PRIMARY KEY, factory_id INTEGER, po_number TEXT, item_name TEXT, weight TEXT, ordered_qty INTEGER, barcode TEXT, company TEXT)''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS dispatch_log (id SERIAL PRIMARY KEY, factory_id INTEGER, po_number TEXT, vehicle_no TEXT, location TEXT, product_name TEXT, loaded_qty INTEGER, timestamp TEXT, barcode TEXT)''')
+    # Per-factory active dispatch session (NOT per-browser) so every device in that factory sees the same live session
+    cursor.execute('''CREATE TABLE IF NOT EXISTS app_state (factory_id INTEGER, key TEXT, value TEXT, PRIMARY KEY (factory_id, key))''')
+    # Companies (Zepto, Flipkart, Reliance, Anand Sweets, etc.) — each PO belongs to one company/folder, scoped per factory
+    cursor.execute('''CREATE TABLE IF NOT EXISTS companies (id SERIAL PRIMARY KEY, factory_id INTEGER, name TEXT, sub_brands TEXT)''')
     # Quality Checkers — registered with a reference photo for identity check-in
-    cursor.execute('''CREATE TABLE IF NOT EXISTS quality_checkers (id SERIAL PRIMARY KEY, name TEXT UNIQUE, photo_data TEXT, created_at TEXT)''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS quality_checkers (id SERIAL PRIMARY KEY, factory_id INTEGER, name TEXT, photo_data TEXT, created_at TEXT)''')
     # A pre-loaded catalog of barcodes (independent of any single PO) so scanning always matches
-    cursor.execute('''CREATE TABLE IF NOT EXISTS barcode_catalog (id SERIAL PRIMARY KEY, barcode TEXT UNIQUE, item_name TEXT)''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS barcode_catalog (id SERIAL PRIMARY KEY, factory_id INTEGER, barcode TEXT, item_name TEXT)''')
     # Daily Production log — one row per packed unit logged by a Quality Checker
     cursor.execute('''CREATE TABLE IF NOT EXISTS daily_production (
         id SERIAL PRIMARY KEY,
+        factory_id INTEGER,
         company TEXT, sub_brand TEXT, item_name_entered TEXT, item_name TEXT, barcode TEXT,
         packing_date TEXT, use_by_date TEXT, batch_number TEXT, quantity INTEGER,
         qc_name TEXT, qc_photo TEXT,
         prod_date TEXT, prod_time TEXT, created_at TEXT
     )''')
-    # --- Vehicle Loading & Live Tracking (multi-PO per vehicle + driver GPS tracking) ---
-    cursor.execute('''CREATE TABLE IF NOT EXISTS vehicles (
+    # --- Vehicle Master + Trip/Loading Sessions + Live GPS Tracking ---
+    # Vehicle Master = permanent vehicle record (always exists, independent of any loading).
+    # Trip = one particular loading/dispatch operation for that vehicle (a vehicle can have many trips over time).
+    # Migrate old single-table 'vehicles' (Phase 1) into 'trips' + new 'vehicle_master', if it exists.
+    cursor.execute("SELECT to_regclass('public.vehicles')")
+    old_vehicles_exists = cursor.fetchone()[0] is not None
+    cursor.execute("SELECT to_regclass('public.trips')")
+    trips_exists = cursor.fetchone()[0] is not None
+    if old_vehicles_exists and not trips_exists:
+        cursor.execute('ALTER TABLE vehicles RENAME TO trips')
+
+    cursor.execute('''CREATE TABLE IF NOT EXISTS vehicle_master (
         id SERIAL PRIMARY KEY,
-        vehicle_number TEXT, driver_name TEXT, driver_mobile TEXT, start_location TEXT,
-        vehicle_status TEXT DEFAULT 'Loading',
-        loading_started_at TEXT,
+        factory_id INTEGER,
+        vehicle_number TEXT,
+        is_active BOOLEAN DEFAULT TRUE,
         current_latitude DOUBLE PRECISION, current_longitude DOUBLE PRECISION, current_accuracy DOUBLE PRECISION,
         last_location_at TEXT,
+        gps_status TEXT DEFAULT 'offline',
+        created_at TEXT, updated_at TEXT
+    )''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS trips (
+        id SERIAL PRIMARY KEY,
+        factory_id INTEGER,
+        vehicle_id INTEGER REFERENCES vehicle_master(id),
+        vehicle_number TEXT,
+        driver_name TEXT, driver_mobile TEXT, start_location TEXT,
+        trip_status TEXT DEFAULT 'Loading',
+        loading_started_at TEXT,
         tracking_token TEXT UNIQUE,
         tracking_status TEXT DEFAULT 'stopped',
         dispatched_at TEXT, delivered_at TEXT
     )''')
     cursor.execute('''CREATE TABLE IF NOT EXISTS vehicle_po_map (
         id SERIAL PRIMARY KEY,
-        vehicle_id INTEGER REFERENCES vehicles(id) ON DELETE CASCADE,
+        factory_id INTEGER,
+        trip_id INTEGER REFERENCES trips(id) ON DELETE CASCADE,
         po_number TEXT, company TEXT,
         is_hold BOOLEAN DEFAULT FALSE, is_cancelled BOOLEAN DEFAULT FALSE,
         created_at TEXT,
-        UNIQUE(vehicle_id, po_number)
+        UNIQUE(trip_id, po_number)
     )''')
     cursor.execute('''CREATE TABLE IF NOT EXISTS location_history (
         id SERIAL PRIMARY KEY,
-        vehicle_id INTEGER REFERENCES vehicles(id) ON DELETE CASCADE,
+        factory_id INTEGER,
+        vehicle_id INTEGER REFERENCES vehicle_master(id) ON DELETE CASCADE,
+        trip_id INTEGER REFERENCES trips(id) ON DELETE CASCADE,
         latitude DOUBLE PRECISION, longitude DOUBLE PRECISION, accuracy DOUBLE PRECISION,
         recorded_at TEXT
     )''')
+
+    # --- Multi-tenant column backfill for tables that may already exist from before this upgrade ---
+    for tbl in ['po_items', 'dispatch_log', 'companies', 'quality_checkers', 'barcode_catalog',
+                'daily_production', 'vehicle_master', 'trips', 'vehicle_po_map', 'location_history']:
+        cursor.execute(f'ALTER TABLE {tbl} ADD COLUMN IF NOT EXISTS factory_id INTEGER')
+    # app_state might already exist from before with a single-column PK; rebuild it as composite-keyed if so
+    cursor.execute("SELECT column_name FROM information_schema.columns WHERE table_name='app_state' AND column_name='factory_id'")
+    if not cursor.fetchone():
+        cursor.execute('ALTER TABLE app_state ADD COLUMN factory_id INTEGER')
+        cursor.execute('ALTER TABLE app_state DROP CONSTRAINT IF EXISTS app_state_pkey')
+
+    # Old single-column UNIQUE constraints (from before multi-tenancy) must become factory-scoped,
+    # since two different factories can legitimately have the same company/checker name, barcode, or vehicle number.
+    for constraint, table in [
+        ('companies_name_key', 'companies'),
+        ('quality_checkers_name_key', 'quality_checkers'),
+        ('barcode_catalog_barcode_key', 'barcode_catalog'),
+        ('vehicle_master_vehicle_number_key', 'vehicle_master'),
+    ]:
+        cursor.execute(f'ALTER TABLE {table} DROP CONSTRAINT IF EXISTS {constraint}')
+
+    # --- Ensure a default factory + admin user exist (first-ever boot, or upgrading from single-tenant) ---
+    cursor.execute('SELECT id FROM factories ORDER BY id ASC LIMIT 1')
+    row = cursor.fetchone()
+    if row:
+        default_factory_id = row[0]
+    else:
+        ts = now_ist().isoformat()
+        cursor.execute('''INSERT INTO factories (company_name, display_name, status, created_at, updated_at)
+                           VALUES (%s, %s, 'Active', %s, %s) RETURNING id''',
+                       ('Real Instant Foods', 'Real Instant Foods', ts, ts))
+        default_factory_id = cursor.fetchone()[0]
+    cursor.execute('SELECT id FROM users LIMIT 1')
+    if not cursor.fetchone():
+        ts = now_ist().isoformat()
+        # Preserves the exact old login (password: real@8283) so the existing team's workflow doesn't change at all.
+        cursor.execute('''INSERT INTO users (factory_id, name, username, password_hash, role, status, created_at, updated_at)
+                           VALUES (%s, %s, %s, %s, %s, 'Active', %s, %s)''',
+                       (default_factory_id, 'Admin', 'admin', generate_password_hash('real@8283'), 'Factory Admin', ts, ts))
+
+    # Bootstrap a single platform-level Super Admin account (factory_id = NULL) the very first time this
+    # migration runs, so there's always a way into the /superadmin panel. Change this password after first login.
+    cursor.execute("SELECT id FROM users WHERE role = 'Super Admin' LIMIT 1")
+    if not cursor.fetchone():
+        ts = now_ist().isoformat()
+        cursor.execute('''INSERT INTO users (factory_id, name, username, password_hash, role, status, created_at, updated_at)
+                           VALUES (NULL, %s, %s, %s, 'Super Admin', 'Active', %s, %s)''',
+                       ('Platform Owner', 'superadmin', generate_password_hash('ChangeMe@2026'), ts, ts))
+
+    # Backfill factory_id on any pre-existing rows (from before multi-tenancy) into the default factory
+    for tbl in ['po_items', 'dispatch_log', 'companies', 'quality_checkers', 'barcode_catalog',
+                'daily_production', 'vehicle_master', 'trips', 'vehicle_po_map', 'location_history', 'app_state']:
+        cursor.execute(f'UPDATE {tbl} SET factory_id = %s WHERE factory_id IS NULL', (default_factory_id,))
+
+    # Re-establish app_state's primary key as (factory_id, key) now that factory_id is populated
+    cursor.execute("SELECT constraint_name FROM information_schema.table_constraints WHERE table_name='app_state' AND constraint_type='PRIMARY KEY'")
+    if not cursor.fetchone():
+        cursor.execute('ALTER TABLE app_state ADD PRIMARY KEY (factory_id, key)')
+
+    # Re-create the old uniqueness guarantees, now scoped per factory instead of globally
+    cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS uq_companies_factory_name ON companies(factory_id, name)')
+    cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS uq_qc_factory_name ON quality_checkers(factory_id, name)')
+    cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS uq_barcode_factory_code ON barcode_catalog(factory_id, barcode)')
+    cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS uq_vehicle_factory_number ON vehicle_master(factory_id, vehicle_number)')
+
+    # Defensive column migrations: make sure old columns (from Phase 1) exist so backfill queries below never fail,
+    # regardless of whether this is a fresh install or an upgrade from the old single-table schema.
+    cursor.execute('ALTER TABLE trips ADD COLUMN IF NOT EXISTS vehicle_id INTEGER')
+    cursor.execute('ALTER TABLE trips ADD COLUMN IF NOT EXISTS vehicle_number TEXT')
+    cursor.execute('ALTER TABLE trips ADD COLUMN IF NOT EXISTS trip_status TEXT')
+    cursor.execute('ALTER TABLE trips ADD COLUMN IF NOT EXISTS vehicle_status TEXT')  # old Phase-1 column name
+    cursor.execute('ALTER TABLE trips ADD COLUMN IF NOT EXISTS current_latitude DOUBLE PRECISION')
+    cursor.execute('ALTER TABLE trips ADD COLUMN IF NOT EXISTS current_longitude DOUBLE PRECISION')
+    cursor.execute('ALTER TABLE trips ADD COLUMN IF NOT EXISTS current_accuracy DOUBLE PRECISION')
+    cursor.execute('ALTER TABLE trips ADD COLUMN IF NOT EXISTS last_location_at TEXT')
+    cursor.execute("UPDATE trips SET trip_status = vehicle_status WHERE trip_status IS NULL AND vehicle_status IS NOT NULL")
+    cursor.execute("UPDATE trips SET trip_status = 'Loading' WHERE trip_status IS NULL")
+
+    # vehicle_po_map: rename old 'vehicle_id' column (which pointed at a trip) to 'trip_id' if upgrading
+    cursor.execute("SELECT column_name FROM information_schema.columns WHERE table_name='vehicle_po_map' AND column_name='vehicle_id'")
+    if cursor.fetchone():
+        cursor.execute("SELECT column_name FROM information_schema.columns WHERE table_name='vehicle_po_map' AND column_name='trip_id'")
+        if not cursor.fetchone():
+            cursor.execute('ALTER TABLE vehicle_po_map RENAME COLUMN vehicle_id TO trip_id')
+
+    # location_history: rename old 'vehicle_id' (which pointed at a trip) to 'trip_id', add fresh 'vehicle_id' pointing at vehicle_master
+    cursor.execute("SELECT column_name FROM information_schema.columns WHERE table_name='location_history' AND column_name='trip_id'")
+    has_trip_id_col = cursor.fetchone() is not None
+    if not has_trip_id_col:
+        cursor.execute("SELECT column_name FROM information_schema.columns WHERE table_name='location_history' AND column_name='vehicle_id'")
+        if cursor.fetchone():
+            cursor.execute('ALTER TABLE location_history RENAME COLUMN vehicle_id TO trip_id')
+    cursor.execute('ALTER TABLE location_history ADD COLUMN IF NOT EXISTS vehicle_id INTEGER')
+
+    # Backfill: ensure every distinct (factory, vehicle_number) seen in trips has a permanent vehicle_master row
+    cursor.execute('SELECT DISTINCT factory_id, vehicle_number FROM trips WHERE vehicle_number IS NOT NULL')
+    for (tfid, vnum) in cursor.fetchall():
+        cursor.execute('INSERT INTO vehicle_master (factory_id, vehicle_number, created_at, updated_at) VALUES (%s,%s,%s,%s) ON CONFLICT (factory_id, vehicle_number) DO NOTHING',
+                       (tfid, vnum, now_ist().isoformat(), now_ist().isoformat()))
+    cursor.execute('UPDATE trips SET vehicle_id = vm.id FROM vehicle_master AS vm WHERE vm.vehicle_number = trips.vehicle_number AND vm.factory_id = trips.factory_id AND trips.vehicle_id IS NULL')
+    # Backfill vehicle_master's current location from each vehicle's most-recently-updated trip (old Phase-1 data)
+    cursor.execute('''UPDATE vehicle_master AS vm SET current_latitude = t.current_latitude, current_longitude = t.current_longitude,
+        current_accuracy = t.current_accuracy, last_location_at = t.last_location_at
+        FROM trips AS t WHERE t.vehicle_id = vm.id AND t.last_location_at IS NOT NULL
+        AND (vm.last_location_at IS NULL OR t.last_location_at > vm.last_location_at)''')
+    # Backfill location_history.vehicle_id from its trip's vehicle_id, for any rows still missing it
+    cursor.execute('''UPDATE location_history AS lh SET vehicle_id = t.vehicle_id
+        FROM trips AS t WHERE t.id = lh.trip_id AND lh.vehicle_id IS NULL''')
+
     # Defensive migrations in case an older schema already exists
     cursor.execute('ALTER TABLE dispatch_log ADD COLUMN IF NOT EXISTS barcode TEXT')
     cursor.execute('ALTER TABLE po_items ADD COLUMN IF NOT EXISTS company TEXT')
     cursor.execute('ALTER TABLE companies ADD COLUMN IF NOT EXISTS sub_brands TEXT')
-    # Convenience defaults for the three companies named in the spec, only if not already set
+    for col, ddl in [('plan', "TEXT DEFAULT 'Free'"), ('user_limit', 'INTEGER DEFAULT 5'), ('vehicle_limit', 'INTEGER DEFAULT 10'),
+                      ('subscription_status', "TEXT DEFAULT 'Active'"), ('plan_start_date', 'TEXT'), ('plan_end_date', 'TEXT')]:
+        cursor.execute(f'ALTER TABLE factories ADD COLUMN IF NOT EXISTS {col} {ddl}')
+    cursor.execute("UPDATE factories SET plan = 'Free' WHERE plan IS NULL")
+    cursor.execute("UPDATE factories SET user_limit = 5 WHERE user_limit IS NULL")
+    cursor.execute("UPDATE factories SET vehicle_limit = 10 WHERE vehicle_limit IS NULL")
+    cursor.execute("UPDATE factories SET subscription_status = 'Active' WHERE subscription_status IS NULL")
+    # RIF is the original real business, not a trial signup — give it a generous limit so nothing is ever blocked by mistake
+    cursor.execute("UPDATE factories SET plan = 'Enterprise', user_limit = 100, vehicle_limit = 500 WHERE id = %s AND plan = 'Free'", (default_factory_id,))
+    # Convenience defaults for the three companies named in the spec (RIF's own setup only), only if not already set
     for cname, subs in [('Zepto', 'Daily Good,Unbranded'), ('Flipkart', 'Unbranded,My Kitchen'), ('Reliance', 'Good Life')]:
-        cursor.execute('UPDATE companies SET sub_brands = %s WHERE name = %s AND (sub_brands IS NULL OR sub_brands = %s)', (subs, cname, ''))
+        cursor.execute('UPDATE companies SET sub_brands = %s WHERE factory_id = %s AND name = %s AND (sub_brands IS NULL OR sub_brands = %s)', (subs, default_factory_id, cname, ''))
     conn.commit()
     conn.close()
 init_db()
 
+def current_factory_id():
+    return session.get('factory_id')
+
+def log_audit(cursor, action, module, record_id='', details=''):
+    """Records an entry in the audit trail. Call this right before conn.commit() in the route
+    that performs the action, using the SAME cursor/connection so it's part of the same transaction."""
+    cursor.execute('INSERT INTO audit_log (factory_id, user_id, user_name, action, module, record_id, details, timestamp) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)',
+                   (current_factory_id(), session.get('user_id'), session.get('user_name'), action, module, str(record_id), details, now_ist().isoformat()))
+
+def check_usage_limit(cursor, kind):
+    """Returns (ok, message). kind is 'user' or 'vehicle'. Super Admin-created/managed limits live on factories."""
+    fid = current_factory_id()
+    cursor.execute('SELECT user_limit, vehicle_limit, plan FROM factories WHERE id = %s', (fid,))
+    row = cursor.fetchone()
+    if not row:
+        return True, ''
+    user_limit, vehicle_limit, plan = row
+    if kind == 'user':
+        cursor.execute("SELECT COUNT(*) FROM users WHERE factory_id = %s AND status = 'Active'", (fid,))
+        current = cursor.fetchone()[0]
+        limit = user_limit
+    else:
+        cursor.execute('SELECT COUNT(*) FROM vehicle_master WHERE factory_id = %s', (fid,))
+        current = cursor.fetchone()[0]
+        limit = vehicle_limit
+    if limit is not None and current >= limit:
+        return False, f'Your "{plan}" plan allows up to {limit} {kind}s. You are at {current}/{limit}. Contact support to upgrade.'
+    return True, ''
+
+def is_super_admin():
+    return session.get('role') == 'Super Admin'
+
+@app.before_request
+def enforce_viewer_readonly():
+    """Backend-enforced permission: a Viewer-role user can look at every page but can never
+    submit a form or call a mutating endpoint. This is enforced here (not just hidden in the UI)
+    so it can't be bypassed by calling the URL directly."""
+    if request.method == 'POST' and session.get('role') == 'Viewer' and request.endpoint not in ('login', 'logout', 'register'):
+        return "Access denied — your account is view-only. Contact your Factory Admin for edit access.", 403
+
+PLATFORM_NAME = 'AI Factory ERP'
+
+@app.context_processor
+def inject_factory_branding():
+    """Makes factory_display_name / factory_initials / platform_name available in every template
+    automatically, without every route needing to pass them explicitly. Falls back to neutral
+    platform branding when no one is logged in yet (e.g. the login page itself)."""
+    fid = session.get('factory_id')
+    name = PLATFORM_NAME
+    logo_url = None
+    if fid:
+        conn = get_conn()
+        cursor = conn.cursor()
+        cursor.execute('SELECT display_name, company_name, logo_url FROM factories WHERE id = %s', (fid,))
+        row = cursor.fetchone()
+        conn.close()
+        if row:
+            name = row[0] or row[1] or name
+            logo_url = row[2]
+    initials = ''.join(w[0] for w in name.split()[:2]).upper() if name else 'AI'
+    return dict(factory_display_name=name, factory_initials=initials, factory_logo_url=logo_url, platform_name=PLATFORM_NAME)
+
 def get_active_session():
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute("SELECT key, value FROM app_state WHERE key IN ('cur_po', 'cur_vehicle', 'cur_location')")
+    cursor.execute("SELECT key, value FROM app_state WHERE factory_id = %s AND key IN ('cur_po', 'cur_vehicle', 'cur_location')", (current_factory_id(),))
     rows = dict(cursor.fetchall())
     conn.close()
     return {
@@ -95,10 +333,11 @@ def get_active_session():
     }
 
 def set_active_session(po_number, vehicle_no, location):
+    fid = current_factory_id()
     conn = get_conn()
     cursor = conn.cursor()
     for key, value in [('cur_po', po_number), ('cur_vehicle', vehicle_no), ('cur_location', location)]:
-        cursor.execute('INSERT INTO app_state (key, value) VALUES (%s, %s) ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value', (key, value))
+        cursor.execute('INSERT INTO app_state (factory_id, key, value) VALUES (%s, %s, %s) ON CONFLICT(factory_id, key) DO UPDATE SET value = EXCLUDED.value', (fid, key, value))
     conn.commit()
     conn.close()
 
@@ -411,23 +650,29 @@ STYLE_BLOCK = """
 def nav_html(active):
     def cls(name):
         return "active" if active == name else ""
-    return f"""
+    base = f"""
     <div class="nav">
         <a href="/" class="{cls('dashboard')}">Dashboard</a>
         <a href="/companies" class="{cls('companies')}">Companies</a>
         <a href="/pos" class="{cls('pos')}">Manage POs</a>
         <a href="/production" class="{cls('production')}">Daily Production</a>
         <a href="/vehicles" class="{cls('vehicles')}">Vehicles</a>
-        <a href="/history" class="{cls('history')}">History</a>
+        <a href="/history" class="{cls('history')}">History</a>"""
+    # Role-gated nav links are written as literal Jinja syntax (evaluated per-request when the page
+    # renders), since nav_html() itself only runs once at import time and can't see the logged-in user.
+    users_link = "\n        {% if session.get('role') == 'Factory Admin' %}<a href=\"/users\" class=\"" + cls('users') + "\">Users</a><a href=\"/audit\" class=\"" + cls('audit') + "\">Audit Log</a>{% endif %}"
+    account_link = "\n        <a href=\"/change_password\" class=\"" + cls('change_password') + "\">🔑 Change Password</a><a href=\"/logout\">Logout</a>"
+    tail = """
     </div>
     """
+    return base + users_link + account_link + tail
 
 TOPBAR_TEMPLATE = """
 <div class="topbar">
     <div class="brand">
-        <div class="brand-logo">RIF</div>
+        <div class="brand-logo">{{ factory_initials }}</div>
         <div>
-            <h1>REAL INSTANT FOODS</h1>
+            <h1>{{ factory_display_name }}</h1>
             <span>AI Dispatch &amp; Packing ERP</span>
         </div>
     </div>
@@ -436,7 +681,7 @@ TOPBAR_TEMPLATE = """
 """
 
 DASHBOARD_HTML = STYLE_BLOCK + """
-<title>Dashboard | REAL INSTANT FOODS</title>
+<title>Dashboard | {{ factory_display_name }}</title>
 </head>
 <body>
 <div class="container">
@@ -457,7 +702,7 @@ DASHBOARD_HTML = STYLE_BLOCK + """
         <div class="hero-scan"></div>
         <div class="hero-content">
             <span class="hero-tag">⚡ AI-Powered ERP &middot; Live</span>
-            <h1 class="hero-title">REAL INSTANT FOODS</h1>
+            <h1 class="hero-title">{{ factory_display_name }}</h1>
             <div class="hero-sub">Dispatch, packing &amp; loading — tracked in real time, floor to office</div>
             <div class="hero-clock" id="heroClock">—</div>
         </div>
@@ -568,7 +813,7 @@ DASHBOARD_HTML = STYLE_BLOCK + """
         {% endif %}
     </div>
 
-    <footer>REAL INSTANT FOODS &middot; AI ERP System</footer>
+    <footer>{{ factory_display_name }} &middot; {{ platform_name }}</footer>
 </div>
 
 <div id="editLogModal" class="modal">
@@ -704,7 +949,7 @@ DASHBOARD_HTML = STYLE_BLOCK + """
 """
 
 POS_HTML = STYLE_BLOCK + """
-<title>Manage POs | REAL INSTANT FOODS</title>
+<title>Manage POs | {{ factory_display_name }}</title>
 </head>
 <body>
 <div class="container">
@@ -737,8 +982,8 @@ POS_HTML = STYLE_BLOCK + """
             <button type="submit" class="btn" style="margin-top:10px;">Upload &amp; Import</button>
         </form>
         <div style="color:var(--text-muted); font-size:12.5px; margin-top:12px; line-height:1.6;">
-            Both .csv and .xlsx (Excel) files work. Your file should have these columns (any order, header row required):<br>
-            <span style="font-family:monospace; color:var(--text);">po_number, item_name, weight, ordered_qty, barcode</span><br>
+            Both .csv and .xlsx (Excel) files work. Required columns: <span style="font-family:monospace; color:var(--text);">po_number, item_name, ordered_qty</span> (weight and barcode are optional — add later if not in the file).<br>
+            Common export formats also work automatically — e.g. Zepto's <span style="font-family:monospace; color:var(--text);">PurchaseOrderId, Sku, PO_Qty</span>.<br>
             Example: <span style="font-family:monospace;">PO-2026-014, Instant Noodles, 1kg, 500, 8901234567890</span><br>
             No company yet? <a href="/companies" style="color:var(--primary);">Add one here</a> first.
         </div>
@@ -833,14 +1078,14 @@ POS_HTML = STYLE_BLOCK + """
         {% endif %}
     </div>
 
-    <footer>REAL INSTANT FOODS &middot; AI ERP System</footer>
+    <footer>{{ factory_display_name }} &middot; {{ platform_name }}</footer>
 </div>
 </body>
 </html>
 """
 
 COMPANIES_HTML = STYLE_BLOCK + """
-<title>Companies | REAL INSTANT FOODS</title>
+<title>Companies | {{ factory_display_name }}</title>
 </head>
 <body>
 <div class="container">
@@ -894,14 +1139,14 @@ COMPANIES_HTML = STYLE_BLOCK + """
         {% endif %}
     </div>
 
-    <footer>REAL INSTANT FOODS &middot; AI ERP System</footer>
+    <footer>{{ factory_display_name }} &middot; {{ platform_name }}</footer>
 </div>
 </body>
 </html>
 """
 
 PRODUCTION_HTML = STYLE_BLOCK + """
-<title>Daily Production | REAL INSTANT FOODS</title>
+<title>Daily Production | {{ factory_display_name }}</title>
 </head>
 <body>
 <div class="container">
@@ -1173,7 +1418,7 @@ PRODUCTION_HTML = STYLE_BLOCK + """
     </div>
     {% endif %}
 
-    <footer>REAL INSTANT FOODS &middot; AI ERP System</footer>
+    <footer>{{ factory_display_name }} &middot; {{ platform_name }}</footer>
 </div>
 
 <script src="https://unpkg.com/html5-qrcode"></script>
@@ -1288,7 +1533,7 @@ PRODUCTION_HTML = STYLE_BLOCK + """
 """
 
 HISTORY_HTML = STYLE_BLOCK + """
-<title>History | REAL INSTANT FOODS</title>
+<title>History | {{ factory_display_name }}</title>
 </head>
 <body>
 <div class="container">
@@ -1355,14 +1600,14 @@ HISTORY_HTML = STYLE_BLOCK + """
         {% endif %}
     </div>
 
-    <footer>REAL INSTANT FOODS &middot; AI ERP System</footer>
+    <footer>{{ factory_display_name }} &middot; {{ platform_name }}</footer>
 </div>
 </body>
 </html>
 """
 
 LOGIN_HTML = STYLE_BLOCK + """
-<title>Login | REAL INSTANT FOODS</title>
+<title>Login | {{ platform_name }}</title>
 </head>
 <body style="background-color:#0b1120; background-image:
         radial-gradient(circle at 15% 20%, rgba(59,130,246,0.20), transparent 45%),
@@ -1380,16 +1625,26 @@ LOGIN_HTML = STYLE_BLOCK + """
     <div class="factory-truck">🚚</div>
     <div style="display:flex; justify-content:center; align-items:center; min-height:100vh; position:relative; z-index:3;">
         <div class="card" style="width:320px; text-align:center; padding:36px 28px; backdrop-filter:blur(16px);">
-            <div class="brand-logo" style="margin:0 auto 16px;">RIF</div>
-            <h2 style="margin:0 0 4px; font-size:19px;">REAL INSTANT FOODS</h2>
+            <div class="brand-logo" style="margin:0 auto 16px;">AI</div>
+            <h2 style="margin:0 0 4px; font-size:19px;">{{ platform_name }}</h2>
             <div style="color:var(--text-muted); font-size:12.5px; margin-bottom:20px;">AI Dispatch &amp; Packing ERP</div>
             <form method="POST">
-                <input type="password" name="password" placeholder="Password" autofocus>
+                <input type="text" name="username" placeholder="Username" autofocus value="{{ username or '' }}">
+                <input type="password" name="password" placeholder="Password" style="margin-top:8px;">
                 <button type="submit" class="btn btn-block" style="margin-top:10px;">Login</button>
             </form>
             {% if error %}
-            <div style="color:#fca5a5; font-size:12.5px; margin-top:12px;">Incorrect password, please try again.</div>
+            <div style="color:#fca5a5; font-size:12.5px; margin-top:12px;">Incorrect username or password, please try again.</div>
             {% endif %}
+            {% if inactive %}
+            <div style="color:#fca5a5; font-size:12.5px; margin-top:12px;">This account is inactive. Contact your admin.</div>
+            {% endif %}
+            {% if request.args.get('registered') %}
+            <div style="color:#86efac; font-size:12.5px; margin-top:12px;">Account created! Please log in.</div>
+            {% endif %}
+            <div style="margin-top:18px; padding-top:14px; border-top:1px solid var(--border); font-size:12.5px; color:var(--text-muted);">
+                New company? <a href="/register" style="color:var(--primary); font-weight:600; text-decoration:none;">Create an account</a>
+            </div>
         </div>
     </div>
 </body>
@@ -1399,19 +1654,20 @@ LOGIN_HTML = STYLE_BLOCK + """
 @app.route('/')
 def home():
     if not session.get('logged_in'): return redirect('/login')
+    fid = current_factory_id()
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute('SELECT DISTINCT po_number, company FROM po_items')
+    cursor.execute('SELECT DISTINCT po_number, company FROM po_items WHERE factory_id = %s', (fid,))
     po_list = cursor.fetchall()
-    cursor.execute('SELECT id, po_number, vehicle_no, location, product_name, loaded_qty, timestamp FROM dispatch_log ORDER BY id DESC LIMIT 200')
+    cursor.execute('SELECT id, po_number, vehicle_no, location, product_name, loaded_qty, timestamp FROM dispatch_log WHERE factory_id = %s ORDER BY id DESC LIMIT 200', (fid,))
     logs = cursor.fetchall()
-    cursor.execute('SELECT COALESCE(SUM(loaded_qty), 0) FROM dispatch_log')
+    cursor.execute('SELECT COALESCE(SUM(loaded_qty), 0) FROM dispatch_log WHERE factory_id = %s', (fid,))
     total_loaded = cursor.fetchone()[0]
 
     # Item-level progress: ordered vs dispatched per (po_number, barcode)
-    cursor.execute('SELECT po_number, barcode, item_name, weight, company, SUM(ordered_qty) FROM po_items GROUP BY po_number, barcode, item_name, weight, company')
+    cursor.execute('SELECT po_number, barcode, item_name, weight, company, SUM(ordered_qty) FROM po_items WHERE factory_id = %s GROUP BY po_number, barcode, item_name, weight, company', (fid,))
     po_item_rows = cursor.fetchall()
-    cursor.execute('SELECT po_number, barcode, SUM(loaded_qty) FROM dispatch_log GROUP BY po_number, barcode')
+    cursor.execute('SELECT po_number, barcode, SUM(loaded_qty) FROM dispatch_log WHERE factory_id = %s GROUP BY po_number, barcode', (fid,))
     dispatched_map = {(r[0], r[1]): (r[2] or 0) for r in cursor.fetchall()}
     conn.close()
 
@@ -1445,11 +1701,12 @@ def home():
 @app.route('/companies')
 def companies_page():
     if not session.get('logged_in'): return redirect('/login')
+    fid = current_factory_id()
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute('SELECT name, sub_brands FROM companies ORDER BY name')
+    cursor.execute('SELECT name, sub_brands FROM companies WHERE factory_id = %s ORDER BY name', (fid,))
     rows = cursor.fetchall()
-    cursor.execute('SELECT company, COUNT(DISTINCT po_number), COUNT(*) FROM po_items WHERE company IS NOT NULL GROUP BY company')
+    cursor.execute('SELECT company, COUNT(DISTINCT po_number), COUNT(*) FROM po_items WHERE factory_id = %s AND company IS NOT NULL GROUP BY company', (fid,))
     stats = {r[0]: (r[1], r[2]) for r in cursor.fetchall()}
     conn.close()
     companies = [{'name': n, 'sub_brands': sb, 'po_count': stats.get(n, (0, 0))[0], 'item_count': stats.get(n, (0, 0))[1]} for n, sb in rows]
@@ -1459,6 +1716,7 @@ def companies_page():
 @app.route('/companies/add', methods=['POST'])
 def companies_add():
     if not session.get('logged_in'): return redirect('/login')
+    fid = current_factory_id()
     name = request.form.get('name', '').strip()
     sub_brands = request.form.get('sub_brands', '').strip()
     if not name:
@@ -1466,7 +1724,7 @@ def companies_add():
     conn = get_conn()
     cursor = conn.cursor()
     try:
-        cursor.execute('INSERT INTO companies (name, sub_brands) VALUES (%s, %s)', (name, sub_brands))
+        cursor.execute('INSERT INTO companies (factory_id, name, sub_brands) VALUES (%s, %s, %s)', (fid, name, sub_brands))
         conn.commit()
     except psycopg2.IntegrityError:
         conn.rollback()
@@ -1478,11 +1736,12 @@ def companies_add():
 @app.route('/companies/edit_subbrands', methods=['POST'])
 def companies_edit_subbrands():
     if not session.get('logged_in'): return redirect('/login')
+    fid = current_factory_id()
     name = request.form.get('name', '').strip()
     sub_brands = request.form.get('sub_brands', '').strip()
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute('UPDATE companies SET sub_brands = %s WHERE name = %s', (sub_brands, name))
+    cursor.execute('UPDATE companies SET sub_brands = %s WHERE factory_id = %s AND name = %s', (sub_brands, fid, name))
     conn.commit()
     conn.close()
     return redirect('/companies')
@@ -1490,18 +1749,19 @@ def companies_edit_subbrands():
 @app.route('/production')
 def production_page():
     if not session.get('logged_in'): return redirect('/login')
+    fid = current_factory_id()
     tab = request.args.get('tab', 'log')
     msg = request.args.get('msg')
     msg_ok = request.args.get('ok') == '1'
 
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute('SELECT name, sub_brands FROM companies ORDER BY name')
+    cursor.execute('SELECT name, sub_brands FROM companies WHERE factory_id = %s ORDER BY name', (fid,))
     company_rows = cursor.fetchall()
     companies = [{'name': n, 'sub_brands': sb} for n, sb in company_rows]
     company_subbrands = {n: [s.strip() for s in (sb or '').split(',') if s.strip()] for n, sb in company_rows}
 
-    cursor.execute('SELECT id, name, photo_data FROM quality_checkers ORDER BY name')
+    cursor.execute('SELECT id, name, photo_data FROM quality_checkers WHERE factory_id = %s ORDER BY name', (fid,))
     qc_rows = cursor.fetchall()
     quality_checkers = [{'id': r[0], 'name': r[1], 'photo_data': r[2]} for r in qc_rows]
     qc_photos = {r[1]: r[2] for r in qc_rows}
@@ -1513,7 +1773,7 @@ def production_page():
     if tab == 'history':
         cursor.execute('''SELECT id, company, sub_brand, item_name, batch_number, quantity, qc_name,
                            packing_date, use_by_date, prod_date, prod_time, created_at
-                           FROM daily_production ORDER BY id DESC LIMIT 500''')
+                           FROM daily_production WHERE factory_id = %s ORDER BY id DESC LIMIT 500''', (fid,))
         rows = cursor.fetchall()
         now = now_ist()
         groups = {}
@@ -1540,19 +1800,19 @@ def production_page():
         grouped_history = [groups[d] for d in order]
 
     elif tab == 'summary':
-        cursor.execute('SELECT company, SUM(quantity) FROM daily_production GROUP BY company ORDER BY SUM(quantity) DESC')
+        cursor.execute('SELECT company, SUM(quantity) FROM daily_production WHERE factory_id = %s GROUP BY company ORDER BY SUM(quantity) DESC', (fid,))
         company_totals = cursor.fetchall()
         grand_total = sum(t or 0 for _, t in company_totals)
         by_company = [{'company': c, 'total': t or 0, 'percent': round(((t or 0) / grand_total) * 100) if grand_total else 0} for c, t in company_totals]
 
-        cursor.execute('SELECT item_name, SUM(quantity) FROM daily_production GROUP BY item_name ORDER BY SUM(quantity) DESC LIMIT 20')
+        cursor.execute('SELECT item_name, SUM(quantity) FROM daily_production WHERE factory_id = %s GROUP BY item_name ORDER BY SUM(quantity) DESC LIMIT 20', (fid,))
         by_item = [{'item_name': i, 'total': t or 0} for i, t in cursor.fetchall()]
 
-        cursor.execute('SELECT COUNT(*) FROM daily_production')
+        cursor.execute('SELECT COUNT(*) FROM daily_production WHERE factory_id = %s', (fid,))
         total_entries = cursor.fetchone()[0]
 
     elif tab == 'admin':
-        cursor.execute('SELECT COUNT(*) FROM barcode_catalog')
+        cursor.execute('SELECT COUNT(*) FROM barcode_catalog WHERE factory_id = %s', (fid,))
         catalog_count = cursor.fetchone()[0]
 
     conn.close()
@@ -1571,6 +1831,7 @@ def production_page():
 @app.route('/production/add', methods=['POST'])
 def production_add():
     if not session.get('logged_in'): return redirect('/login')
+    fid = current_factory_id()
     company = request.form.get('company', '').strip()
     sub_brand = request.form.get('sub_brand', '').strip()
     item_name_entered = request.form.get('item_name_entered', '').strip()
@@ -1596,10 +1857,10 @@ def production_add():
     conn = get_conn()
     cursor = conn.cursor()
     cursor.execute('''INSERT INTO daily_production
-        (company, sub_brand, item_name_entered, item_name, barcode, packing_date, use_by_date,
+        (factory_id, company, sub_brand, item_name_entered, item_name, barcode, packing_date, use_by_date,
          batch_number, quantity, qc_name, qc_photo, prod_date, prod_time, created_at)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
-        (company, sub_brand, item_name_entered, item_name, barcode, packing_date, use_by_date,
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
+        (fid, company, sub_brand, item_name_entered, item_name, barcode, packing_date, use_by_date,
          batch_number, quantity, qc_name, qc_photo, now.strftime('%d %b %Y'), now.strftime('%I:%M %p'), now.isoformat()))
     conn.commit()
     conn.close()
@@ -1608,9 +1869,10 @@ def production_add():
 @app.route('/production/edit/<int:entry_id>', methods=['POST'])
 def production_edit(entry_id):
     if not session.get('logged_in'): return redirect('/login')
+    fid = current_factory_id()
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute('SELECT created_at FROM daily_production WHERE id = %s', (entry_id,))
+    cursor.execute('SELECT created_at FROM daily_production WHERE id = %s AND factory_id = %s', (entry_id, fid))
     row = cursor.fetchone()
     if not row:
         conn.close()
@@ -1633,8 +1895,8 @@ def production_edit(entry_id):
         conn.close()
         return redirect('/production?tab=history&ok=0&msg=' + quote('Quantity must be a number.'))
 
-    cursor.execute('UPDATE daily_production SET packing_date=%s, use_by_date=%s, batch_number=%s, quantity=%s WHERE id=%s',
-                   (packing_date, use_by_date, batch_number, quantity, entry_id))
+    cursor.execute('UPDATE daily_production SET packing_date=%s, use_by_date=%s, batch_number=%s, quantity=%s WHERE id=%s AND factory_id=%s',
+                   (packing_date, use_by_date, batch_number, quantity, entry_id, fid))
     conn.commit()
     conn.close()
     return redirect('/production?tab=history&ok=1&msg=' + quote('Entry updated.'))
@@ -1642,9 +1904,10 @@ def production_edit(entry_id):
 @app.route('/production/delete/<int:entry_id>', methods=['POST'])
 def production_delete(entry_id):
     if not session.get('logged_in'): return redirect('/login')
+    fid = current_factory_id()
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute('SELECT created_at FROM daily_production WHERE id = %s', (entry_id,))
+    cursor.execute('SELECT created_at FROM daily_production WHERE id = %s AND factory_id = %s', (entry_id, fid))
     row = cursor.fetchone()
     if not row:
         conn.close()
@@ -1656,7 +1919,7 @@ def production_delete(entry_id):
     if (now_ist() - created_dt) > timedelta(hours=12):
         conn.close()
         return redirect('/production?tab=history&ok=0&msg=' + quote('This entry is locked (older than 12 hours) and can no longer be deleted.'))
-    cursor.execute('DELETE FROM daily_production WHERE id = %s', (entry_id,))
+    cursor.execute('DELETE FROM daily_production WHERE id = %s AND factory_id = %s', (entry_id, fid))
     conn.commit()
     conn.close()
     return redirect('/production?tab=history&ok=1&msg=' + quote('Entry deleted.'))
@@ -1664,6 +1927,7 @@ def production_delete(entry_id):
 @app.route('/production/qc/add', methods=['POST'])
 def production_qc_add():
     if not session.get('logged_in'): return redirect('/login')
+    fid = current_factory_id()
     name = request.form.get('name', '').strip()
     photo_data = request.form.get('photo_data', '').strip()
     if not name or not photo_data:
@@ -1671,8 +1935,8 @@ def production_qc_add():
     conn = get_conn()
     cursor = conn.cursor()
     try:
-        cursor.execute('INSERT INTO quality_checkers (name, photo_data, created_at) VALUES (%s, %s, %s)',
-                       (name, photo_data, now_ist().isoformat()))
+        cursor.execute('INSERT INTO quality_checkers (factory_id, name, photo_data, created_at) VALUES (%s, %s, %s, %s)',
+                       (fid, name, photo_data, now_ist().isoformat()))
         conn.commit()
     except psycopg2.IntegrityError:
         conn.rollback()
@@ -1684,9 +1948,10 @@ def production_qc_add():
 @app.route('/production/qc/delete/<int:qc_id>', methods=['POST'])
 def production_qc_delete(qc_id):
     if not session.get('logged_in'): return redirect('/login')
+    fid = current_factory_id()
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute('DELETE FROM quality_checkers WHERE id = %s', (qc_id,))
+    cursor.execute('DELETE FROM quality_checkers WHERE id = %s AND factory_id = %s', (qc_id, fid))
     conn.commit()
     conn.close()
     return redirect('/production?tab=admin')
@@ -1694,13 +1959,14 @@ def production_qc_delete(qc_id):
 @app.route('/production/barcode_catalog/add', methods=['POST'])
 def barcode_catalog_add():
     if not session.get('logged_in'): return redirect('/login')
+    fid = current_factory_id()
     barcode = request.form.get('barcode', '').strip()
     item_name = request.form.get('item_name', '').strip()
     if not barcode or not item_name:
         return redirect('/production?tab=admin')
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute('INSERT INTO barcode_catalog (barcode, item_name) VALUES (%s, %s) ON CONFLICT (barcode) DO UPDATE SET item_name = EXCLUDED.item_name', (barcode, item_name))
+    cursor.execute('INSERT INTO barcode_catalog (factory_id, barcode, item_name) VALUES (%s, %s, %s) ON CONFLICT (factory_id, barcode) DO UPDATE SET item_name = EXCLUDED.item_name', (fid, barcode, item_name))
     conn.commit()
     conn.close()
     return redirect('/production?tab=admin&ok=1&msg=' + quote('Barcode added to catalog.'))
@@ -1708,6 +1974,7 @@ def barcode_catalog_add():
 @app.route('/production/barcode_catalog/import', methods=['POST'])
 def barcode_catalog_import():
     if not session.get('logged_in'): return redirect('/login')
+    fid = current_factory_id()
     file = request.files.get('catalog_file')
     if not file or file.filename == '':
         return redirect('/production?tab=admin&ok=0&msg=' + quote('No file selected.'))
@@ -1732,7 +1999,7 @@ def barcode_catalog_import():
         if not barcode or not item_name:
             skipped += 1
             continue
-        cursor.execute('INSERT INTO barcode_catalog (barcode, item_name) VALUES (%s, %s) ON CONFLICT (barcode) DO UPDATE SET item_name = EXCLUDED.item_name', (barcode, item_name))
+        cursor.execute('INSERT INTO barcode_catalog (factory_id, barcode, item_name) VALUES (%s, %s, %s) ON CONFLICT (factory_id, barcode) DO UPDATE SET item_name = EXCLUDED.item_name', (fid, barcode, item_name))
         inserted += 1
     conn.commit()
     conn.close()
@@ -1744,13 +2011,14 @@ def barcode_catalog_import():
 @app.route('/production/lookup_barcode')
 def production_lookup_barcode():
     if not session.get('logged_in'): return {'found': False}, 401
+    fid = current_factory_id()
     barcode = request.args.get('barcode', '').strip()
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute('SELECT item_name FROM barcode_catalog WHERE barcode = %s', (barcode,))
+    cursor.execute('SELECT item_name FROM barcode_catalog WHERE factory_id = %s AND barcode = %s', (fid, barcode))
     row = cursor.fetchone()
     if not row:
-        cursor.execute('SELECT item_name FROM po_items WHERE barcode = %s LIMIT 1', (barcode,))
+        cursor.execute('SELECT item_name FROM po_items WHERE factory_id = %s AND barcode = %s LIMIT 1', (fid, barcode))
         row = cursor.fetchone()
     conn.close()
     if row:
@@ -1760,13 +2028,14 @@ def production_lookup_barcode():
 @app.route('/history')
 def history_page():
     if not session.get('logged_in'): return redirect('/login')
+    fid = current_factory_id()
     search_po = request.args.get('po', '').strip()
     conn = get_conn()
     cursor = conn.cursor()
     if search_po:
-        cursor.execute('SELECT po_number, vehicle_no, location, product_name, loaded_qty, timestamp FROM dispatch_log WHERE po_number ILIKE %s ORDER BY id DESC', (f'%{search_po}%',))
+        cursor.execute('SELECT po_number, vehicle_no, location, product_name, loaded_qty, timestamp FROM dispatch_log WHERE factory_id = %s AND po_number ILIKE %s ORDER BY id DESC', (fid, f'%{search_po}%'))
     else:
-        cursor.execute('SELECT po_number, vehicle_no, location, product_name, loaded_qty, timestamp FROM dispatch_log ORDER BY id DESC LIMIT 200')
+        cursor.execute('SELECT po_number, vehicle_no, location, product_name, loaded_qty, timestamp FROM dispatch_log WHERE factory_id = %s ORDER BY id DESC LIMIT 200', (fid,))
     records = cursor.fetchall()
     conn.close()
 
@@ -1784,15 +2053,16 @@ def history_page():
 @app.route('/pos')
 def pos_page():
     if not session.get('logged_in'): return redirect('/login')
+    fid = current_factory_id()
     filter_company = request.args.get('company', '').strip()
     conn = get_conn()
     cursor = conn.cursor()
     if filter_company:
-        cursor.execute('SELECT id, po_number, item_name, weight, ordered_qty, barcode, company FROM po_items WHERE company = %s ORDER BY po_number, id DESC', (filter_company,))
+        cursor.execute('SELECT id, po_number, item_name, weight, ordered_qty, barcode, company FROM po_items WHERE factory_id = %s AND company = %s ORDER BY po_number, id DESC', (fid, filter_company))
     else:
-        cursor.execute('SELECT id, po_number, item_name, weight, ordered_qty, barcode, company FROM po_items ORDER BY po_number, id DESC')
+        cursor.execute('SELECT id, po_number, item_name, weight, ordered_qty, barcode, company FROM po_items WHERE factory_id = %s ORDER BY po_number, id DESC', (fid,))
     rows = cursor.fetchall()
-    cursor.execute('SELECT name FROM companies ORDER BY name')
+    cursor.execute('SELECT name FROM companies WHERE factory_id = %s ORDER BY name', (fid,))
     companies = [r[0] for r in cursor.fetchall()]
     conn.close()
 
@@ -1815,11 +2085,12 @@ def pos_page():
 @app.route('/pos/delete_po', methods=['POST'])
 def pos_delete_po():
     if not session.get('logged_in'): return redirect('/login')
+    fid = current_factory_id()
     po_number = request.form.get('po_number', '').strip()
     company = request.form.get('company', '').strip()
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute('DELETE FROM po_items WHERE po_number = %s AND company = %s', (po_number, company))
+    cursor.execute('DELETE FROM po_items WHERE factory_id = %s AND po_number = %s AND company = %s', (fid, po_number, company))
     conn.commit()
     conn.close()
     return redirect('/pos?company=' + quote(company) if company else '/pos')
@@ -1827,6 +2098,7 @@ def pos_delete_po():
 @app.route('/pos/add', methods=['POST'])
 def pos_add():
     if not session.get('logged_in'): return redirect('/login')
+    fid = current_factory_id()
     company = request.form.get('company', '').strip()
     po_number = request.form.get('po_number', '').strip()
     item_name = request.form.get('item_name', '').strip()
@@ -1835,8 +2107,9 @@ def pos_add():
     barcode = request.form.get('barcode', '').strip()
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute('INSERT INTO po_items (po_number, item_name, weight, ordered_qty, barcode, company) VALUES (%s, %s, %s, %s, %s, %s)',
-                   (po_number, item_name, weight, int(ordered_qty), barcode, company))
+    cursor.execute('INSERT INTO po_items (factory_id, po_number, item_name, weight, ordered_qty, barcode, company) VALUES (%s, %s, %s, %s, %s, %s, %s)',
+                   (fid, po_number, item_name, weight, int(ordered_qty), barcode, company))
+    log_audit(cursor, 'Product Updated', 'Manage POs', po_number, f'Added {item_name} ({ordered_qty}) to PO {po_number}')
     conn.commit()
     conn.close()
     return redirect('/pos?company=' + quote(company) if company else '/pos')
@@ -1844,14 +2117,14 @@ def pos_add():
 # Accepts flexible header names (English or common Hindi-transliterated variants),
 # plus real-world PO export formats (e.g. PoNumber, SkuDesc, EAN, Quantity)
 CSV_HEADER_MAP = {
-    'po_number': ['po_number', 'po number', 'po no', 'ponumber', 'po', 'po_no'],
+    'po_number': ['po_number', 'po number', 'po no', 'ponumber', 'po', 'po_no', 'purchaseorderid', 'purchase order id', 'purchase_order_id', 'poid', 'po id'],
     'item_name': ['item_name', 'item name', 'item', 'product', 'product_name', 'skudesc', 'sku desc', 'sku_desc', 'sku'],
     'weight': ['weight', 'wt', 'size'],
-    'ordered_qty': ['ordered_qty', 'ordered quantity', 'quantity', 'qty', 'order_qty'],
+    'ordered_qty': ['ordered_qty', 'ordered quantity', 'quantity', 'qty', 'order_qty', 'po_qty', 'po qty', 'poqty'],
     'barcode': ['barcode', 'bar code', 'code', 'ean', 'ean code'],
 }
 
-WEIGHT_PATTERN = re.compile(r'\((\d+(?:\.\d+)?)\s*(kg|g)\)', re.IGNORECASE)
+WEIGHT_PATTERN = re.compile(r'\(?(\d+(?:\.\d+)?)\s*(kg|kgs|gm|gms|g|ml|ltr|l)\)?(?:\s|$)', re.IGNORECASE)
 
 def _extract_weight(text):
     """Pull a weight like '500 g' or '1 kg' out of a product description string."""
@@ -1919,6 +2192,7 @@ def _read_spreadsheet_rows(file_storage):
 @app.route('/pos/import_csv', methods=['POST'])
 def pos_import_csv():
     if not session.get('logged_in'): return redirect('/login')
+    fid = current_factory_id()
     company = request.form.get('company', '').strip()
     if not company:
         return redirect('/pos?ok=0&msg=' + quote('Please select a company for this import.'))
@@ -1935,7 +2209,7 @@ def pos_import_csv():
         return redirect('/pos?ok=0&msg=' + quote('Could not read the file — check it has a header row and try again.'))
 
     colmap = _map_csv_headers(fieldnames)
-    required = ['po_number', 'item_name', 'ordered_qty', 'barcode']
+    required = ['po_number', 'item_name', 'ordered_qty']  # barcode is optional — can be added later
     missing = [k for k in required if k not in colmap]
     if missing:
         return redirect('/pos?ok=0&msg=' + quote(f'These columns were not found in the file: {", ".join(missing)}'))
@@ -1946,7 +2220,7 @@ def pos_import_csv():
     for row in rows:
         po_number = (row.get(colmap['po_number']) or '').strip()
         item_name = (row.get(colmap['item_name']) or '').strip()
-        barcode = (row.get(colmap['barcode']) or '').strip()
+        barcode = (row.get(colmap['barcode']) or '').strip() if 'barcode' in colmap else ''
         qty_raw = (row.get(colmap['ordered_qty']) or '').strip()
         if 'weight' in colmap:
             weight = (row.get(colmap['weight']) or '').strip()
@@ -1960,8 +2234,8 @@ def pos_import_csv():
         except ValueError:
             skipped += 1
             continue
-        cursor.execute('INSERT INTO po_items (po_number, item_name, weight, ordered_qty, barcode, company) VALUES (%s, %s, %s, %s, %s, %s)',
-                       (po_number, item_name, weight, ordered_qty, barcode, company))
+        cursor.execute('INSERT INTO po_items (factory_id, po_number, item_name, weight, ordered_qty, barcode, company) VALUES (%s, %s, %s, %s, %s, %s, %s)',
+                       (fid, po_number, item_name, weight, ordered_qty, barcode, company))
         inserted += 1
     conn.commit()
     conn.close()
@@ -1974,9 +2248,10 @@ def pos_import_csv():
 @app.route('/pos/delete/<int:item_id>', methods=['POST'])
 def pos_delete(item_id):
     if not session.get('logged_in'): return redirect('/login')
+    fid = current_factory_id()
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute('DELETE FROM po_items WHERE id = %s', (item_id,))
+    cursor.execute('DELETE FROM po_items WHERE id = %s AND factory_id = %s', (item_id, fid))
     conn.commit()
     conn.close()
     return redirect('/pos')
@@ -1993,10 +2268,11 @@ def start_session():
 @app.route('/lookup_barcode')
 def lookup_barcode():
     if not session.get('logged_in'): return {'found': False}, 401
+    fid = current_factory_id()
     barcode = request.args.get('barcode', '').strip()
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute('SELECT item_name, weight FROM po_items WHERE barcode = %s LIMIT 1', (barcode,))
+    cursor.execute('SELECT item_name, weight FROM po_items WHERE factory_id = %s AND barcode = %s LIMIT 1', (fid, barcode))
     item = cursor.fetchone()
     conn.close()
     if item:
@@ -2005,6 +2281,8 @@ def lookup_barcode():
 
 @app.route('/process_scan', methods=['POST'])
 def process_scan():
+    if not session.get('logged_in'): return {'ok': False, 'error': 'not logged in'}, 401
+    fid = current_factory_id()
     barcode = request.form['barcode'].strip()
     m_units = request.form['qty']
     active = get_active_session()
@@ -2013,12 +2291,12 @@ def process_scan():
     location = active['cur_location'] or 'Unknown'
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute('SELECT item_name, weight FROM po_items WHERE barcode = %s', (barcode,))
+    cursor.execute('SELECT item_name, weight FROM po_items WHERE factory_id = %s AND barcode = %s', (fid, barcode))
     item = cursor.fetchone()
     if item:
         total_qty = calculate_qty(item[1], m_units)
-        cursor.execute('INSERT INTO dispatch_log (po_number, vehicle_no, location, product_name, loaded_qty, timestamp, barcode) VALUES (%s, %s, %s, %s, %s, %s, %s)',
-                       (po_number, vehicle_no, location, f"{item[0]} ({item[1]})", total_qty, now_ist().strftime("%d %b %Y, %I:%M %p"), barcode))
+        cursor.execute('INSERT INTO dispatch_log (factory_id, po_number, vehicle_no, location, product_name, loaded_qty, timestamp, barcode) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)',
+                       (fid, po_number, vehicle_no, location, f"{item[0]} ({item[1]})", total_qty, now_ist().strftime("%d %b %Y, %I:%M %p"), barcode))
         conn.commit()
         conn.close()
         return {'ok': True}, 200
@@ -2028,6 +2306,7 @@ def process_scan():
 @app.route('/dispatch/edit/<int:log_id>', methods=['POST'])
 def dispatch_edit(log_id):
     if not session.get('logged_in'): return redirect('/login')
+    fid = current_factory_id()
     new_qty = request.form.get('loaded_qty', '').strip()
     try:
         new_qty = int(float(new_qty))
@@ -2035,7 +2314,7 @@ def dispatch_edit(log_id):
         return redirect('/')
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute('UPDATE dispatch_log SET loaded_qty = %s WHERE id = %s', (new_qty, log_id))
+    cursor.execute('UPDATE dispatch_log SET loaded_qty = %s WHERE id = %s AND factory_id = %s', (new_qty, log_id, fid))
     conn.commit()
     conn.close()
     return redirect('/')
@@ -2043,9 +2322,10 @@ def dispatch_edit(log_id):
 @app.route('/dispatch/delete/<int:log_id>', methods=['POST'])
 def dispatch_delete(log_id):
     if not session.get('logged_in'): return redirect('/login')
+    fid = current_factory_id()
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute('DELETE FROM dispatch_log WHERE id = %s', (log_id,))
+    cursor.execute('DELETE FROM dispatch_log WHERE id = %s AND factory_id = %s', (log_id, fid))
     conn.commit()
     conn.close()
     return redirect('/')
@@ -2053,36 +2333,47 @@ def dispatch_delete(log_id):
 @app.route('/export_csv')
 def export_csv():
     if not session.get('logged_in'): return redirect('/login')
+    fid = current_factory_id()
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute('SELECT po_number, vehicle_no, location, product_name, loaded_qty, timestamp FROM dispatch_log ORDER BY id DESC')
+    cursor.execute('SELECT display_name, company_name FROM factories WHERE id = %s', (fid,))
+    frow = cursor.fetchone()
+    factory_name = (frow[0] or frow[1]) if frow else 'Export'
+    cursor.execute('SELECT po_number, vehicle_no, location, product_name, loaded_qty, timestamp FROM dispatch_log WHERE factory_id = %s ORDER BY id DESC', (fid,))
     rows = cursor.fetchall()
     conn.close()
 
     output = io.StringIO()
     writer = csv.writer(output)
+    writer.writerow([factory_name])
     writer.writerow(['PO Number', 'Vehicle No', 'Location', 'Product', 'Qty Loaded', 'Time'])
     writer.writerows(rows)
 
+    safe_name = re.sub(r'[^A-Za-z0-9_-]+', '_', factory_name).strip('_') or 'export'
     return Response(
         output.getvalue(),
         mimetype='text/csv',
-        headers={'Content-Disposition': 'attachment; filename=dispatch_log.csv'}
+        headers={'Content-Disposition': f'attachment; filename={safe_name}_dispatch_log.csv'}
     )
 
 @app.route('/export_progress_csv')
 def export_progress_csv():
     if not session.get('logged_in'): return redirect('/login')
+    fid = current_factory_id()
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute('SELECT po_number, barcode, item_name, weight, company, SUM(ordered_qty) FROM po_items GROUP BY po_number, barcode, item_name, weight, company')
+    cursor.execute('SELECT display_name, company_name FROM factories WHERE id = %s', (fid,))
+    frow = cursor.fetchone()
+    factory_name = (frow[0] or frow[1]) if frow else 'Export'
+    cursor.execute('SELECT po_number, barcode, item_name, weight, company, SUM(ordered_qty) FROM po_items WHERE factory_id = %s GROUP BY po_number, barcode, item_name, weight, company', (fid,))
     po_item_rows = cursor.fetchall()
-    cursor.execute('SELECT po_number, barcode, SUM(loaded_qty) FROM dispatch_log GROUP BY po_number, barcode')
+    cursor.execute('SELECT po_number, barcode, SUM(loaded_qty) FROM dispatch_log WHERE factory_id = %s GROUP BY po_number, barcode', (fid,))
     dispatched_map = {(r[0], r[1]): (r[2] or 0) for r in cursor.fetchall()}
     conn.close()
 
     output = io.StringIO()
     writer = csv.writer(output)
+    writer.writerow([factory_name])
     writer.writerow(['Company', 'PO Number', 'Item', 'Weight', 'Barcode', 'Ordered Qty', 'Loaded Qty', 'Pending Qty', '% Complete'])
     for po_number, barcode, item_name, weight, company, ordered in po_item_rows:
         ordered = ordered or 0
@@ -2091,10 +2382,11 @@ def export_progress_csv():
         percent = min(100, round((dispatched / ordered) * 100)) if ordered else 0
         writer.writerow([company or '', po_number, item_name, weight, barcode, ordered, dispatched, pending, f'{percent}%'])
 
+    safe_name = re.sub(r'[^A-Za-z0-9_-]+', '_', factory_name).strip('_') or 'export'
     return Response(
         output.getvalue(),
         mimetype='text/csv',
-        headers={'Content-Disposition': 'attachment; filename=po_progress.csv'}
+        headers={'Content-Disposition': f'attachment; filename={safe_name}_po_progress.csv'}
     )
 
 def calculate_qty(weight, master_units):
@@ -2102,17 +2394,19 @@ def calculate_qty(weight, master_units):
     return int(master_units)
 
 
+
 # ===========================================================================
-# VEHICLE LOADING & LIVE GPS TRACKING
+# VEHICLE MASTER + TRIP/LOADING SESSIONS + LIVE GPS TRACKING
 # ===========================================================================
 
 def gen_tracking_token():
     return secrets.token_urlsafe(24)
 
 def po_progress(cursor, po_number, vehicle_number):
-    cursor.execute('SELECT COALESCE(SUM(ordered_qty),0) FROM po_items WHERE po_number = %s', (po_number,))
+    fid = current_factory_id()
+    cursor.execute('SELECT COALESCE(SUM(ordered_qty),0) FROM po_items WHERE factory_id = %s AND po_number = %s', (fid, po_number))
     ordered = cursor.fetchone()[0] or 0
-    cursor.execute('SELECT COALESCE(SUM(loaded_qty),0) FROM dispatch_log WHERE po_number = %s AND vehicle_no = %s', (po_number, vehicle_number))
+    cursor.execute('SELECT COALESCE(SUM(loaded_qty),0) FROM dispatch_log WHERE factory_id = %s AND po_number = %s AND vehicle_no = %s', (fid, po_number, vehicle_number))
     loaded = cursor.fetchone()[0] or 0
     return ordered, loaded
 
@@ -2139,16 +2433,18 @@ def freshness_info(last_location_at):
     else: color = 'red'
     return (label, color, secs)
 
-def recompute_vehicle_status(cursor, vehicle_id):
-    cursor.execute('SELECT vehicle_status FROM vehicles WHERE id = %s', (vehicle_id,))
+TRIP_STATUS_BADGE = {'Loading':'badge-blue', 'Ready to Dispatch':'badge-green', 'In Transit':'badge-blue',
+                      'Delivered':'badge-green', 'Cancelled':'badge-amber', 'Available':'badge-green'}
+
+def recompute_trip_status(cursor, trip_id):
+    fid = current_factory_id()
+    cursor.execute('SELECT trip_status, vehicle_number FROM trips WHERE id = %s AND factory_id = %s', (trip_id, fid))
     row = cursor.fetchone()
     if not row: return
-    current = row[0]
+    current, vehicle_number = row
     if current in ('In Transit', 'Delivered', 'Cancelled'):
-        return  # dispatched/delivered/cancelled vehicles are not auto-changed
-    cursor.execute('SELECT vehicle_number FROM vehicles WHERE id = %s', (vehicle_id,))
-    vehicle_number = cursor.fetchone()[0]
-    cursor.execute('SELECT po_number, is_hold, is_cancelled FROM vehicle_po_map WHERE vehicle_id = %s', (vehicle_id,))
+        return  # dispatched/delivered/cancelled trips are not auto-changed
+    cursor.execute('SELECT po_number, is_hold, is_cancelled FROM vehicle_po_map WHERE trip_id = %s', (trip_id,))
     pos = cursor.fetchall()
     if not pos:
         return
@@ -2161,31 +2457,145 @@ def recompute_vehicle_status(cursor, vehicle_id):
             break
     new_status = 'Ready to Dispatch' if all_done else 'Loading'
     if new_status != current:
-        cursor.execute('UPDATE vehicles SET vehicle_status = %s WHERE id = %s', (new_status, vehicle_id))
+        cursor.execute('UPDATE trips SET trip_status = %s WHERE id = %s', (new_status, trip_id))
+
+def get_or_create_vehicle(cursor, vehicle_number):
+    fid = current_factory_id()
+    cursor.execute('SELECT id FROM vehicle_master WHERE factory_id = %s AND vehicle_number = %s', (fid, vehicle_number))
+    row = cursor.fetchone()
+    if row:
+        return row[0]
+    ts = now_ist().isoformat()
+    cursor.execute('INSERT INTO vehicle_master (factory_id, vehicle_number, created_at, updated_at) VALUES (%s,%s,%s,%s) RETURNING id',
+                   (fid, vehicle_number, ts, ts))
+    return cursor.fetchone()[0]
+
+def vehicle_master_status(cursor, vehicle_id):
+    """Returns (status_label, active_trip_id_or_None) for a vehicle master row, derived from its latest trip."""
+    fid = current_factory_id()
+    cursor.execute('SELECT id, trip_status FROM trips WHERE vehicle_id = %s AND factory_id = %s ORDER BY id DESC LIMIT 1', (vehicle_id, fid))
+    row = cursor.fetchone()
+    if not row:
+        return ('Available', None)
+    trip_id, trip_status = row
+    if trip_status in ('Delivered', 'Cancelled'):
+        return ('Available', None)
+    return (trip_status, trip_id)
+
+# ---------------------------------------------------------------------------
+# Templates
+# ---------------------------------------------------------------------------
 
 VEHICLES_LIST_HTML = STYLE_BLOCK + """
-<title>Vehicles | REAL INSTANT FOODS</title>
+<title>Vehicles | {{ factory_display_name }}</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css">
 </head>
 <body>
 <div class="container">
 """ + TOPBAR_TEMPLATE.replace("__NAV__", nav_html('vehicles')) + """
-    <div class="card">
-        <div class="card-header"><h2>🚚 Live Vehicle Tracking</h2></div>
-        <div id="liveMap" style="height:340px; border-radius:12px; overflow:hidden;"></div>
-        <div style="font-size:12px; color:var(--text-dim); margin-top:8px;">🟢 recently updated &nbsp; 🟡 a few minutes old &nbsp; 🔴 stale / no signal</div>
+    <div class="card-header" style="margin-bottom:14px;">
+        <h2>🚚 Vehicles</h2>
+        <div style="display:flex; gap:8px;">
+            <button class="btn btn-outline btn-sm" onclick="document.getElementById('addVehicleModal').style.display='flex'">+ Add Vehicle</button>
+            <a href="/vehicles/start_loading" class="btn btn-primary btn-sm">+ Start New Vehicle Loading</a>
+        </div>
+    </div>
+
+    <div id="addVehicleModal" class="modal" style="{% if add_vehicle_error %}display:flex;{% endif %}">
+        <div class="modal-content">
+            <h3>Add New Vehicle</h3>
+            {% if add_vehicle_error %}<div style="color:#fca5a5; font-size:12.5px; margin-bottom:8px;">{{ add_vehicle_error }}</div>{% endif %}
+            <form method="POST" action="/vehicles/add">
+                <input type="text" name="vehicle_number" placeholder="Vehicle Number (e.g. RJ14GA1234)" required autofocus>
+                <button type="submit" class="btn btn-block" style="margin-top:8px;">Add Vehicle</button>
+            </form>
+            <button class="btn btn-outline btn-block" style="margin-top:8px;" onclick="document.getElementById('addVehicleModal').style.display='none'">Close</button>
+        </div>
+    </div>
+
+
+    <div class="stats-grid">
+        <div class="stat-card"><div class="icon">🚛</div><div class="label">Total Vehicles</div><div class="value">{{ summary.total }}</div></div>
+        <div class="stat-card"><div class="icon">📦</div><div class="label">Loading</div><div class="value">{{ summary.loading }}</div></div>
+        <div class="stat-card"><div class="icon">🛣️</div><div class="label">In Transit</div><div class="value">{{ summary.transit }}</div></div>
+        <div class="stat-card"><div class="icon">🟢</div><div class="label">Available</div><div class="value">{{ summary.available }}</div></div>
+        <div class="stat-card"><div class="icon">📴</div><div class="label">Location Offline</div><div class="value">{{ summary.offline }}</div></div>
     </div>
 
     <div class="card">
-        <div class="card-header">
-            <h2>➕ Start New Vehicle Loading</h2>
-        </div>
-        <form method="POST" action="/vehicles/create" id="createVehicleForm">
-            <div class="form-grid">
-                <div><label>Vehicle Number *</label><input type="text" name="vehicle_number" required placeholder="e.g. RJ14GA1234"></div>
-                <div><label>Driver Name *</label><input type="text" name="driver_name" required></div>
-                <div><label>Driver Mobile Number *</label><input type="tel" name="driver_mobile" required pattern="[0-9]{10}" maxlength="10" placeholder="10 digit mobile"></div>
+        <div class="card-header"><h2>🗺️ Live Vehicle Map</h2></div>
+        <div id="liveMap" style="height:340px; border-radius:12px; overflow:hidden;"></div>
+        <div style="font-size:12px; color:var(--text-dim); margin-top:8px;">🟢 live &amp; fresh &nbsp; 🟡 live but a few min old &nbsp; ⚪ last known location only</div>
+    </div>
+
+    <div class="card">
+        <div class="card-header"><h2>🔍 All Vehicles</h2></div>
+        <form method="GET" action="/vehicles" style="margin-bottom:14px;">
+            <input type="text" name="q" value="{{ q }}" placeholder="Search Vehicle Number, Driver Name or Mobile...">
+        </form>
+        <table class="table">
+            <tr><th>Vehicle No.</th><th>Driver</th><th>Mobile</th><th>Status</th><th>Current / Last Location</th><th>Last Updated</th><th></th></tr>
+            {% for veh in vehicles %}
+            <tr>
+                <td>{{ veh.vehicle_number }}</td>
+                <td>{{ veh.driver_name or '—' }}</td>
+                <td>{{ veh.driver_mobile or '—' }}</td>
+                <td><span class="badge {{ veh.status_class }}">{{ veh.status }}</span></td>
+                <td>{% if veh.has_location %}{{ veh.lat_display }}, {{ veh.lng_display }}{% else %}No location yet{% endif %}</td>
+                <td><span style="color:{{ veh.freshness_color }};">●</span> {{ veh.freshness_label }}</td>
+                <td><a href="/vehicles/{{ veh.id }}" class="btn btn-outline btn-sm">Open</a></td>
+            </tr>
+            {% endfor %}
+            {% if not vehicles %}<tr><td colspan="7" style="text-align:center; color:var(--text-dim); padding:20px;">No vehicles found.</td></tr>{% endif %}
+        </table>
+    </div>
+</div>
+<script>
+const map = L.map('liveMap').setView([20.5937, 78.9629], 5);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '&copy; OpenStreetMap' }).addTo(map);
+const markers = {{ map_markers|tojson }};
+const bounds = [];
+markers.forEach(m => {
+    const color = m.color === 'green' ? '#4ade80' : (m.color === 'yellow' ? '#fbbf24' : '#94a3b8');
+    const icon = L.divIcon({html: `<div style="background:${color}; width:16px; height:16px; border-radius:50%; border:2px solid white; box-shadow:0 0 6px rgba(0,0,0,0.5);"></div>`, className: ''});
+    const mk = L.marker([m.lat, m.lng], {icon}).addTo(map);
+    mk.bindPopup(`<b>${m.vehicle_number}</b><br>Driver: ${m.driver_name || '—'} (${m.driver_mobile || '—'})<br>Status: ${m.status}<br>Active PO: ${m.po_count}<br>${m.mode} — ${m.freshness}<br><a href="/vehicles/${m.id}">Open →</a>`);
+    bounds.push([m.lat, m.lng]);
+});
+if (bounds.length) map.fitBounds(bounds, {padding:[30,30]});
+</script>
+</body></html>
+"""
+
+START_LOADING_HTML = STYLE_BLOCK + """
+<title>Start New Vehicle Loading | {{ factory_display_name }}</title>
+</head>
+<body>
+<div class="container">
+""" + TOPBAR_TEMPLATE.replace("__NAV__", nav_html('vehicles')) + """
+    <div class="card">
+        <div class="card-header"><h2>🚀 Start New Vehicle Loading</h2><a href="/vehicles" class="btn btn-outline btn-sm">← Back</a></div>
+        <form method="POST" action="/vehicles/start_loading" id="startLoadingForm">
+            <div>
+                <label>Vehicle</label>
+                <select id="vehicleSelect" name="vehicle_choice" onchange="onVehicleChange()" required>
+                    <option value="">Select vehicle...</option>
+                    {% for veh in existing_vehicles %}
+                    <option value="{{ veh.vehicle_number }}" data-driver="{{ veh.driver_name or '' }}" data-mobile="{{ veh.driver_mobile or '' }}" data-status="{{ veh.status }}">
+                        {{ veh.vehicle_number }} ({{ veh.status }})
+                    </option>
+                    {% endfor %}
+                    <option value="__new__">+ Add New Vehicle</option>
+                </select>
+            </div>
+            <div id="newVehicleRow" style="display:none;">
+                <label>New Vehicle Number *</label>
+                <input type="text" id="newVehicleNumber" name="new_vehicle_number" placeholder="e.g. RJ14GA1234">
+            </div>
+            <div class="form-grid" style="margin-top:6px;">
+                <div><label>Driver Name *</label><input type="text" name="driver_name" id="driverName" required></div>
+                <div><label>Driver Mobile Number *</label><input type="tel" name="driver_mobile" id="driverMobile" required pattern="[0-9]{10}" maxlength="10" placeholder="10 digit mobile"></div>
                 <div><label>Starting Location *</label><input type="text" name="start_location" required></div>
             </div>
             <div style="margin-top:6px;">
@@ -2195,43 +2605,6 @@ VEHICLES_LIST_HTML = STYLE_BLOCK + """
             </div>
             <button type="submit" class="btn btn-primary btn-block" style="margin-top:14px;">Start Loading</button>
         </form>
-    </div>
-
-    <div class="card">
-        <div class="card-header"><h2>🟢 Active Vehicles</h2></div>
-        <table class="table">
-            <tr><th>Vehicle</th><th>Driver</th><th>Status</th><th>POs</th><th>Progress</th><th>Location</th><th></th></tr>
-            {% for v in active_vehicles %}
-            <tr>
-                <td>{{ v.vehicle_number }}</td>
-                <td>{{ v.driver_name }}<br><span style="color:var(--text-dim); font-size:11px;">{{ v.driver_mobile }}</span></td>
-                <td><span class="badge {{ v.status_class }}">{{ v.vehicle_status }}</span></td>
-                <td>{{ v.completed_count }}/{{ v.po_count }} done</td>
-                <td style="min-width:120px;">
-                    <div class="progress-track"><div class="progress-fill" style="width:{{ v.percent }}%;"></div></div>
-                </td>
-                <td><span style="color:{{ v.freshness_color }};">●</span> {{ v.freshness_label }}</td>
-                <td><a href="/vehicles/{{ v.id }}" class="btn btn-outline btn-sm">Open</a></td>
-            </tr>
-            {% endfor %}
-            {% if not active_vehicles %}<tr><td colspan="7" style="text-align:center; color:var(--text-dim); padding:20px;">No active vehicles right now.</td></tr>{% endif %}
-        </table>
-    </div>
-
-    <div class="card">
-        <div class="card-header"><h2>📜 Completed / Past Vehicles</h2></div>
-        <table class="table">
-            <tr><th>Vehicle</th><th>Driver</th><th>Status</th><th>Started</th><th></th></tr>
-            {% for v in past_vehicles %}
-            <tr>
-                <td>{{ v.vehicle_number }}</td><td>{{ v.driver_name }}</td>
-                <td><span class="badge {{ v.status_class }}">{{ v.vehicle_status }}</span></td>
-                <td>{{ v.loading_started_at }}</td>
-                <td><a href="/vehicles/{{ v.id }}" class="btn btn-outline btn-sm">Open</a></td>
-            </tr>
-            {% endfor %}
-            {% if not past_vehicles %}<tr><td colspan="5" style="text-align:center; color:var(--text-dim); padding:20px;">Nothing here yet.</td></tr>{% endif %}
-        </table>
     </div>
 </div>
 <script>
@@ -2247,31 +2620,40 @@ function addPoRow() {
     document.getElementById('poRows').appendChild(div);
 }
 addPoRow();
-document.getElementById('createVehicleForm').addEventListener('submit', function(e){
+function onVehicleChange() {
+    const sel = document.getElementById('vehicleSelect');
+    const opt = sel.options[sel.selectedIndex];
+    if (sel.value === '__new__') {
+        document.getElementById('newVehicleRow').style.display = 'block';
+        document.getElementById('newVehicleNumber').required = true;
+        document.getElementById('driverName').value = '';
+        document.getElementById('driverMobile').value = '';
+    } else {
+        document.getElementById('newVehicleRow').style.display = 'none';
+        document.getElementById('newVehicleNumber').required = false;
+        document.getElementById('driverName').value = opt.dataset.driver || '';
+        document.getElementById('driverMobile').value = opt.dataset.mobile || '';
+    }
+}
+{% if preselect_vehicle %}
+window.addEventListener('DOMContentLoaded', () => {
+    document.getElementById('vehicleSelect').value = "{{ preselect_vehicle }}";
+    onVehicleChange();
+});
+{% endif %}
+document.getElementById('startLoadingForm').addEventListener('submit', function(e){
     const selects = Array.from(document.querySelectorAll('select[name="po_numbers"]')).map(s => s.value).filter(Boolean);
     const unique = new Set(selects);
     if (selects.length === 0) { alert('Kam se kam 1 PO add karo.'); e.preventDefault(); return; }
     if (unique.size !== selects.length) { alert('Same PO do baar add nahi ho sakta.'); e.preventDefault(); return; }
+    if (document.getElementById('vehicleSelect').value === '') { alert('Vehicle select karo.'); e.preventDefault(); return; }
 });
-
-const map = L.map('liveMap').setView([20.5937, 78.9629], 5);
-L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '&copy; OpenStreetMap' }).addTo(map);
-const markers = {{ map_markers|tojson }};
-const bounds = [];
-markers.forEach(m => {
-    const color = m.color === 'green' ? '#4ade80' : (m.color === 'yellow' ? '#fbbf24' : '#94a3b8');
-    const icon = L.divIcon({html: `<div style="background:${color}; width:16px; height:16px; border-radius:50%; border:2px solid white; box-shadow:0 0 6px rgba(0,0,0,0.5);"></div>`, className: ''});
-    const mk = L.marker([m.lat, m.lng], {icon}).addTo(map);
-    mk.bindPopup(`<b>${m.vehicle_number}</b><br>Driver: ${m.driver_name} (${m.driver_mobile})<br>Status: ${m.vehicle_status}<br>POs: ${m.po_count}<br>Last update: ${m.freshness}<br><a href="/vehicles/${m.id}">Open →</a>`);
-    bounds.push([m.lat, m.lng]);
-});
-if (bounds.length) map.fitBounds(bounds, {padding:[30,30]});
 </script>
 </body></html>
 """
 
-VEHICLE_DETAIL_HTML = STYLE_BLOCK + """
-<title>{{ v.vehicle_number }} | Vehicle Tracking</title>
+VEHICLE_MASTER_DETAIL_HTML = STYLE_BLOCK + """
+<title>{{ veh.vehicle_number }} | Vehicle Details</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css">
 </head>
@@ -2280,37 +2662,137 @@ VEHICLE_DETAIL_HTML = STYLE_BLOCK + """
 """ + TOPBAR_TEMPLATE.replace("__NAV__", nav_html('vehicles')) + """
     <div class="card">
         <div class="card-header">
-            <h2>🚛 {{ v.vehicle_number }} <span class="badge {{ v.status_class }}">{{ v.vehicle_status }}</span></h2>
-            <a href="/vehicles" class="btn btn-outline btn-sm">← Back</a>
+            <h2>🚛 {{ veh.vehicle_number }} <span class="badge {{ veh.status_class }}">{{ veh.status }}</span></h2>
+            <div style="display:flex; gap:8px;">
+                <a href="/vehicles/start_loading?vehicle={{ veh.vehicle_number }}" class="btn btn-primary btn-sm">+ Start New Loading</a>
+                <a href="/vehicles" class="btn btn-outline btn-sm">← Back</a>
+            </div>
         </div>
         <div class="form-grid">
-            <div><strong>Driver:</strong> {{ v.driver_name }}</div>
-            <div><strong>Mobile:</strong> {{ v.driver_mobile }}</div>
-            <div><strong>Start Location:</strong> {{ v.start_location }}</div>
-            <div><strong>Loading Started:</strong> {{ v.loading_started_at }}</div>
-            <div><strong>Tracking:</strong> {{ v.tracking_status }} — <span style="color:{{ v.freshness_color }};">●</span> {{ v.freshness_label }}</div>
+            <div><strong>Driver (current/last trip):</strong> {{ veh.driver_name or '—' }}</div>
+            <div><strong>Mobile:</strong> {{ veh.driver_mobile or '—' }}</div>
+            <div><strong>GPS Status:</strong> {{ veh.mode }}</div>
+        </div>
+    </div>
+
+    <div class="card">
+        <div class="card-header"><h2>📍 {{ veh.mode }} Location</h2></div>
+        {% if veh.has_location %}
+        <div id="curMap" style="height:280px; border-radius:12px;"></div>
+        <div style="margin-top:10px; font-size:13px; color:var(--text-dim);">
+            <span style="color:{{ veh.freshness_color }};">●</span> Last Updated: {{ veh.freshness_label }}
+            &nbsp;|&nbsp; Lat/Lng: {{ veh.lat_display }}, {{ veh.lng_display }}
+            &nbsp;|&nbsp; <a href="https://www.google.com/maps?q={{ veh.lat_display }},{{ veh.lng_display }}" target="_blank" style="color:var(--primary);">Open in Google Maps →</a>
+        </div>
+        {% else %}
+        <p style="color:var(--text-dim);">Is vehicle ki abhi tak koi location record nahi hui.</p>
+        {% endif %}
+    </div>
+
+    <div class="card">
+        <div class="card-header"><h2>🧾 Trip History</h2></div>
+        <table class="table">
+            <tr><th>Trip</th><th>Date</th><th>PO Count</th><th>Status</th><th></th></tr>
+            {% for t in trips %}
+            <tr>
+                <td>#{{ t.id }}</td><td>{{ t.loading_started_at }}</td><td>{{ t.po_count }}</td>
+                <td><span class="badge {{ t.status_class }}">{{ t.trip_status }}</span></td>
+                <td><a href="/trips/{{ t.id }}" class="btn btn-outline btn-sm">Open</a></td>
+            </tr>
+            {% endfor %}
+            {% if not trips %}<tr><td colspan="5" style="text-align:center; color:var(--text-dim); padding:20px;">Koi trip nahi hui abhi tak.</td></tr>{% endif %}
+        </table>
+    </div>
+
+    <div class="card">
+        <div class="card-header"><h2>🛣️ Route History</h2></div>
+        <form method="GET" action="/vehicles/{{ veh.id }}" style="display:flex; gap:8px; margin-bottom:14px;">
+            <select name="route_trip" onchange="this.form.submit()" style="flex:1;">
+                <option value="">Select a trip to view its route...</option>
+                {% for t in trips %}<option value="{{ t.id }}" {% if t.id == route_trip_id %}selected{% endif %}>Trip #{{ t.id }} — {{ t.loading_started_at }}</option>{% endfor %}
+            </select>
+        </form>
+        {% if route_points %}
+        <div id="routeMap" style="height:300px; border-radius:12px;"></div>
+        {% elif route_trip_id %}
+        <p style="color:var(--text-dim);">Is trip ke liye koi location record nahi mila.</p>
+        {% endif %}
+    </div>
+
+    <div class="card">
+        <div class="card-header"><h2>📜 Location History</h2></div>
+        <table class="table">
+            <tr><th>Date</th><th>Time</th><th>Lat</th><th>Lng</th></tr>
+            {% for h in location_history %}
+            <tr><td>{{ h.date }}</td><td>{{ h.time }}</td><td>{{ h.lat }}</td><td>{{ h.lng }}</td></tr>
+            {% endfor %}
+            {% if not location_history %}<tr><td colspan="4" style="text-align:center; color:var(--text-dim); padding:20px;">Koi location history nahi hai.</td></tr>{% endif %}
+        </table>
+    </div>
+</div>
+<script>
+{% if veh.has_location %}
+const map = L.map('curMap').setView([{{ veh.lat_display }}, {{ veh.lng_display }}], 13);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '&copy; OpenStreetMap' }).addTo(map);
+L.marker([{{ veh.lat_display }}, {{ veh.lng_display }}]).addTo(map).bindPopup('{{ veh.mode }} — {{ veh.freshness_label }}').openPopup();
+{% endif %}
+{% if route_points %}
+const rmap = L.map('routeMap').setView({{ route_points[0]|tojson }}, 12);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '&copy; OpenStreetMap' }).addTo(rmap);
+const route = {{ route_points|tojson }};
+L.polyline(route, {color:'#3b82f6', weight:4}).addTo(rmap);
+L.marker(route[0]).addTo(rmap).bindPopup('Trip start');
+L.marker(route[route.length-1]).addTo(rmap).bindPopup('Latest point');
+rmap.fitBounds(route);
+{% endif %}
+</script>
+</body></html>
+"""
+
+TRIP_DETAIL_HTML = STYLE_BLOCK + """
+<title>{{ t.vehicle_number }} — Trip #{{ t.id }}</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css">
+</head>
+<body>
+<div class="container">
+""" + TOPBAR_TEMPLATE.replace("__NAV__", nav_html('vehicles')) + """
+    <div class="card">
+        <div class="card-header">
+            <h2>🚛 {{ t.vehicle_number }} — Trip #{{ t.id }} <span class="badge {{ t.status_class }}">{{ t.trip_status }}</span></h2>
+            <div style="display:flex; gap:8px;">
+                <a href="/vehicles/{{ t.vehicle_id }}" class="btn btn-outline btn-sm">🚛 Vehicle Page</a>
+                <a href="/vehicles" class="btn btn-outline btn-sm">← All Vehicles</a>
+            </div>
+        </div>
+        <div class="form-grid">
+            <div><strong>Driver:</strong> {{ t.driver_name }}</div>
+            <div><strong>Mobile:</strong> {{ t.driver_mobile }}</div>
+            <div><strong>Start Location:</strong> {{ t.start_location }}</div>
+            <div><strong>Loading Started:</strong> {{ t.loading_started_at }}</div>
+            <div><strong>Tracking:</strong> {{ t.tracking_status }} — <span style="color:{{ t.freshness_color }};">●</span> {{ t.freshness_label }}</div>
         </div>
         <div style="margin-top:14px; display:flex; gap:8px; flex-wrap:wrap;">
-            {% if v.vehicle_status not in ['In Transit','Delivered','Cancelled'] %}
-                <form method="POST" action="/vehicles/{{ v.id }}/regen_token" style="display:inline;"><button class="btn btn-outline btn-sm">🔗 Generate/Reset Tracking Link</button></form>
-                {% if v.tracking_token %}
+            {% if t.trip_status not in ['In Transit','Delivered','Cancelled'] %}
+                <form method="POST" action="/trips/{{ t.id }}/regen_token" style="display:inline;"><button class="btn btn-outline btn-sm">🔗 Generate/Reset Tracking Link</button></form>
+                {% if t.tracking_token %}
                 <button class="btn btn-outline btn-sm" onclick="navigator.clipboard.writeText('{{ track_url }}'); alert('Link copied!');">📋 Copy Tracking Link</button>
-                <a class="btn btn-outline btn-sm" target="_blank" href="https://wa.me/91{{ v.driver_mobile }}?text={{ track_url_encoded }}">📲 Share on WhatsApp</a>
+                <a class="btn btn-outline btn-sm" target="_blank" href="https://wa.me/91{{ t.driver_mobile }}?text={{ track_url_encoded }}">📲 Share on WhatsApp</a>
                 {% endif %}
-                {% if v.tracking_status == 'active' %}
-                <form method="POST" action="/vehicles/{{ v.id }}/stop_tracking" style="display:inline;"><button class="btn btn-danger btn-sm">⛔ Stop Tracking</button></form>
+                {% if t.tracking_status == 'active' %}
+                <form method="POST" action="/trips/{{ t.id }}/stop_tracking" style="display:inline;"><button class="btn btn-danger btn-sm">⛔ Stop Tracking</button></form>
                 {% endif %}
             {% endif %}
-            {% if v.vehicle_status == 'Ready to Dispatch' %}
-                <form method="POST" action="/vehicles/{{ v.id }}/dispatch" style="display:inline;"><button class="btn btn-primary btn-sm">🚀 Dispatch Vehicle</button></form>
+            {% if t.trip_status == 'Ready to Dispatch' %}
+                <form method="POST" action="/trips/{{ t.id }}/dispatch" style="display:inline;"><button class="btn btn-primary btn-sm">🚀 Dispatch Vehicle</button></form>
             {% endif %}
-            {% if v.vehicle_status == 'In Transit' %}
-                <form method="POST" action="/vehicles/{{ v.id }}/deliver" style="display:inline;"><button class="btn btn-primary btn-sm">✅ Mark Delivered</button></form>
+            {% if t.trip_status == 'In Transit' %}
+                <form method="POST" action="/trips/{{ t.id }}/deliver" style="display:inline;"><button class="btn btn-primary btn-sm">✅ Mark Delivered</button></form>
             {% endif %}
         </div>
     </div>
 
-    {% if v.current_latitude %}
+    {% if t.current_latitude %}
     <div class="card">
         <div class="card-header"><h2>📍 Live Location &amp; Route</h2></div>
         <div id="routeMap" style="height:300px; border-radius:12px;"></div>
@@ -2319,9 +2801,9 @@ VEHICLE_DETAIL_HTML = STYLE_BLOCK + """
 
     <div class="card">
         <div class="card-header">
-            <h2>📦 Attached POs — {{ v.completed_count }}/{{ v.po_count }} completed ({{ v.percent }}% overall)</h2>
+            <h2>📦 Attached POs — {{ t.completed_count }}/{{ t.po_count }} completed ({{ t.percent }}% overall)</h2>
         </div>
-        <div class="progress-track" style="margin-bottom:14px;"><div class="progress-fill" style="width:{{ v.percent }}%;"></div></div>
+        <div class="progress-track" style="margin-bottom:14px;"><div class="progress-fill" style="width:{{ t.percent }}%;"></div></div>
         <table class="table">
             <tr><th>PO Number</th><th>Ordered</th><th>Loaded</th><th>Pending</th><th>Status</th><th></th></tr>
             {% for p in pos %}
@@ -2330,17 +2812,17 @@ VEHICLE_DETAIL_HTML = STYLE_BLOCK + """
                 <td>{{ p.ordered }}</td><td>{{ p.loaded }}</td><td>{{ p.pending }}</td>
                 <td><span class="badge {{ p.status_class }}">{{ p.status }}</span></td>
                 <td style="white-space:nowrap;">
-                    {% if v.vehicle_status not in ['In Transit','Delivered','Cancelled'] %}
-                    <form method="POST" action="/vehicles/{{ v.id }}/set_active_po" style="display:inline;">
+                    {% if t.trip_status not in ['In Transit','Delivered','Cancelled'] %}
+                    <form method="POST" action="/trips/{{ t.id }}/set_active_po" style="display:inline;">
                         <input type="hidden" name="po_number" value="{{ p.po_number }}">
                         <button class="btn btn-outline btn-sm">Scan This</button>
                     </form>
-                    <form method="POST" action="/vehicles/{{ v.id }}/po_status" style="display:inline;">
+                    <form method="POST" action="/trips/{{ t.id }}/po_status" style="display:inline;">
                         <input type="hidden" name="po_number" value="{{ p.po_number }}">
                         <input type="hidden" name="action" value="{{ 'resume' if p.is_hold else 'hold' }}">
                         <button class="btn btn-outline btn-sm">{{ 'Resume' if p.is_hold else 'Hold' }}</button>
                     </form>
-                    <form method="POST" action="/vehicles/{{ v.id }}/remove_po" style="display:inline;" onsubmit="return confirm('Is PO ko vehicle se remove karein?');">
+                    <form method="POST" action="/trips/{{ t.id }}/remove_po" style="display:inline;" onsubmit="return confirm('Is PO ko trip se remove karein?');">
                         <input type="hidden" name="po_number" value="{{ p.po_number }}">
                         <button class="btn btn-danger btn-sm">Remove</button>
                     </form>
@@ -2349,8 +2831,8 @@ VEHICLE_DETAIL_HTML = STYLE_BLOCK + """
             </tr>
             {% endfor %}
         </table>
-        {% if v.vehicle_status not in ['In Transit','Delivered','Cancelled'] %}
-        <form method="POST" action="/vehicles/{{ v.id }}/add_po" style="margin-top:14px; display:flex; gap:8px;">
+        {% if t.trip_status not in ['In Transit','Delivered','Cancelled'] %}
+        <form method="POST" action="/trips/{{ t.id }}/add_po" style="margin-top:14px; display:flex; gap:8px;">
             <select name="po_number" required style="flex:1;">
                 <option value="">+ Add another PO...</option>
                 {% for po in available_pos %}<option value="{{ po }}">{{ po }}</option>{% endfor %}
@@ -2361,27 +2843,27 @@ VEHICLE_DETAIL_HTML = STYLE_BLOCK + """
     </div>
 </div>
 <script>
-{% if v.current_latitude %}
-const map = L.map('routeMap').setView([{{ v.current_latitude }}, {{ v.current_longitude }}], 13);
+{% if t.current_latitude %}
+const map = L.map('routeMap').setView([{{ t.current_latitude }}, {{ t.current_longitude }}], 13);
 L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '&copy; OpenStreetMap' }).addTo(map);
 const route = {{ route_points|tojson }};
 if (route.length > 1) L.polyline(route, {color:'#3b82f6', weight:4}).addTo(map);
-L.marker([{{ v.current_latitude }}, {{ v.current_longitude }}]).addTo(map).bindPopup('Current location — {{ v.freshness_label }}').openPopup();
+L.marker([{{ t.current_latitude }}, {{ t.current_longitude }}]).addTo(map).bindPopup('Current location — {{ t.freshness_label }}').openPopup();
 {% endif %}
 </script>
 </body></html>
 """
 
 TRACK_HTML = STYLE_BLOCK + """
-<title>Live Tracking | {{ v.vehicle_number }}</title>
+<title>Live Tracking | {{ t.vehicle_number }}</title>
 </head>
 <body>
 <div class="container" style="max-width:480px;">
     <div class="card" style="text-align:center; margin-top:40px;">
         <div style="font-size:40px;">🚚</div>
-        <h2 style="margin:10px 0 4px;">{{ v.vehicle_number }}</h2>
-        <div style="color:var(--text-dim);">Driver: {{ v.driver_name }}</div>
-        <div class="badge {{ v.status_class }}" style="margin-top:10px; display:inline-block;">{{ v.vehicle_status }}</div>
+        <h2 style="margin:10px 0 4px;">{{ t.vehicle_number }}</h2>
+        <div style="color:var(--text-dim);">Driver: {{ t.driver_name }}</div>
+        <div class="badge {{ t.status_class }}" style="margin-top:10px; display:inline-block;">{{ t.trip_status }}</div>
 
         {% if not trackable %}
         <p style="margin-top:24px; color:var(--text-dim);">Yeh tracking link ab active nahi hai. Trip complete ho chuki hai ya tracking band kar di gayi hai.</p>
@@ -2416,14 +2898,232 @@ function startTracking() {
 </body></html>
 """
 
-def _vehicle_row_dict(cursor, row):
-    (vid, vehicle_number, driver_name, driver_mobile, start_location, vehicle_status,
-     loading_started_at, cur_lat, cur_lng, cur_acc, last_loc_at, tracking_token,
-     tracking_status, dispatched_at, delivered_at) = row
-    cursor.execute('SELECT po_number, is_hold, is_cancelled FROM vehicle_po_map WHERE vehicle_id = %s', (vid,))
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
+@app.route('/vehicles')
+def vehicles_page():
+    if not session.get('logged_in'): return redirect('/login')
+    fid = current_factory_id()
+    q = request.args.get('q', '').strip().lower()
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute('''SELECT id, vehicle_number, current_latitude, current_longitude, last_location_at
+                       FROM vehicle_master WHERE factory_id = %s ORDER BY vehicle_number''', (fid,))
+    rows = cursor.fetchall()
+    vehicles, map_markers = [], []
+    summary = {'total': 0, 'loading': 0, 'transit': 0, 'available': 0, 'offline': 0}
+    for vid, vnum, lat, lng, last_loc in rows:
+        status, active_trip_id = vehicle_master_status(cursor, vid)
+        driver_name, driver_mobile, tracking_status, po_count = None, None, 'stopped', 0
+        if active_trip_id:
+            cursor.execute('SELECT driver_name, driver_mobile, tracking_status FROM trips WHERE id = %s AND factory_id = %s', (active_trip_id, fid))
+            driver_name, driver_mobile, tracking_status = cursor.fetchone()
+            cursor.execute('SELECT COUNT(*) FROM vehicle_po_map WHERE trip_id = %s AND is_cancelled = FALSE', (active_trip_id,))
+            po_count = cursor.fetchone()[0]
+        else:
+            cursor.execute('SELECT driver_name, driver_mobile FROM trips WHERE vehicle_id = %s AND factory_id = %s ORDER BY id DESC LIMIT 1', (vid, fid))
+            last_trip = cursor.fetchone()
+            if last_trip: driver_name, driver_mobile = last_trip
+
+        if q and q not in vnum.lower() and q not in (driver_name or '').lower() and q not in (driver_mobile or ''):
+            continue
+
+        label, color, secs = freshness_info(last_loc)
+        is_live = tracking_status == 'active' and status in ('Loading', 'Ready to Dispatch', 'In Transit')
+        mode = 'LIVE' if (is_live and secs <= 600) else ('LAST KNOWN' if lat is not None else 'NO DATA')
+        gps_offline = lat is None or secs > 600 or not is_live
+
+        summary['total'] += 1
+        if status == 'Loading': summary['loading'] += 1
+        elif status == 'In Transit': summary['transit'] += 1
+        elif status == 'Available': summary['available'] += 1
+        if gps_offline: summary['offline'] += 1
+
+        d = {'id': vid, 'vehicle_number': vnum, 'driver_name': driver_name, 'driver_mobile': driver_mobile,
+             'status': status, 'status_class': TRIP_STATUS_BADGE.get(status, 'badge-amber'),
+             'has_location': lat is not None, 'lat_display': lat, 'lng_display': lng,
+             'freshness_label': label, 'freshness_color': color if lat is not None else 'grey'}
+        vehicles.append(d)
+        if lat is not None:
+            map_markers.append({'id': vid, 'lat': lat, 'lng': lng, 'vehicle_number': vnum, 'driver_name': driver_name,
+                                 'driver_mobile': driver_mobile, 'status': status, 'po_count': po_count,
+                                 'color': 'green' if (is_live and secs <= 60) else ('yellow' if (is_live and secs <= 600) else 'grey'),
+                                 'mode': mode, 'freshness': label})
+    conn.commit()
+    conn.close()
+    return render_template_string(VEHICLES_LIST_HTML, vehicles=vehicles, summary=summary, map_markers=map_markers,
+                                   q=request.args.get('q', ''), add_vehicle_error=request.args.get('add_error', ''))
+
+@app.route('/vehicles/add', methods=['POST'])
+def vehicles_add():
+    if not session.get('logged_in'): return redirect('/login')
+    fid = current_factory_id()
+    vehicle_number = request.form.get('vehicle_number', '').strip().upper()
+    if not vehicle_number:
+        return redirect('/vehicles?add_error=' + quote('Vehicle number zaroori hai.'))
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute('SELECT id FROM vehicle_master WHERE factory_id = %s AND vehicle_number = %s', (fid, vehicle_number))
+    if cursor.fetchone():
+        conn.close()
+        return redirect('/vehicles?add_error=' + quote(f'Vehicle {vehicle_number} pehle se system mein hai.'))
+    ok, limit_msg = check_usage_limit(cursor, 'vehicle')
+    if not ok:
+        conn.close()
+        return redirect('/vehicles?add_error=' + quote(limit_msg))
+    vehicle_id = get_or_create_vehicle(cursor, vehicle_number)
+    log_audit(cursor, 'Vehicle Created', 'Vehicles', vehicle_id, f'Added vehicle {vehicle_number}')
+    conn.commit()
+    conn.close()
+    return redirect(f'/vehicles/{vehicle_id}')
+
+@app.route('/vehicles/start_loading', methods=['GET', 'POST'])
+def vehicles_start_loading():
+    if not session.get('logged_in'): return redirect('/login')
+    fid = current_factory_id()
+    conn = get_conn()
+    cursor = conn.cursor()
+
+    if request.method == 'GET':
+        cursor.execute('SELECT id, vehicle_number FROM vehicle_master WHERE factory_id = %s ORDER BY vehicle_number', (fid,))
+        existing_vehicles = []
+        for vid, vnum in cursor.fetchall():
+            status, _ = vehicle_master_status(cursor, vid)
+            cursor.execute('SELECT driver_name, driver_mobile FROM trips WHERE vehicle_id = %s AND factory_id = %s ORDER BY id DESC LIMIT 1', (vid, fid))
+            last = cursor.fetchone()
+            existing_vehicles.append({'vehicle_number': vnum, 'status': status,
+                                       'driver_name': last[0] if last else '', 'driver_mobile': last[1] if last else ''})
+        cursor.execute('SELECT DISTINCT po_number FROM po_items WHERE factory_id = %s ORDER BY po_number', (fid,))
+        all_po_numbers = [r[0] for r in cursor.fetchall()]
+        conn.close()
+        preselect = request.args.get('vehicle', '')
+        return render_template_string(START_LOADING_HTML, existing_vehicles=existing_vehicles,
+                                       all_po_numbers=all_po_numbers, preselect_vehicle=preselect)
+
+    # POST — create the trip
+    vehicle_choice = request.form.get('vehicle_choice', '').strip()
+    new_vehicle_number = request.form.get('new_vehicle_number', '').strip().upper()
+    vehicle_number = new_vehicle_number if vehicle_choice == '__new__' else vehicle_choice.strip().upper()
+    driver_name = request.form.get('driver_name', '').strip()
+    driver_mobile = request.form.get('driver_mobile', '').strip()
+    start_location = request.form.get('start_location', '').strip()
+    po_numbers = [p.strip() for p in request.form.getlist('po_numbers') if p.strip()]
+    po_numbers = list(dict.fromkeys(po_numbers))
+
+    if not (vehicle_number and driver_name and driver_mobile and start_location and po_numbers):
+        conn.close()
+        return "Sabhi required fields aur kam se kam 1 PO zaroori hai. <a href='/vehicles/start_loading'>Back</a>", 400
+    if not re.match(r'^[0-9]{10}$', driver_mobile):
+        conn.close()
+        return "Driver mobile number 10 digit ka valid number hona chahiye. <a href='/vehicles/start_loading'>Back</a>", 400
+
+    is_new_vehicle = False
+    cursor.execute('SELECT id FROM vehicle_master WHERE factory_id = %s AND vehicle_number = %s', (fid, vehicle_number))
+    if not cursor.fetchone():
+        is_new_vehicle = True
+        ok, limit_msg = check_usage_limit(cursor, 'vehicle')
+        if not ok:
+            conn.close()
+            return f"{limit_msg} <a href='/vehicles/start_loading'>Back</a>", 400
+    vehicle_id = get_or_create_vehicle(cursor, vehicle_number)
+    status, active_trip_id = vehicle_master_status(cursor, vehicle_id)
+    if active_trip_id:
+        conn.close()
+        return f"Vehicle {vehicle_number} already has an active loading session (Trip #{active_trip_id}). <a href='/vehicles'>Back</a>", 400
+
+    for po in po_numbers:
+        cursor.execute('''SELECT tr.vehicle_number FROM vehicle_po_map m JOIN trips tr ON tr.id = m.trip_id
+                           WHERE tr.factory_id = %s AND m.po_number = %s AND m.is_cancelled = FALSE AND tr.trip_status NOT IN ('Delivered','Cancelled')''', (fid, po))
+        clash = cursor.fetchone()
+        if clash:
+            conn.close()
+            return f"PO {po} pehle se vehicle {clash[0]} mein active hai. <a href='/vehicles/start_loading'>Back</a>", 400
+
+    token = gen_tracking_token()
+    cursor.execute('''INSERT INTO trips (factory_id, vehicle_id, vehicle_number, driver_name, driver_mobile, start_location, trip_status,
+                       loading_started_at, tracking_token, tracking_status) VALUES (%s,%s,%s,%s,%s,%s,'Loading',%s,%s,'active') RETURNING id''',
+                   (fid, vehicle_id, vehicle_number, driver_name, driver_mobile, start_location, now_ist().strftime("%d %b %Y, %I:%M %p"), token))
+    trip_id = cursor.fetchone()[0]
+    for po in po_numbers:
+        cursor.execute('SELECT company FROM po_items WHERE factory_id = %s AND po_number = %s LIMIT 1', (fid, po))
+        comp = cursor.fetchone()
+        company = comp[0] if comp else ''
+        cursor.execute('INSERT INTO vehicle_po_map (factory_id, trip_id, po_number, company, created_at) VALUES (%s,%s,%s,%s,%s)',
+                       (fid, trip_id, po, company, now_ist().isoformat()))
+    cursor.execute('UPDATE vehicle_master SET updated_at = %s WHERE id = %s', (now_ist().isoformat(), vehicle_id))
+    log_audit(cursor, 'Loading Started', 'Vehicles', trip_id, f'Vehicle {vehicle_number}, driver {driver_name}, POs: {", ".join(po_numbers)}')
+    conn.commit()
+    conn.close()
+    return redirect(f'/trips/{trip_id}')
+
+@app.route('/vehicles/<int:vehicle_id>')
+def vehicle_master_detail(vehicle_id):
+    if not session.get('logged_in'): return redirect('/login')
+    fid = current_factory_id()
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute('SELECT id, vehicle_number, current_latitude, current_longitude, last_location_at FROM vehicle_master WHERE id = %s AND factory_id = %s', (vehicle_id, fid))
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        return "Vehicle not found. <a href='/vehicles'>Back</a>", 404
+    vid, vnum, lat, lng, last_loc = row
+    status, active_trip_id = vehicle_master_status(cursor, vid)
+    driver_name, driver_mobile, tracking_status = None, None, 'stopped'
+    if active_trip_id:
+        cursor.execute('SELECT driver_name, driver_mobile, tracking_status FROM trips WHERE id = %s AND factory_id = %s', (active_trip_id, fid))
+        driver_name, driver_mobile, tracking_status = cursor.fetchone()
+    else:
+        cursor.execute('SELECT driver_name, driver_mobile FROM trips WHERE vehicle_id = %s AND factory_id = %s ORDER BY id DESC LIMIT 1', (vid, fid))
+        last = cursor.fetchone()
+        if last: driver_name, driver_mobile = last
+
+    label, color, secs = freshness_info(last_loc)
+    is_live = tracking_status == 'active' and status in ('Loading', 'Ready to Dispatch', 'In Transit')
+    mode = 'LIVE' if (is_live and secs <= 600) else 'LAST KNOWN'
+    veh = {'id': vid, 'vehicle_number': vnum, 'driver_name': driver_name, 'driver_mobile': driver_mobile,
+           'status': status, 'status_class': TRIP_STATUS_BADGE.get(status, 'badge-amber'),
+           'has_location': lat is not None, 'lat_display': lat, 'lng_display': lng,
+           'freshness_label': label, 'freshness_color': color if lat is not None else 'grey', 'mode': mode if lat is not None else 'NO DATA'}
+
+    cursor.execute('SELECT id, trip_status, loading_started_at FROM trips WHERE vehicle_id = %s AND factory_id = %s ORDER BY id DESC', (vid, fid))
+    trips = []
+    for tid, tstatus, started in cursor.fetchall():
+        cursor.execute('SELECT COUNT(*) FROM vehicle_po_map WHERE trip_id = %s', (tid,))
+        po_count = cursor.fetchone()[0]
+        trips.append({'id': tid, 'trip_status': tstatus, 'loading_started_at': started, 'po_count': po_count,
+                       'status_class': TRIP_STATUS_BADGE.get(tstatus, 'badge-amber')})
+
+    route_trip_id = request.args.get('route_trip', type=int)
+    route_points = []
+    if route_trip_id:
+        cursor.execute('SELECT latitude, longitude FROM location_history WHERE trip_id = %s AND factory_id = %s ORDER BY id ASC LIMIT 1000', (route_trip_id, fid))
+        route_points = [[r[0], r[1]] for r in cursor.fetchall()]
+
+    cursor.execute('SELECT recorded_at, latitude, longitude FROM location_history WHERE vehicle_id = %s AND factory_id = %s ORDER BY id DESC LIMIT 50', (vid, fid))
+    location_history = []
+    for rec_at, hlat, hlng in cursor.fetchall():
+        try:
+            dt = datetime.fromisoformat(rec_at)
+            date_s, time_s = dt.strftime('%d %b %Y'), dt.strftime('%I:%M %p')
+        except Exception:
+            date_s, time_s = rec_at, ''
+        location_history.append({'date': date_s, 'time': time_s, 'lat': round(hlat, 5), 'lng': round(hlng, 5)})
+
+    conn.commit()
+    conn.close()
+    return render_template_string(VEHICLE_MASTER_DETAIL_HTML, veh=veh, trips=trips, route_trip_id=route_trip_id,
+                                   route_points=route_points, location_history=location_history)
+
+def _trip_dict(cursor, row):
+    (tid, vehicle_id, vehicle_number, driver_name, driver_mobile, start_location, trip_status,
+     loading_started_at, cur_lat, cur_lng, cur_acc, last_loc_at, tracking_token, tracking_status,
+     dispatched_at, delivered_at) = row
+    cursor.execute('SELECT po_number, is_hold, is_cancelled FROM vehicle_po_map WHERE trip_id = %s', (tid,))
     pos = cursor.fetchall()
-    completed, total_ordered, total_loaded = 0, 0, 0
-    active_count = 0
+    completed, total_ordered, total_loaded, active_count = 0, 0, 0, 0
     for po_number, is_hold, is_cancelled in pos:
         if is_cancelled: continue
         active_count += 1
@@ -2433,251 +3133,194 @@ def _vehicle_row_dict(cursor, row):
         if ordered and loaded >= ordered: completed += 1
     percent = min(100, round((total_loaded / total_ordered) * 100)) if total_ordered else 0
     label, color, _ = freshness_info(last_loc_at)
-    status_class = {'Loading':'badge-blue','Ready to Dispatch':'badge-green','In Transit':'badge-blue','Delivered':'badge-green','Cancelled':'badge-amber'}.get(vehicle_status, 'badge-amber')
     return {
-        'id': vid, 'vehicle_number': vehicle_number, 'driver_name': driver_name, 'driver_mobile': driver_mobile,
-        'start_location': start_location, 'vehicle_status': vehicle_status, 'loading_started_at': loading_started_at,
-        'current_latitude': cur_lat, 'current_longitude': cur_lng, 'tracking_token': tracking_token,
-        'tracking_status': tracking_status, 'po_count': active_count, 'completed_count': completed,
-        'percent': percent, 'freshness_label': label, 'freshness_color': color, 'status_class': status_class,
+        'id': tid, 'vehicle_id': vehicle_id, 'vehicle_number': vehicle_number, 'driver_name': driver_name,
+        'driver_mobile': driver_mobile, 'start_location': start_location, 'trip_status': trip_status,
+        'loading_started_at': loading_started_at, 'current_latitude': cur_lat, 'current_longitude': cur_lng,
+        'tracking_token': tracking_token, 'tracking_status': tracking_status, 'po_count': active_count,
+        'completed_count': completed, 'percent': percent, 'freshness_label': label, 'freshness_color': color,
+        'status_class': TRIP_STATUS_BADGE.get(trip_status, 'badge-amber'),
     }
 
-@app.route('/vehicles')
-def vehicles_page():
+@app.route('/trips/<int:trip_id>')
+def trip_detail(trip_id):
     if not session.get('logged_in'): return redirect('/login')
+    fid = current_factory_id()
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute('SELECT DISTINCT po_number FROM po_items ORDER BY po_number')
-    all_po_numbers = [r[0] for r in cursor.fetchall()]
-    cursor.execute('''SELECT id, vehicle_number, driver_name, driver_mobile, start_location, vehicle_status,
+    recompute_trip_status(cursor, trip_id)
+    cursor.execute('''SELECT id, vehicle_id, vehicle_number, driver_name, driver_mobile, start_location, trip_status,
         loading_started_at, current_latitude, current_longitude, current_accuracy, last_location_at,
-        tracking_token, tracking_status, dispatched_at, delivered_at FROM vehicles ORDER BY id DESC''')
-    rows = cursor.fetchall()
-    active_vehicles, past_vehicles, map_markers = [], [], []
-    for row in rows:
-        recompute_vehicle_status(cursor, row[0])
-        d = _vehicle_row_dict(cursor, row)
-        if d['vehicle_status'] in ('Delivered', 'Cancelled'):
-            past_vehicles.append(d)
-        else:
-            active_vehicles.append(d)
-        if d['current_latitude'] is not None:
-            map_markers.append({'id': d['id'], 'lat': d['current_latitude'], 'lng': d['current_longitude'],
-                                 'vehicle_number': d['vehicle_number'], 'driver_name': d['driver_name'],
-                                 'driver_mobile': d['driver_mobile'], 'vehicle_status': d['vehicle_status'],
-                                 'po_count': d['po_count'], 'color': d['freshness_color'], 'freshness': d['freshness_label']})
-    conn.commit()
-    conn.close()
-    return render_template_string(VEHICLES_LIST_HTML, active_vehicles=active_vehicles, past_vehicles=past_vehicles,
-                                   all_po_numbers=all_po_numbers, map_markers=map_markers)
-
-@app.route('/vehicles/create', methods=['POST'])
-def vehicles_create():
-    if not session.get('logged_in'): return redirect('/login')
-    vehicle_number = request.form.get('vehicle_number', '').strip().upper()
-    driver_name = request.form.get('driver_name', '').strip()
-    driver_mobile = request.form.get('driver_mobile', '').strip()
-    start_location = request.form.get('start_location', '').strip()
-    po_numbers = [p.strip() for p in request.form.getlist('po_numbers') if p.strip()]
-    po_numbers = list(dict.fromkeys(po_numbers))  # de-dupe, keep order
-
-    if not (vehicle_number and driver_name and driver_mobile and start_location and po_numbers):
-        return "Sabhi required fields aur kam se kam 1 PO zaroori hai. <a href='/vehicles'>Back</a>", 400
-    if not re.match(r'^[0-9]{10}$', driver_mobile):
-        return "Driver mobile number 10 digit ka valid number hona chahiye. <a href='/vehicles'>Back</a>", 400
-
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute("SELECT id FROM vehicles WHERE vehicle_number = %s AND vehicle_status NOT IN ('Delivered','Cancelled')", (vehicle_number,))
-    if cursor.fetchone():
-        conn.close()
-        return f"Vehicle {vehicle_number} already has an active loading session. <a href='/vehicles'>Back</a>", 400
-
-    for po in po_numbers:
-        cursor.execute('''SELECT v.vehicle_number FROM vehicle_po_map m JOIN vehicles v ON v.id = m.vehicle_id
-                           WHERE m.po_number = %s AND m.is_cancelled = FALSE AND v.vehicle_status NOT IN ('Delivered','Cancelled')''', (po,))
-        clash = cursor.fetchone()
-        if clash:
-            conn.close()
-            return f"PO {po} pehle se vehicle {clash[0]} mein active hai. <a href='/vehicles'>Back</a>", 400
-
-    token = gen_tracking_token()
-    cursor.execute('''INSERT INTO vehicles (vehicle_number, driver_name, driver_mobile, start_location, vehicle_status,
-                       loading_started_at, tracking_token, tracking_status) VALUES (%s,%s,%s,%s,'Loading',%s,%s,'active') RETURNING id''',
-                   (vehicle_number, driver_name, driver_mobile, start_location, now_ist().strftime("%d %b %Y, %I:%M %p"), token))
-    vehicle_id = cursor.fetchone()[0]
-    for po in po_numbers:
-        cursor.execute('SELECT company FROM po_items WHERE po_number = %s LIMIT 1', (po,))
-        comp = cursor.fetchone()
-        company = comp[0] if comp else ''
-        cursor.execute('INSERT INTO vehicle_po_map (vehicle_id, po_number, company, created_at) VALUES (%s,%s,%s,%s)',
-                       (vehicle_id, po, company, now_ist().isoformat()))
-    conn.commit()
-    conn.close()
-    return redirect(f'/vehicles/{vehicle_id}')
-
-@app.route('/vehicles/<int:vehicle_id>')
-def vehicle_detail(vehicle_id):
-    if not session.get('logged_in'): return redirect('/login')
-    conn = get_conn()
-    cursor = conn.cursor()
-    recompute_vehicle_status(cursor, vehicle_id)
-    cursor.execute('''SELECT id, vehicle_number, driver_name, driver_mobile, start_location, vehicle_status,
-        loading_started_at, current_latitude, current_longitude, current_accuracy, last_location_at,
-        tracking_token, tracking_status, dispatched_at, delivered_at FROM vehicles WHERE id = %s''', (vehicle_id,))
+        tracking_token, tracking_status, dispatched_at, delivered_at FROM trips WHERE id = %s AND factory_id = %s''', (trip_id, fid))
     row = cursor.fetchone()
     if not row:
         conn.close()
-        return "Vehicle not found. <a href='/vehicles'>Back</a>", 404
-    v = _vehicle_row_dict(cursor, row)
+        return "Trip not found. <a href='/vehicles'>Back</a>", 404
+    t = _trip_dict(cursor, row)
 
-    cursor.execute('SELECT po_number, company, is_hold, is_cancelled FROM vehicle_po_map WHERE vehicle_id = %s ORDER BY id', (vehicle_id,))
+    cursor.execute('SELECT po_number, company, is_hold, is_cancelled FROM vehicle_po_map WHERE trip_id = %s ORDER BY id', (trip_id,))
     pos = []
     for po_number, company, is_hold, is_cancelled in cursor.fetchall():
-        ordered, loaded = po_progress(cursor, po_number, v['vehicle_number'])
+        ordered, loaded = po_progress(cursor, po_number, t['vehicle_number'])
         pending = max(ordered - loaded, 0)
         status, status_class = po_status_label(ordered, loaded, is_hold, is_cancelled)
         pos.append({'po_number': po_number, 'company': company, 'ordered': ordered, 'loaded': loaded,
                     'pending': pending, 'status': status, 'status_class': status_class, 'is_hold': is_hold})
 
     attached = {p['po_number'] for p in pos}
-    cursor.execute('SELECT DISTINCT po_number FROM po_items ORDER BY po_number')
+    cursor.execute('SELECT DISTINCT po_number FROM po_items WHERE factory_id = %s ORDER BY po_number', (fid,))
     available_pos = [p[0] for p in cursor.fetchall() if p[0] not in attached]
 
-    cursor.execute('SELECT latitude, longitude FROM location_history WHERE vehicle_id = %s ORDER BY id ASC LIMIT 500', (vehicle_id,))
+    cursor.execute('SELECT latitude, longitude FROM location_history WHERE trip_id = %s ORDER BY id ASC LIMIT 500', (trip_id,))
     route_points = [[r[0], r[1]] for r in cursor.fetchall()]
 
     conn.commit()
     conn.close()
-    track_url = request.url_root.rstrip('/') + f"/track/{v['tracking_token']}" if v['tracking_token'] else ''
-    return render_template_string(VEHICLE_DETAIL_HTML, v=v, pos=pos, available_pos=available_pos,
+    track_url = request.url_root.rstrip('/') + f"/track/{t['tracking_token']}" if t['tracking_token'] else ''
+    return render_template_string(TRIP_DETAIL_HTML, t=t, pos=pos, available_pos=available_pos,
                                    route_points=route_points, track_url=track_url, track_url_encoded=quote(track_url))
 
-@app.route('/vehicles/<int:vehicle_id>/add_po', methods=['POST'])
-def vehicle_add_po(vehicle_id):
+@app.route('/trips/<int:trip_id>/add_po', methods=['POST'])
+def trip_add_po(trip_id):
     if not session.get('logged_in'): return redirect('/login')
+    fid = current_factory_id()
     po = request.form.get('po_number', '').strip()
-    if not po: return redirect(f'/vehicles/{vehicle_id}')
+    if not po: return redirect(f'/trips/{trip_id}')
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute('SELECT vehicle_number FROM vehicles WHERE id = %s', (vehicle_id,))
-    vrow = cursor.fetchone()
-    if not vrow:
+    cursor.execute('SELECT vehicle_number FROM trips WHERE id = %s AND factory_id = %s', (trip_id, fid))
+    trow = cursor.fetchone()
+    if not trow:
         conn.close(); return redirect('/vehicles')
-    cursor.execute('''SELECT v.vehicle_number FROM vehicle_po_map m JOIN vehicles v ON v.id = m.vehicle_id
-                       WHERE m.po_number = %s AND m.is_cancelled = FALSE AND v.vehicle_status NOT IN ('Delivered','Cancelled')''', (po,))
+    cursor.execute('''SELECT tr.vehicle_number FROM vehicle_po_map m JOIN trips tr ON tr.id = m.trip_id
+                       WHERE tr.factory_id = %s AND m.po_number = %s AND m.is_cancelled = FALSE AND tr.trip_status NOT IN ('Delivered','Cancelled')''', (fid, po))
     clash = cursor.fetchone()
     if clash:
         conn.close()
-        return f"PO {po} already active on vehicle {clash[0]}. <a href='/vehicles/{vehicle_id}'>Back</a>", 400
-    cursor.execute('SELECT company FROM po_items WHERE po_number = %s LIMIT 1', (po,))
+        return f"PO {po} already active on vehicle {clash[0]}. <a href='/trips/{trip_id}'>Back</a>", 400
+    cursor.execute('SELECT company FROM po_items WHERE factory_id = %s AND po_number = %s LIMIT 1', (fid, po))
     comp = cursor.fetchone()
     company = comp[0] if comp else ''
-    cursor.execute('INSERT INTO vehicle_po_map (vehicle_id, po_number, company, created_at) VALUES (%s,%s,%s,%s) ON CONFLICT (vehicle_id, po_number) DO NOTHING',
-                   (vehicle_id, po, company, now_ist().isoformat()))
-    recompute_vehicle_status(cursor, vehicle_id)
+    cursor.execute('INSERT INTO vehicle_po_map (factory_id, trip_id, po_number, company, created_at) VALUES (%s,%s,%s,%s,%s) ON CONFLICT (trip_id, po_number) DO NOTHING',
+                   (fid, trip_id, po, company, now_ist().isoformat()))
+    recompute_trip_status(cursor, trip_id)
     conn.commit()
     conn.close()
-    return redirect(f'/vehicles/{vehicle_id}')
+    return redirect(f'/trips/{trip_id}')
 
-@app.route('/vehicles/<int:vehicle_id>/remove_po', methods=['POST'])
-def vehicle_remove_po(vehicle_id):
+@app.route('/trips/<int:trip_id>/remove_po', methods=['POST'])
+def trip_remove_po(trip_id):
     if not session.get('logged_in'): return redirect('/login')
+    fid = current_factory_id()
     po = request.form.get('po_number', '').strip()
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute('DELETE FROM vehicle_po_map WHERE vehicle_id = %s AND po_number = %s', (vehicle_id, po))
-    recompute_vehicle_status(cursor, vehicle_id)
+    cursor.execute('SELECT id FROM trips WHERE id = %s AND factory_id = %s', (trip_id, fid))
+    if not cursor.fetchone():
+        conn.close(); return redirect('/vehicles')
+    cursor.execute('DELETE FROM vehicle_po_map WHERE trip_id = %s AND po_number = %s', (trip_id, po))
+    recompute_trip_status(cursor, trip_id)
     conn.commit()
     conn.close()
-    return redirect(f'/vehicles/{vehicle_id}')
+    return redirect(f'/trips/{trip_id}')
 
-@app.route('/vehicles/<int:vehicle_id>/po_status', methods=['POST'])
-def vehicle_po_status(vehicle_id):
+@app.route('/trips/<int:trip_id>/po_status', methods=['POST'])
+def trip_po_status(trip_id):
     if not session.get('logged_in'): return redirect('/login')
+    fid = current_factory_id()
     po = request.form.get('po_number', '').strip()
     action = request.form.get('action', '')
     conn = get_conn()
     cursor = conn.cursor()
+    cursor.execute('SELECT id FROM trips WHERE id = %s AND factory_id = %s', (trip_id, fid))
+    if not cursor.fetchone():
+        conn.close(); return redirect('/vehicles')
     if action == 'hold':
-        cursor.execute('UPDATE vehicle_po_map SET is_hold = TRUE WHERE vehicle_id = %s AND po_number = %s', (vehicle_id, po))
+        cursor.execute('UPDATE vehicle_po_map SET is_hold = TRUE WHERE trip_id = %s AND po_number = %s', (trip_id, po))
     elif action == 'resume':
-        cursor.execute('UPDATE vehicle_po_map SET is_hold = FALSE WHERE vehicle_id = %s AND po_number = %s', (vehicle_id, po))
-    recompute_vehicle_status(cursor, vehicle_id)
+        cursor.execute('UPDATE vehicle_po_map SET is_hold = FALSE WHERE trip_id = %s AND po_number = %s', (trip_id, po))
+    recompute_trip_status(cursor, trip_id)
     conn.commit()
     conn.close()
-    return redirect(f'/vehicles/{vehicle_id}')
+    return redirect(f'/trips/{trip_id}')
 
-@app.route('/vehicles/<int:vehicle_id>/set_active_po', methods=['POST'])
-def vehicle_set_active_po(vehicle_id):
+@app.route('/trips/<int:trip_id>/set_active_po', methods=['POST'])
+def trip_set_active_po(trip_id):
     if not session.get('logged_in'): return redirect('/login')
+    fid = current_factory_id()
     po = request.form.get('po_number', '').strip()
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute('SELECT vehicle_number, start_location FROM vehicles WHERE id = %s', (vehicle_id,))
+    cursor.execute('SELECT vehicle_number, start_location FROM trips WHERE id = %s AND factory_id = %s', (trip_id, fid))
     row = cursor.fetchone()
     conn.close()
     if row:
         set_active_session(po, row[0], row[1])
     return redirect('/')
 
-@app.route('/vehicles/<int:vehicle_id>/regen_token', methods=['POST'])
-def vehicle_regen_token(vehicle_id):
+@app.route('/trips/<int:trip_id>/regen_token', methods=['POST'])
+def trip_regen_token(trip_id):
     if not session.get('logged_in'): return redirect('/login')
+    fid = current_factory_id()
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute("UPDATE vehicles SET tracking_token = %s, tracking_status = 'active' WHERE id = %s", (gen_tracking_token(), vehicle_id))
+    cursor.execute("UPDATE trips SET tracking_token = %s, tracking_status = 'active' WHERE id = %s AND factory_id = %s", (gen_tracking_token(), trip_id, fid))
     conn.commit()
     conn.close()
-    return redirect(f'/vehicles/{vehicle_id}')
+    return redirect(f'/trips/{trip_id}')
 
-@app.route('/vehicles/<int:vehicle_id>/stop_tracking', methods=['POST'])
-def vehicle_stop_tracking(vehicle_id):
+@app.route('/trips/<int:trip_id>/stop_tracking', methods=['POST'])
+def trip_stop_tracking(trip_id):
     if not session.get('logged_in'): return redirect('/login')
+    fid = current_factory_id()
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute("UPDATE vehicles SET tracking_status = 'stopped' WHERE id = %s", (vehicle_id,))
+    cursor.execute("UPDATE trips SET tracking_status = 'stopped' WHERE id = %s AND factory_id = %s", (trip_id, fid))
     conn.commit()
     conn.close()
-    return redirect(f'/vehicles/{vehicle_id}')
+    return redirect(f'/trips/{trip_id}')
 
-@app.route('/vehicles/<int:vehicle_id>/dispatch', methods=['POST'])
-def vehicle_dispatch(vehicle_id):
+@app.route('/trips/<int:trip_id>/dispatch', methods=['POST'])
+def trip_dispatch(trip_id):
     if not session.get('logged_in'): return redirect('/login')
+    fid = current_factory_id()
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute("UPDATE vehicles SET vehicle_status = 'In Transit', dispatched_at = %s WHERE id = %s",
-                   (now_ist().strftime("%d %b %Y, %I:%M %p"), vehicle_id))
+    cursor.execute("UPDATE trips SET trip_status = 'In Transit', dispatched_at = %s WHERE id = %s AND factory_id = %s",
+                   (now_ist().strftime("%d %b %Y, %I:%M %p"), trip_id, fid))
+    log_audit(cursor, 'Dispatch Completed', 'Vehicles', trip_id, 'Trip marked In Transit')
     conn.commit()
     conn.close()
-    return redirect(f'/vehicles/{vehicle_id}')
+    return redirect(f'/trips/{trip_id}')
 
-@app.route('/vehicles/<int:vehicle_id>/deliver', methods=['POST'])
-def vehicle_deliver(vehicle_id):
+@app.route('/trips/<int:trip_id>/deliver', methods=['POST'])
+def trip_deliver(trip_id):
     if not session.get('logged_in'): return redirect('/login')
+    fid = current_factory_id()
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute("UPDATE vehicles SET vehicle_status = 'Delivered', delivered_at = %s, tracking_status = 'stopped' WHERE id = %s",
-                   (now_ist().strftime("%d %b %Y, %I:%M %p"), vehicle_id))
+    cursor.execute("UPDATE trips SET trip_status = 'Delivered', delivered_at = %s, tracking_status = 'stopped' WHERE id = %s AND factory_id = %s",
+                   (now_ist().strftime("%d %b %Y, %I:%M %p"), trip_id, fid))
+    log_audit(cursor, 'Delivery Completed', 'Vehicles', trip_id, 'Trip marked Delivered')
     conn.commit()
     conn.close()
-    return redirect(f'/vehicles/{vehicle_id}')
+    return redirect(f'/trips/{trip_id}')
 
 @app.route('/track/<token>')
 def track_page(token):
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute('''SELECT id, vehicle_number, driver_name, driver_mobile, start_location, vehicle_status,
-        tracking_status FROM vehicles WHERE tracking_token = %s''', (token,))
+    cursor.execute('''SELECT id, vehicle_number, driver_name, driver_mobile, start_location, trip_status,
+        tracking_status FROM trips WHERE tracking_token = %s''', (token,))
     row = cursor.fetchone()
     conn.close()
     if not row:
         return "Invalid or expired tracking link.", 404
-    vid, vehicle_number, driver_name, driver_mobile, start_location, vehicle_status, tracking_status = row
-    status_class = {'Loading':'badge-blue','Ready to Dispatch':'badge-green','In Transit':'badge-blue','Delivered':'badge-green','Cancelled':'badge-amber'}.get(vehicle_status, 'badge-amber')
-    v = {'vehicle_number': vehicle_number, 'driver_name': driver_name, 'vehicle_status': vehicle_status, 'status_class': status_class}
-    trackable = tracking_status == 'active' and vehicle_status not in ('Delivered', 'Cancelled')
-    return render_template_string(TRACK_HTML, v=v, token=token, trackable=trackable)
+    tid, vehicle_number, driver_name, driver_mobile, start_location, trip_status, tracking_status = row
+    t = {'vehicle_number': vehicle_number, 'driver_name': driver_name, 'trip_status': trip_status,
+         'status_class': TRIP_STATUS_BADGE.get(trip_status, 'badge-amber')}
+    trackable = tracking_status == 'active' and trip_status not in ('Delivered', 'Cancelled')
+    return render_template_string(TRACK_HTML, t=t, token=token, trackable=trackable)
 
 @app.route('/track/<token>/ping', methods=['POST'])
 def track_ping(token):
@@ -2687,33 +3330,615 @@ def track_ping(token):
         return jsonify({'ok': False, 'error': 'missing coordinates'}), 400
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute("SELECT id, vehicle_status, tracking_status FROM vehicles WHERE tracking_token = %s", (token,))
+    cursor.execute("SELECT id, factory_id, vehicle_id, trip_status, tracking_status FROM trips WHERE tracking_token = %s", (token,))
     row = cursor.fetchone()
     if not row:
         conn.close()
         return jsonify({'ok': False, 'error': 'invalid token'}), 404
-    vid, vehicle_status, tracking_status = row
-    if tracking_status != 'active' or vehicle_status in ('Delivered', 'Cancelled'):
+    tid, tfid, vehicle_id, trip_status, tracking_status = row
+    if tracking_status != 'active' or trip_status in ('Delivered', 'Cancelled'):
         conn.close()
         return jsonify({'ok': False, 'error': 'tracking not active'}), 403
     ts = now_ist().isoformat()
-    cursor.execute('''UPDATE vehicles SET current_latitude=%s, current_longitude=%s, current_accuracy=%s, last_location_at=%s WHERE id=%s''',
-                   (lat, lng, acc, ts, vid))
-    cursor.execute('INSERT INTO location_history (vehicle_id, latitude, longitude, accuracy, recorded_at) VALUES (%s,%s,%s,%s,%s)',
-                   (vid, lat, lng, acc, ts))
+    # Update the trip's own snapshot (for backward-compat display) and the permanent vehicle_master record
+    cursor.execute('''UPDATE trips SET current_latitude=%s, current_longitude=%s, current_accuracy=%s, last_location_at=%s WHERE id=%s''',
+                   (lat, lng, acc, ts, tid))
+    if vehicle_id:
+        cursor.execute('''UPDATE vehicle_master SET current_latitude=%s, current_longitude=%s, current_accuracy=%s,
+                           last_location_at=%s, gps_status='live', updated_at=%s WHERE id=%s''',
+                       (lat, lng, acc, ts, ts, vehicle_id))
+    cursor.execute('INSERT INTO location_history (factory_id, vehicle_id, trip_id, latitude, longitude, accuracy, recorded_at) VALUES (%s,%s,%s,%s,%s,%s,%s)',
+                   (tfid, vehicle_id, tid, lat, lng, acc, ts))
     conn.commit()
     conn.close()
     return jsonify({'ok': True})
 
+
+REGISTER_HTML = STYLE_BLOCK + """
+<title>Create Account | {{ platform_name }}</title>
+</head>
+<body style="background-color:#0b1120; background-image:
+        radial-gradient(circle at 15% 20%, rgba(59,130,246,0.20), transparent 45%),
+        radial-gradient(circle at 85% 80%, rgba(139,92,246,0.16), transparent 50%);
+    background-attachment:fixed; margin:0; min-height:100vh; position:relative; overflow:hidden;">
+    <div class="hero-particle" style="left:12%; animation-delay:0s;"></div>
+    <div class="hero-particle" style="left:30%; animation-delay:2s;"></div>
+    <div class="hero-particle" style="left:70%; animation-delay:3.5s;"></div>
+    <div class="conveyor-track" style="opacity:0.6;"></div>
+    <div class="factory-truck">🚚</div>
+    <div style="display:flex; justify-content:center; align-items:center; min-height:100vh; position:relative; z-index:3; padding:24px 0;">
+        <div class="card" style="width:360px; text-align:center; padding:32px 28px; backdrop-filter:blur(16px);">
+            <div class="brand-logo" style="margin:0 auto 14px;">AI</div>
+            <h2 style="margin:0 0 4px; font-size:19px;">Create Your Company Account</h2>
+            <div style="color:var(--text-muted); font-size:12.5px; margin-bottom:18px;">on {{ platform_name }}</div>
+            {% if error %}
+            <div style="color:#fca5a5; font-size:12.5px; margin-bottom:12px; text-align:left;">{{ error }}</div>
+            {% endif %}
+            <form method="POST" style="text-align:left;">
+                <label style="margin-top:0;">Company Name</label>
+                <input type="text" name="company_name" placeholder="e.g. ABC Foods Pvt Ltd" required value="{{ form.company_name or '' }}">
+                <label>Your Name</label>
+                <input type="text" name="admin_name" placeholder="Admin's full name" required value="{{ form.admin_name or '' }}">
+                <label>Username (for login)</label>
+                <input type="text" name="username" placeholder="e.g. abcfoods_admin" required value="{{ form.username or '' }}">
+                <label>Mobile</label>
+                <input type="text" name="mobile" placeholder="10-digit mobile number" value="{{ form.mobile or '' }}">
+                <label>Password</label>
+                <input type="password" name="password" placeholder="Choose a password" required>
+                <label>Confirm Password</label>
+                <input type="password" name="confirm_password" placeholder="Re-enter password" required>
+                <button type="submit" class="btn btn-block" style="margin-top:16px;">Create Account</button>
+            </form>
+            <div style="margin-top:16px; padding-top:14px; border-top:1px solid var(--border); font-size:12.5px; color:var(--text-muted);">
+                Already have an account? <a href="/login" style="color:var(--primary); font-weight:600; text-decoration:none;">Log in</a>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+USERS_HTML = STYLE_BLOCK + """
+<title>Users | {{ factory_display_name }}</title>
+</head>
+<body>
+<div class="container">
+""" + TOPBAR_TEMPLATE.replace("__NAV__", nav_html('users')) + """
+    <div class="stats-grid">
+        <div class="stat-card"><div class="icon">📦</div><div class="label">Plan</div><div class="value" style="font-size:18px;">{{ plan_info.plan }}</div></div>
+        <div class="stat-card"><div class="icon">👥</div><div class="label">Users</div><div class="value">{{ plan_info.user_count }}/{{ plan_info.user_limit }}</div></div>
+        <div class="stat-card"><div class="icon">🚚</div><div class="label">Vehicles</div><div class="value">{{ plan_info.vehicle_count }}/{{ plan_info.vehicle_limit }}</div></div>
+    </div>
+
+    <div class="card">
+        <div class="card-header">
+            <h2>➕ Add Team Member</h2>
+        </div>
+        {% if error_msg %}
+        <div class="badge badge-amber" style="display:block; padding:10px 14px; margin-bottom:14px; font-size:13px;">{{ error_msg }}</div>
+        {% endif %}
+        {% if ok_msg %}
+        <div class="badge badge-green" style="display:block; padding:10px 14px; margin-bottom:14px; font-size:13px;">{{ ok_msg }}</div>
+        {% endif %}
+        <form method="POST" action="/users/add" class="form-grid">
+            <div><label>Name</label><input type="text" name="name" required></div>
+            <div><label>Username</label><input type="text" name="username" required></div>
+            <div><label>Mobile</label><input type="text" name="mobile"></div>
+            <div><label>Password</label><input type="password" name="password" required></div>
+            <div>
+                <label>Role</label>
+                <select name="role">
+                    <option value="Factory Admin">Factory Admin (full access)</option>
+                    <option value="Manager" selected>Manager (full access, can't manage users)</option>
+                    <option value="Viewer">Viewer (read-only)</option>
+                </select>
+            </div>
+            <div><button type="submit" class="btn btn-block" style="margin-top:18px;">Add User</button></div>
+        </form>
+    </div>
+
+    <div class="card">
+        <div class="card-header"><h2>👥 Team Members</h2></div>
+        {% if users|length > 0 %}
+        <table>
+            <thead><tr><th>Name</th><th>Username</th><th>Mobile</th><th>Role</th><th>Status</th><th>Last Login</th><th></th></tr></thead>
+            <tbody>
+            {% for u in users %}
+                <tr>
+                    <td>{{ u.name }}</td>
+                    <td>{{ u.username }}</td>
+                    <td>{{ u.mobile or '—' }}</td>
+                    <td><span class="badge badge-blue">{{ u.role }}</span></td>
+                    <td><span class="badge {{ 'badge-green' if u.status == 'Active' else 'badge-amber' }}">{{ u.status }}</span></td>
+                    <td style="color:var(--text-muted); font-size:12px;">{{ u.last_login or 'Never' }}</td>
+                    <td>
+                        {% if u.id != session.get('user_id') %}
+                        <form method="POST" action="/users/toggle/{{ u.id }}" style="display:inline;">
+                            <button type="submit" class="btn btn-outline btn-sm">{{ 'Deactivate' if u.status == 'Active' else 'Activate' }}</button>
+                        </form>
+                        {% endif %}
+                    </td>
+                </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <div class="empty-state">No team members yet.</div>
+        {% endif %}
+    </div>
+
+    <footer>{{ factory_display_name }} &middot; {{ platform_name }}</footer>
+</div>
+</body>
+</html>
+"""
+
+AUDIT_HTML = STYLE_BLOCK + """
+<title>Audit Log | {{ factory_display_name }}</title>
+</head>
+<body>
+<div class="container">
+""" + TOPBAR_TEMPLATE.replace("__NAV__", nav_html('users')) + """
+    <div class="card">
+        <div class="card-header">
+            <h2>📋 Audit Log</h2>
+            <span style="color:var(--text-muted); font-size:12.5px;">Last 200 actions</span>
+        </div>
+        {% if entries|length > 0 %}
+        <table>
+            <thead><tr><th>When</th><th>User</th><th>Action</th><th>Module</th><th>Details</th></tr></thead>
+            <tbody>
+            {% for e in entries %}
+                <tr>
+                    <td style="color:var(--text-muted); font-size:12px; white-space:nowrap;">{{ e.timestamp }}</td>
+                    <td>{{ e.user_name or '—' }}</td>
+                    <td><span class="badge badge-blue">{{ e.action }}</span></td>
+                    <td>{{ e.module }}</td>
+                    <td style="color:var(--text-muted); font-size:12.5px;">{{ e.details }}</td>
+                </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <div class="empty-state">No activity recorded yet.</div>
+        {% endif %}
+    </div>
+
+    <footer>{{ factory_display_name }} &middot; {{ platform_name }}</footer>
+</div>
+</body>
+</html>
+"""
+
+@app.route('/audit')
+def audit_page():
+    if not session.get('logged_in'): return redirect('/login')
+    if session.get('role') != 'Factory Admin':
+        return "Access denied — only a Factory Admin can view the audit log.", 403
+    fid = current_factory_id()
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute('SELECT timestamp, user_name, action, module, details FROM audit_log WHERE factory_id = %s ORDER BY id DESC LIMIT 200', (fid,))
+    entries = [{'timestamp': r[0], 'user_name': r[1], 'action': r[2], 'module': r[3], 'details': r[4]} for r in cursor.fetchall()]
+    conn.close()
+    return render_template_string(AUDIT_HTML, entries=entries)
+
+@app.route('/users')
+def users_page():
+    if not session.get('logged_in'): return redirect('/login')
+    if session.get('role') != 'Factory Admin':
+        return "Access denied — only a Factory Admin can manage team members.", 403
+    fid = current_factory_id()
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute('SELECT id, name, username, mobile, role, status, last_login FROM users WHERE factory_id = %s ORDER BY id', (fid,))
+    users = [{'id': r[0], 'name': r[1], 'username': r[2], 'mobile': r[3], 'role': r[4], 'status': r[5], 'last_login': r[6]} for r in cursor.fetchall()]
+    cursor.execute('SELECT plan, user_limit, vehicle_limit FROM factories WHERE id = %s', (fid,))
+    plan, user_limit, vehicle_limit = cursor.fetchone()
+    cursor.execute("SELECT COUNT(*) FROM users WHERE factory_id = %s AND status = 'Active'", (fid,))
+    user_count = cursor.fetchone()[0]
+    cursor.execute('SELECT COUNT(*) FROM vehicle_master WHERE factory_id = %s', (fid,))
+    vehicle_count = cursor.fetchone()[0]
+    plan_info = {'plan': plan, 'user_limit': user_limit, 'vehicle_limit': vehicle_limit, 'user_count': user_count, 'vehicle_count': vehicle_count}
+    conn.close()
+    return render_template_string(USERS_HTML, users=users, plan_info=plan_info, error_msg=request.args.get('error'), ok_msg=request.args.get('ok'))
+
+@app.route('/users/add', methods=['POST'])
+def users_add():
+    if not session.get('logged_in'): return redirect('/login')
+    if session.get('role') != 'Factory Admin':
+        return "Access denied — only a Factory Admin can manage team members.", 403
+    fid = current_factory_id()
+    name = request.form.get('name', '').strip()
+    username = request.form.get('username', '').strip()
+    mobile = request.form.get('mobile', '').strip()
+    password = request.form.get('password', '')
+    role = request.form.get('role', 'Manager')
+    if role not in ('Factory Admin', 'Manager', 'Viewer'):
+        role = 'Manager'
+    if not (name and username and password):
+        return redirect('/users?error=' + quote('Name, username, and password are required.'))
+    if len(password) < 6:
+        return redirect('/users?error=' + quote('Password must be at least 6 characters.'))
+    conn = get_conn()
+    cursor = conn.cursor()
+    ok, limit_msg = check_usage_limit(cursor, 'user')
+    if not ok:
+        conn.close()
+        return redirect('/users?error=' + quote(limit_msg))
+    cursor.execute('SELECT id FROM users WHERE username = %s', (username,))
+    if cursor.fetchone():
+        conn.close()
+        return redirect('/users?error=' + quote(f'Username "{username}" is already taken.'))
+    ts = now_ist().isoformat()
+    cursor.execute('''INSERT INTO users (factory_id, name, mobile, username, password_hash, role, status, created_at, updated_at)
+                       VALUES (%s, %s, %s, %s, %s, %s, 'Active', %s, %s)''',
+                   (fid, name, mobile, username, generate_password_hash(password), role, ts, ts))
+    log_audit(cursor, 'User Created', 'Users', '', f'Added {name} ({username}) as {role}')
+    conn.commit()
+    conn.close()
+    return redirect('/users?ok=' + quote(f'{name} added successfully.'))
+
+@app.route('/users/toggle/<int:user_id>', methods=['POST'])
+def users_toggle(user_id):
+    if not session.get('logged_in'): return redirect('/login')
+    if session.get('role') != 'Factory Admin':
+        return "Access denied — only a Factory Admin can manage team members.", 403
+    fid = current_factory_id()
+    if user_id == session.get('user_id'):
+        return redirect('/users?error=' + quote("You can't deactivate your own account."))
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute('SELECT status FROM users WHERE id = %s AND factory_id = %s', (user_id, fid))
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        return redirect('/users')
+    new_status = 'Inactive' if row[0] == 'Active' else 'Active'
+    cursor.execute('UPDATE users SET status = %s, updated_at = %s WHERE id = %s AND factory_id = %s', (new_status, now_ist().isoformat(), user_id, fid))
+    conn.commit()
+    conn.close()
+    return redirect('/users')
+
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    error = None
+    form = {}
+    if request.method == 'POST':
+        form = {k: request.form.get(k, '').strip() for k in ['company_name', 'admin_name', 'username', 'mobile']}
+        password = request.form.get('password', '')
+        confirm_password = request.form.get('confirm_password', '')
+
+        if not (form['company_name'] and form['admin_name'] and form['username'] and password):
+            error = 'Company name, your name, username, and password are all required.'
+        elif password != confirm_password:
+            error = 'Passwords do not match.'
+        elif len(password) < 6:
+            error = 'Password must be at least 6 characters.'
+        elif not re.match(r'^[a-zA-Z0-9_.]+$', form['username']):
+            error = 'Username can only contain letters, numbers, dots, and underscores.'
+
+        if not error:
+            conn = get_conn()
+            cursor = conn.cursor()
+            cursor.execute('SELECT id FROM users WHERE username = %s', (form['username'],))
+            if cursor.fetchone():
+                error = f"Username \"{form['username']}\" is already taken. Please choose another."
+                conn.close()
+            else:
+                ts = now_ist().isoformat()
+                cursor.execute('''INSERT INTO factories (company_name, display_name, status, created_at, updated_at, created_by)
+                                   VALUES (%s, %s, 'Active', %s, %s, %s) RETURNING id''',
+                               (form['company_name'], form['company_name'], ts, ts, form['username']))
+                new_fid = cursor.fetchone()[0]
+                cursor.execute('''INSERT INTO users (factory_id, name, mobile, username, password_hash, role, status, created_at, updated_at)
+                                   VALUES (%s, %s, %s, %s, %s, 'Factory Admin', 'Active', %s, %s)''',
+                               (new_fid, form['admin_name'], form['mobile'], form['username'], generate_password_hash(password), ts, ts))
+                conn.commit()
+                conn.close()
+                return redirect('/login?registered=1')
+    return render_template_string(REGISTER_HTML, error=error, form=form)
+
+SUPERADMIN_HTML = STYLE_BLOCK + """
+<title>Super Admin | {{ platform_name }}</title>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="brand">
+            <div class="brand-logo">SA</div>
+            <div>
+                <h1>{{ platform_name }}</h1>
+                <span>Super Admin &middot; Platform Control</span>
+            </div>
+        </div>
+        <div class="nav"><a href="/change_password" class="">🔑 Change Password</a><a href="/logout" class="">Logout</a></div>
+    </div>
+
+    <div class="stats-grid">
+        <div class="stat-card"><div class="icon">🏭</div><div class="label">Total Factories</div><div class="value">{{ summary.total }}</div></div>
+        <div class="stat-card"><div class="icon">✅</div><div class="label">Active</div><div class="value">{{ summary.active }}</div></div>
+        <div class="stat-card"><div class="icon">⛔</div><div class="label">Suspended</div><div class="value">{{ summary.suspended }}</div></div>
+        <div class="stat-card"><div class="icon">👥</div><div class="label">Total Users</div><div class="value">{{ summary.total_users }}</div></div>
+    </div>
+
+    <div class="card">
+        <div class="card-header"><h2>➕ Create Factory</h2></div>
+        {% if error_msg %}
+        <div class="badge badge-amber" style="display:block; padding:10px 14px; margin-bottom:14px; font-size:13px;">{{ error_msg }}</div>
+        {% endif %}
+        {% if ok_msg %}
+        <div class="badge badge-green" style="display:block; padding:10px 14px; margin-bottom:14px; font-size:13px;">{{ ok_msg }}</div>
+        {% endif %}
+        <form method="POST" action="/superadmin/create" class="form-grid">
+            <div><label>Company Name</label><input type="text" name="company_name" required></div>
+            <div><label>Admin Name</label><input type="text" name="admin_name" required></div>
+            <div><label>Admin Username</label><input type="text" name="username" required></div>
+            <div><label>Admin Password</label><input type="password" name="password" required></div>
+            <div><button type="submit" class="btn btn-block" style="margin-top:18px;">Create Factory</button></div>
+        </form>
+    </div>
+
+    <div class="card">
+        <div class="card-header"><h2>🏢 All Factories</h2></div>
+        {% if factories|length > 0 %}
+        <table>
+            <thead><tr><th>Company</th><th>Status</th><th>Plan</th><th>Users</th><th>Vehicles</th><th>PO Items</th><th>Created</th><th></th></tr></thead>
+            <tbody>
+            {% for f in factories %}
+                <tr>
+                    <td>{{ f.company_name }}</td>
+                    <td><span class="badge {{ 'badge-green' if f.status == 'Active' else 'badge-amber' }}">{{ f.status }}</span></td>
+                    <td>
+                        <form method="POST" action="/superadmin/update_plan/{{ f.id }}" style="display:flex; gap:4px; align-items:center;">
+                            <select name="plan" style="margin:0; padding:6px 8px; font-size:12px;">
+                                {% for p in ['Free', 'Basic', 'Professional', 'Enterprise'] %}
+                                <option value="{{ p }}" {{ 'selected' if f.plan == p else '' }}>{{ p }}</option>
+                                {% endfor %}
+                            </select>
+                            <input type="number" name="user_limit" value="{{ f.user_limit }}" style="width:52px; margin:0; padding:6px; font-size:12px;" title="User limit">
+                            <input type="number" name="vehicle_limit" value="{{ f.vehicle_limit }}" style="width:52px; margin:0; padding:6px; font-size:12px;" title="Vehicle limit">
+                            <button type="submit" class="btn btn-outline btn-sm">Save</button>
+                        </form>
+                    </td>
+                    <td>{{ f.user_count }}</td>
+                    <td>{{ f.vehicle_count }}</td>
+                    <td>{{ f.po_count }}</td>
+                    <td style="color:var(--text-muted); font-size:12px;">{{ f.created_at }}</td>
+                    <td>
+                        <form method="POST" action="/superadmin/toggle/{{ f.id }}" style="display:inline;">
+                            <button type="submit" class="btn btn-outline btn-sm">{{ 'Suspend' if f.status == 'Active' else 'Activate' }}</button>
+                        </form>
+                    </td>
+                </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <div class="empty-state">No factories yet.</div>
+        {% endif %}
+    </div>
+
+    <footer>{{ platform_name }} &middot; Super Admin Panel</footer>
+</div>
+</body>
+</html>
+"""
+
+@app.route('/superadmin')
+def superadmin_page():
+    if not session.get('logged_in'): return redirect('/login')
+    if not is_super_admin():
+        return "Access denied — Super Admin only.", 403
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute('SELECT id, company_name, status, plan, user_limit, vehicle_limit, created_at FROM factories ORDER BY id')
+    rows = cursor.fetchall()
+    factories = []
+    summary = {'total': 0, 'active': 0, 'suspended': 0, 'total_users': 0}
+    for fid, cname, status, plan, user_limit, vehicle_limit, created_at in rows:
+        cursor.execute('SELECT COUNT(*) FROM users WHERE factory_id = %s', (fid,))
+        user_count = cursor.fetchone()[0]
+        cursor.execute('SELECT COUNT(*) FROM vehicle_master WHERE factory_id = %s', (fid,))
+        vehicle_count = cursor.fetchone()[0]
+        cursor.execute('SELECT COUNT(*) FROM po_items WHERE factory_id = %s', (fid,))
+        po_count = cursor.fetchone()[0]
+        factories.append({'id': fid, 'company_name': cname, 'status': status, 'plan': plan, 'user_limit': user_limit, 'vehicle_limit': vehicle_limit,
+                           'created_at': (created_at or '')[:10], 'user_count': user_count, 'vehicle_count': vehicle_count, 'po_count': po_count})
+        summary['total'] += 1
+        summary['total_users'] += user_count
+        if status == 'Active': summary['active'] += 1
+        else: summary['suspended'] += 1
+    conn.close()
+    return render_template_string(SUPERADMIN_HTML, factories=factories, summary=summary,
+                                   error_msg=request.args.get('error'), ok_msg=request.args.get('ok'))
+
+@app.route('/superadmin/update_plan/<int:factory_id>', methods=['POST'])
+def superadmin_update_plan(factory_id):
+    if not session.get('logged_in'): return redirect('/login')
+    if not is_super_admin():
+        return "Access denied — Super Admin only.", 403
+    plan = request.form.get('plan', 'Free')
+    if plan not in ('Free', 'Basic', 'Professional', 'Enterprise'):
+        plan = 'Free'
+    try:
+        user_limit = int(request.form.get('user_limit', 5))
+        vehicle_limit = int(request.form.get('vehicle_limit', 10))
+    except ValueError:
+        return redirect('/superadmin?error=' + quote('User/vehicle limits must be numbers.'))
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute('UPDATE factories SET plan = %s, user_limit = %s, vehicle_limit = %s, updated_at = %s WHERE id = %s',
+                   (plan, user_limit, vehicle_limit, now_ist().isoformat(), factory_id))
+    cursor.execute('INSERT INTO audit_log (factory_id, user_id, user_name, action, module, record_id, details, timestamp) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)',
+                   (factory_id, session.get('user_id'), session.get('user_name'), 'Plan Updated', 'Super Admin', factory_id,
+                    f'Plan={plan}, user_limit={user_limit}, vehicle_limit={vehicle_limit}', now_ist().isoformat()))
+    conn.commit()
+    conn.close()
+    return redirect('/superadmin?ok=' + quote('Plan updated.'))
+
+@app.route('/superadmin/create', methods=['POST'])
+def superadmin_create():
+    if not session.get('logged_in'): return redirect('/login')
+    if not is_super_admin():
+        return "Access denied — Super Admin only.", 403
+    company_name = request.form.get('company_name', '').strip()
+    admin_name = request.form.get('admin_name', '').strip()
+    username = request.form.get('username', '').strip()
+    password = request.form.get('password', '')
+    if not (company_name and admin_name and username and password):
+        return redirect('/superadmin?error=' + quote('All fields are required.'))
+    if len(password) < 6:
+        return redirect('/superadmin?error=' + quote('Password must be at least 6 characters.'))
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute('SELECT id FROM users WHERE username = %s', (username,))
+    if cursor.fetchone():
+        conn.close()
+        return redirect('/superadmin?error=' + quote(f'Username "{username}" is already taken.'))
+    ts = now_ist().isoformat()
+    cursor.execute('''INSERT INTO factories (company_name, display_name, status, created_at, updated_at, created_by)
+                       VALUES (%s, %s, 'Active', %s, %s, %s) RETURNING id''',
+                   (company_name, company_name, ts, ts, session.get('username')))
+    new_fid = cursor.fetchone()[0]
+    cursor.execute('''INSERT INTO users (factory_id, name, username, password_hash, role, status, created_at, updated_at)
+                       VALUES (%s, %s, %s, %s, 'Factory Admin', 'Active', %s, %s)''',
+                   (new_fid, admin_name, username, generate_password_hash(password), ts, ts))
+    cursor.execute('INSERT INTO audit_log (factory_id, user_id, user_name, action, module, record_id, details, timestamp) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)',
+                   (new_fid, session.get('user_id'), session.get('user_name'), 'Factory Created', 'Super Admin', new_fid, f'Created by Super Admin, admin user: {username}', ts))
+    conn.commit()
+    conn.close()
+    return redirect('/superadmin?ok=' + quote(f'{company_name} created successfully.'))
+
+@app.route('/superadmin/toggle/<int:factory_id>', methods=['POST'])
+def superadmin_toggle(factory_id):
+    if not session.get('logged_in'): return redirect('/login')
+    if not is_super_admin():
+        return "Access denied — Super Admin only.", 403
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute('SELECT status FROM factories WHERE id = %s', (factory_id,))
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        return redirect('/superadmin')
+    new_status = 'Suspended' if row[0] == 'Active' else 'Active'
+    ts = now_ist().isoformat()
+    cursor.execute('UPDATE factories SET status = %s, updated_at = %s WHERE id = %s', (new_status, ts, factory_id))
+    cursor.execute('INSERT INTO audit_log (factory_id, user_id, user_name, action, module, record_id, details, timestamp) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)',
+                   (factory_id, session.get('user_id'), session.get('user_name'), f'Factory {new_status}', 'Super Admin', factory_id, '', ts))
+    conn.commit()
+    conn.close()
+    return redirect('/superadmin')
+
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     error = False
+    inactive = False
+    username = ''
     if request.method == 'POST':
-        if request.form.get('password') == 'real@8283':
-            session['logged_in'] = True
-            return redirect('/')
-        error = True
-    return render_template_string(LOGIN_HTML, error=error)
+        username = request.form.get('username', '').strip()
+        password = request.form.get('password', '')
+        conn = get_conn()
+        cursor = conn.cursor()
+        cursor.execute('SELECT id, factory_id, name, password_hash, role, status FROM users WHERE username = %s', (username,))
+        row = cursor.fetchone()
+        if row and check_password_hash(row[3], password):
+            user_id, factory_id, name, _, role, status = row
+            if status != 'Active':
+                inactive = True
+            elif role == 'Super Admin':
+                # Platform-level account: not tied to any single factory, skips the per-factory active check.
+                cursor.execute('UPDATE users SET last_login = %s WHERE id = %s', (now_ist().isoformat(), user_id))
+                conn.commit()
+                session['logged_in'] = True
+                session['user_id'] = user_id
+                session['factory_id'] = None
+                session['user_name'] = name
+                session['username'] = username
+                session['role'] = role
+                conn.close()
+                return redirect('/superadmin')
+            else:
+                cursor.execute('SELECT status FROM factories WHERE id = %s', (factory_id,))
+                frow = cursor.fetchone()
+                if not frow or frow[0] != 'Active':
+                    inactive = True
+                else:
+                    cursor.execute('UPDATE users SET last_login = %s WHERE id = %s', (now_ist().isoformat(), user_id))
+                    conn.commit()
+                    session['logged_in'] = True
+                    session['user_id'] = user_id
+                    session['factory_id'] = factory_id
+                    session['user_name'] = name
+                    session['username'] = username
+                    session['role'] = role
+                    conn.close()
+                    return redirect('/')
+        else:
+            error = True
+        conn.close()
+    return render_template_string(LOGIN_HTML, error=error, inactive=inactive, username=username)
+
+CHANGE_PASSWORD_HTML = STYLE_BLOCK + """
+<title>Change Password | {{ factory_display_name }}</title>
+</head>
+<body>
+<div class="container">
+""" + TOPBAR_TEMPLATE.replace("__NAV__", "") + """
+    <div class="card" style="max-width:420px; margin:0 auto;">
+        <div class="card-header"><h2>🔑 Change Password</h2></div>
+        {% if error %}
+        <div class="badge badge-amber" style="display:block; padding:10px 14px; margin-bottom:14px; font-size:13px;">{{ error }}</div>
+        {% endif %}
+        {% if ok %}
+        <div class="badge badge-green" style="display:block; padding:10px 14px; margin-bottom:14px; font-size:13px;">Password changed successfully.</div>
+        {% endif %}
+        <form method="POST">
+            <label>Current Password</label>
+            <input type="password" name="current_password" required autofocus>
+            <label>New Password</label>
+            <input type="password" name="new_password" required>
+            <label>Confirm New Password</label>
+            <input type="password" name="confirm_password" required>
+            <button type="submit" class="btn btn-block" style="margin-top:16px;">Change Password</button>
+        </form>
+        <a href="{{ '/superadmin' if session.get('role') == 'Super Admin' else '/' }}" style="display:block; text-align:center; margin-top:14px; color:var(--text-muted); font-size:12.5px; text-decoration:none;">← Back</a>
+    </div>
+    <footer>{{ factory_display_name }} &middot; {{ platform_name }}</footer>
+</div>
+</body>
+</html>
+"""
+
+@app.route('/change_password', methods=['GET', 'POST'])
+def change_password():
+    if not session.get('logged_in'): return redirect('/login')
+    error = None
+    ok = False
+    if request.method == 'POST':
+        current_password = request.form.get('current_password', '')
+        new_password = request.form.get('new_password', '')
+        confirm_password = request.form.get('confirm_password', '')
+        conn = get_conn()
+        cursor = conn.cursor()
+        cursor.execute('SELECT password_hash FROM users WHERE id = %s', (session.get('user_id'),))
+        row = cursor.fetchone()
+        if not row or not check_password_hash(row[0], current_password):
+            error = 'Current password is incorrect.'
+        elif len(new_password) < 6:
+            error = 'New password must be at least 6 characters.'
+        elif new_password != confirm_password:
+            error = 'New password and confirmation do not match.'
+        elif new_password == current_password:
+            error = 'New password must be different from the current password.'
+        else:
+            cursor.execute('UPDATE users SET password_hash = %s, updated_at = %s WHERE id = %s',
+                           (generate_password_hash(new_password), now_ist().isoformat(), session.get('user_id')))
+            conn.commit()
+            ok = True
+        conn.close()
+    return render_template_string(CHANGE_PASSWORD_HTML, error=error, ok=ok)
 
 @app.route('/logout')
 def logout():
