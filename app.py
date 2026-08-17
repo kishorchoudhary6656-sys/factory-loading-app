@@ -53,6 +53,18 @@ def init_db():
     conn = get_conn()
     cursor = conn.cursor()
 
+    # Render commonly runs multiple gunicorn worker processes, each importing this module (and
+    # therefore calling init_db()) independently at startup. Without a lock, two workers can race
+    # on the same migration/backfill statements simultaneously — this is the actual, reproducible
+    # cause of startup crashes like a UniqueViolation on a table that "shouldn't" have a duplicate
+    # insert in the code at all: the crash is a genuine multi-process race, not a logic bug in any
+    # single statement. A Postgres session-level advisory lock (a fixed arbitrary integer id, scoped
+    # to this app) forces every other worker to simply WAIT here until the first one finishes the
+    # entire migration and releases the lock — by the time a waiting worker gets it, the schema/data
+    # are already fully migrated, so its own run of the same statements is a safe no-op. This does
+    # not delete/modify any existing data — it only serializes the startup migration itself.
+    cursor.execute('SELECT pg_advisory_lock(918273645)')
+
     # --- Multi-tenant foundation: factories (companies using this platform) + users (people who log in) ---
     cursor.execute('''CREATE TABLE IF NOT EXISTS factories (
         id SERIAL PRIMARY KEY,
@@ -286,6 +298,27 @@ def init_db():
     if not cursor.fetchone():
         cursor.execute('ALTER TABLE app_state ADD PRIMARY KEY (factory_id, key)')
 
+    # --- Idempotency fix: if the live database already has duplicate (factory_id, name) rows in
+    # companies (e.g. from a double-submit before this constraint existed), the CREATE UNIQUE INDEX
+    # below would fail every time the app boots with exactly a UniqueViolation on
+    # uq_companies_factory_name — "IF NOT EXISTS" only skips re-creating an EXISTING index object,
+    # it does not skip the uniqueness check against pre-existing duplicate data. Deduplicate safely
+    # first: merge any non-empty sub_brands into the oldest (lowest-id) row for each duplicate group,
+    # then remove the redundant newer row(s). This never touches PO/GRN/Production/Rate Master data —
+    # those all reference a company by its NAME (text), not a foreign key to companies.id — so no
+    # other table or existing business data is affected. No-ops entirely if no duplicates exist.
+    cursor.execute('SELECT factory_id, name FROM companies GROUP BY factory_id, name HAVING COUNT(*) > 1')
+    dup_keys = cursor.fetchall()
+    for dup_fid, dup_name in dup_keys:
+        cursor.execute('SELECT id, sub_brands FROM companies WHERE factory_id = %s AND name = %s ORDER BY id', (dup_fid, dup_name))
+        dup_rows = cursor.fetchall()
+        keep_id = dup_rows[0][0]
+        merged_subs = next((sb for _, sb in dup_rows if sb), None)
+        if merged_subs:
+            cursor.execute('UPDATE companies SET sub_brands = %s WHERE id = %s', (merged_subs, keep_id))
+        for extra_id, _ in dup_rows[1:]:
+            cursor.execute('DELETE FROM companies WHERE id = %s', (extra_id,))
+
     # Re-create the old uniqueness guarantees, now scoped per factory instead of globally
     cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS uq_companies_factory_name ON companies(factory_id, name)')
     cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS uq_qc_factory_name ON quality_checkers(factory_id, name)')
@@ -445,6 +478,10 @@ def init_db():
                        GROUP BY factory_id, vehicle_number HAVING COUNT(*) > 1''')
     dup_rows = cursor.fetchall()
 
+    conn.commit()
+    # Release the advisory lock so the next worker (if any is waiting) can proceed — by now the
+    # schema/data are fully migrated, so its own run of these same statements is a safe no-op.
+    cursor.execute('SELECT pg_advisory_unlock(918273645)')
     conn.commit()
     conn.close()
 init_db()
