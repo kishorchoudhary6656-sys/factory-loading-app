@@ -297,19 +297,28 @@ def init_db():
     for tbl in ['po_items', 'dispatch_log', 'daily_production', 'trips', 'vehicle_po_map', 'location_history', 'app_state']:
         cursor.execute(f'UPDATE {tbl} SET factory_id = %s WHERE factory_id IS NULL', (default_factory_id,))
 
-    # Safe, non-crashing backfill for the four tables with a (factory_id, <unique column>) index:
-    # only assign factory_id to a NULL row if doing so would NOT collide with an already-correctly-
-    # scoped row sharing that same unique value. A colliding row is left exactly as it is (factory_id
-    # stays NULL) — nothing is deleted or merged here; it simply becomes invisible to normal
-    # factory-scoped queries rather than crashing the app. This matches the "detect and skip, never
-    # delete/modify" requirement. The already-existing dedup-merge block further below still runs
+    # Safe, non-crashing backfill for the four tables with a (factory_id, <unique column>) index.
+    # IMPORTANT: this must be done ROW BY ROW in Python, not as a single bulk UPDATE — a single SQL
+    # UPDATE evaluates its WHERE/NOT EXISTS clause against one consistent snapshot, so if there are
+    # e.g. TWO NULL-factory_id 'zepto' rows and no already-assigned one yet, BOTH would pass a bulk
+    # NOT-EXISTS check simultaneously and PostgreSQL would try to give both the same (factory_id, name)
+    # within that same statement — a within-statement duplicate that still throws UniqueViolation. This
+    # exact scenario is what caused the production crash even after the first NOT-EXISTS attempt.
+    # Processing one row at a time re-checks against the LATEST state (including rows already
+    # backfilled earlier in this same loop), so only the first row in any duplicate-name group ever
+    # gets assigned; every other colliding row is safely left exactly as it is (factory_id stays
+    # NULL — never deleted, never force-merged). The dedup-merge block further below still runs
     # afterward for companies specifically, for the separate case of two rows that already share the
     # same factory_id.
     for tbl, unique_col in [('companies', 'name'), ('quality_checkers', 'name'),
                              ('barcode_catalog', 'barcode'), ('vehicle_master', 'vehicle_number')]:
-        cursor.execute(f'''UPDATE {tbl} SET factory_id = %s WHERE factory_id IS NULL
-                           AND NOT EXISTS (SELECT 1 FROM {tbl} c2 WHERE c2.factory_id = %s AND c2.{unique_col} = {tbl}.{unique_col})''',
-                       (default_factory_id, default_factory_id))
+        cursor.execute(f'SELECT id, {unique_col} FROM {tbl} WHERE factory_id IS NULL')
+        null_rows = cursor.fetchall()
+        for row_id, uval in null_rows:
+            cursor.execute(f'SELECT 1 FROM {tbl} WHERE factory_id = %s AND {unique_col} = %s', (default_factory_id, uval))
+            if cursor.fetchone():
+                continue  # would collide with an already-assigned row (or one just backfilled above in this loop) — leave this one safely as NULL
+            cursor.execute(f'UPDATE {tbl} SET factory_id = %s WHERE id = %s', (default_factory_id, row_id))
 
     # Re-establish app_state's primary key as (factory_id, key) now that factory_id is populated
     cursor.execute("SELECT constraint_name FROM information_schema.table_constraints WHERE table_name='app_state' AND constraint_type='PRIMARY KEY'")
@@ -325,7 +334,11 @@ def init_db():
     # then remove the redundant newer row(s). This never touches PO/GRN/Production/Rate Master data —
     # those all reference a company by its NAME (text), not a foreign key to companies.id — so no
     # other table or existing business data is affected. No-ops entirely if no duplicates exist.
-    cursor.execute('SELECT factory_id, name FROM companies GROUP BY factory_id, name HAVING COUNT(*) > 1')
+    # Only considers factory_id IS NOT NULL groups — any remaining NULL-factory_id orphans (left
+    # deliberately untouched by the safe row-by-row backfill above) are intentionally excluded here
+    # too, since "factory_id = NULL" never matches in SQL (would silently miss them anyway) and,
+    # more importantly, they must stay exactly as they are per the never-delete/never-modify rule.
+    cursor.execute('SELECT factory_id, name FROM companies WHERE factory_id IS NOT NULL GROUP BY factory_id, name HAVING COUNT(*) > 1')
     dup_keys = cursor.fetchall()
     for dup_fid, dup_name in dup_keys:
         cursor.execute('SELECT id, sub_brands FROM companies WHERE factory_id = %s AND name = %s ORDER BY id', (dup_fid, dup_name))
