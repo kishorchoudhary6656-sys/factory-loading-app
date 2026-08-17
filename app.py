@@ -288,10 +288,28 @@ def init_db():
                            VALUES (NULL, %s, %s, %s, 'Super Admin', 'Active', %s, %s)''',
                        ('Platform Owner', 'superadmin', generate_password_hash(initial_superadmin_password), ts, ts))
 
-    # Backfill factory_id on any pre-existing rows (from before multi-tenancy) into the default factory
-    for tbl in ['po_items', 'dispatch_log', 'companies', 'quality_checkers', 'barcode_catalog',
-                'daily_production', 'vehicle_master', 'trips', 'vehicle_po_map', 'location_history', 'app_state']:
+    # Backfill factory_id on any pre-existing rows (from before multi-tenancy) into the default factory.
+    # 'companies', 'quality_checkers', 'barcode_catalog' and 'vehicle_master' are handled separately
+    # below (not in this generic loop) — a blind UPDATE on any of them can hit a genuine live-data
+    # case where a NULL-factory_id row shares its unique key (name/barcode/vehicle_number) with an
+    # already-assigned row, which would violate that table's uq_*_factory_* index and crash every
+    # single boot — this already happened in production for companies (see the dedicated blocks below).
+    for tbl in ['po_items', 'dispatch_log', 'daily_production', 'trips', 'vehicle_po_map', 'location_history', 'app_state']:
         cursor.execute(f'UPDATE {tbl} SET factory_id = %s WHERE factory_id IS NULL', (default_factory_id,))
+
+    # Safe, non-crashing backfill for the four tables with a (factory_id, <unique column>) index:
+    # only assign factory_id to a NULL row if doing so would NOT collide with an already-correctly-
+    # scoped row sharing that same unique value. A colliding row is left exactly as it is (factory_id
+    # stays NULL) — nothing is deleted or merged here; it simply becomes invisible to normal
+    # factory-scoped queries rather than crashing the app. This matches the "detect and skip, never
+    # delete/modify" requirement. The already-existing dedup-merge block further below still runs
+    # afterward for companies specifically, for the separate case of two rows that already share the
+    # same factory_id.
+    for tbl, unique_col in [('companies', 'name'), ('quality_checkers', 'name'),
+                             ('barcode_catalog', 'barcode'), ('vehicle_master', 'vehicle_number')]:
+        cursor.execute(f'''UPDATE {tbl} SET factory_id = %s WHERE factory_id IS NULL
+                           AND NOT EXISTS (SELECT 1 FROM {tbl} c2 WHERE c2.factory_id = %s AND c2.{unique_col} = {tbl}.{unique_col})''',
+                       (default_factory_id, default_factory_id))
 
     # Re-establish app_state's primary key as (factory_id, key) now that factory_id is populated
     cursor.execute("SELECT constraint_name FROM information_schema.table_constraints WHERE table_name='app_state' AND constraint_type='PRIMARY KEY'")
