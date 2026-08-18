@@ -497,6 +497,13 @@ def init_db():
     cursor.execute('ALTER TABLE po_items ADD COLUMN IF NOT EXISTS tax_percent DOUBLE PRECISION')
     cursor.execute('ALTER TABLE po_items ADD COLUMN IF NOT EXISTS approved_by TEXT')
     cursor.execute('ALTER TABLE po_items ADD COLUMN IF NOT EXISTS approved_at TEXT')
+    # --- PO Cost Variance Control: additive matching-key fields on po_items. Existing old PO rows
+    # simply stay NULL here — nothing about their existing display/behavior changes. New uploads can
+    # populate these for accurate PVID+Pack Size+Location matching against the Approved Cost Master.
+    cursor.execute('ALTER TABLE po_items ADD COLUMN IF NOT EXISTS pvid TEXT')
+    cursor.execute('ALTER TABLE po_items ADD COLUMN IF NOT EXISTS pack_size TEXT')
+    cursor.execute('ALTER TABLE po_items ADD COLUMN IF NOT EXISTS cost_location TEXT')
+    cursor.execute("ALTER TABLE po_items ADD COLUMN IF NOT EXISTS cost_status TEXT DEFAULT 'not_evaluated'")
     cursor.execute('ALTER TABLE companies ADD COLUMN IF NOT EXISTS sub_brands TEXT')
 
     # --- Barcode Catalog: company/sub-brand/PIN code/packing size, per the master workflow spec ---
@@ -520,6 +527,20 @@ def init_db():
         updated_at TEXT, updated_by TEXT
     )''')
     cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS uq_rate_master_factory_company_product ON rate_master(factory_id, company, product_name)')
+    # --- Approved Cost Master expansion (PO Cost Variance Control workflow) ---
+    # Additive only. The OLD unique index above is left completely untouched (still enforces the
+    # legacy company+product_name uniqueness for any record that only has those fields). This new
+    # business key (PVID + Pack Size + Location) is the PRIMARY matching key for new/complete
+    # records; legacy rows simply have NULL in the new columns, and Postgres unique indexes treat
+    # NULL as distinct from every other NULL — so any number of legacy rows can coexist safely
+    # without ever colliding against this new index. No backfill, no destructive migration needed.
+    for col, ddl in [('pvid', 'TEXT'), ('pack_size', 'TEXT'), ('location', 'TEXT'),
+                      ('effective_date', 'TEXT'), ('remarks', 'TEXT'),
+                      ('pvid_norm', 'TEXT'), ('pack_size_norm', 'TEXT'), ('location_norm', 'TEXT')]:
+        cursor.execute(f'ALTER TABLE rate_master ADD COLUMN IF NOT EXISTS {col} {ddl}')
+    cursor.execute('''CREATE UNIQUE INDEX IF NOT EXISTS uq_rate_master_factory_company_pvid_pack_loc
+                       ON rate_master(factory_id, company, pvid_norm, pack_size_norm, location_norm)''')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_rate_master_match ON rate_master(factory_id, company, pvid_norm, pack_size_norm, location_norm)')
 
     # --- AI-based PDF/Photo import staging: extracted data always lands here for human review first ---
     cursor.execute('''CREATE TABLE IF NOT EXISTS ai_import_staging (
@@ -727,6 +748,17 @@ def get_rate_status(cursor, fid, company, item_name, po_rate):
 # P2: Cost Variation threshold — ₹1,000 inclusive counts as GREEN, per exact confirmed spec.
 COST_VARIATION_THRESHOLD = float(os.environ.get('COST_VARIATION_THRESHOLD', '1000'))
 
+def _variance_result(approved_rate, po_rate, po_qty):
+    """Single shared implementation of 'Total Variance Impact = ABS(PO Rate - Approved Cost) x Qty'
+    and the GREEN/RED threshold check. Both the legacy product-name-keyed get_cost_variation() and
+    the new PVID+Pack+Location-keyed get_cost_match() call this SAME function — the ₹1,000 rule is
+    defined exactly once, never duplicated."""
+    if approved_rate is None or po_rate is None or po_qty is None:
+        return {'status': 'none', 'variance': None, 'approved_rate': approved_rate}
+    variance = round(abs(po_rate - approved_rate) * po_qty, 2)
+    status = 'GREEN' if variance <= COST_VARIATION_THRESHOLD else 'RED'
+    return {'status': status, 'variance': variance, 'approved_rate': approved_rate}
+
 def get_cost_variation(cursor, fid, company, item_name, po_rate, po_qty):
     """P2: Cost Variation = ABS(PO Unit Rate - Applicable Approved Cost) x PO Quantity.
     GREEN if <= COST_VARIATION_THRESHOLD (inclusive), RED if strictly greater. Reuses the SAME
@@ -737,11 +769,47 @@ def get_cost_variation(cursor, fid, company, item_name, po_rate, po_qty):
                    (fid, company or '', item_name or ''))
     row = cursor.fetchone()
     approved_rate = row[0] if row else None
-    if approved_rate is None or po_rate is None or po_qty is None:
-        return {'status': 'none', 'variance': None, 'approved_rate': approved_rate}
-    variance = round(abs(po_rate - approved_rate) * po_qty, 2)
-    status = 'GREEN' if variance <= COST_VARIATION_THRESHOLD else 'RED'
-    return {'status': status, 'variance': variance, 'approved_rate': approved_rate}
+    return _variance_result(approved_rate, po_rate, po_qty)
+
+def _norm_key(value):
+    """Whitespace-trimmed, lowercased normalization for PVID/Pack Size/Location matching — never
+    changes the originally displayed value (that stays in pvid/pack_size/location); this is only
+    used for the comparison/index columns (pvid_norm/pack_size_norm/location_norm)."""
+    if value is None:
+        return None
+    v = str(value).strip().lower()
+    return v if v else None
+
+def get_cost_match(cursor, fid, company, pvid, pack_size, location, po_rate, po_qty):
+    """PO Cost Variance Control workflow: matches the Approved Cost Master using
+    factory_id + company + PVID + Pack Size + Location (normalized), NOT product name. Never
+    fuzzy-matches. Returns one of:
+      - {'status': 'unmatched', ...}      — one or more of PVID/Pack Size/Location missing on the PO line
+      - {'status': 'not_found', ...}      — all keys present, but no Approved Cost Master row matches
+      - {'status': 'ambiguous', ...}      — more than one exact match found (should be prevented by the
+                                             unique index, but checked defensively for any pre-existing
+                                             legacy duplicates) — NEVER guesses, requires human correction
+      - {'status': 'GREEN'/'RED', 'variance':..., 'approved_rate':...} — a clean single match, using
+        the exact same _variance_result() threshold logic as the legacy function above."""
+    pvid_n, pack_n, loc_n = _norm_key(pvid), _norm_key(pack_size), _norm_key(location)
+    if not (pvid_n and pack_n and loc_n):
+        missing = [name for name, v in [('PVID', pvid_n), ('Pack Size', pack_n), ('Location', loc_n)] if not v]
+        return {'status': 'unmatched', 'variance': None, 'approved_rate': None,
+                'label': f'Approved Cost Not Matched — {" / ".join(missing)} required'}
+    cursor.execute('''SELECT id, approved_rate FROM rate_master WHERE factory_id = %s AND company = %s
+                       AND pvid_norm = %s AND pack_size_norm = %s AND location_norm = %s''',
+                   (fid, company or '', pvid_n, pack_n, loc_n))
+    rows = cursor.fetchall()
+    if not rows:
+        return {'status': 'not_found', 'variance': None, 'approved_rate': None, 'label': 'Approved Cost Not Matched — no record for this PVID/Pack Size/Location'}
+    if len(rows) > 1:
+        return {'status': 'ambiguous', 'variance': None, 'approved_rate': None, 'label': 'Ambiguous Approved Cost — multiple matching records, human correction required'}
+    approved_rate = rows[0][1]
+    result = _variance_result(approved_rate, po_rate, po_qty)
+    result['label'] = 'PO Rate Missing' if po_rate is None else None
+    return result
+
+
 
 
 # ===========================================================================
@@ -855,10 +923,11 @@ Return ONLY valid JSON, nothing else — no markdown fences, no explanation. Mat
   "delivery_date": string in YYYY-MM-DD format or null,
   "tax_percent": number or null,
   "items": [
-    {"item_name": string, "weight": string or null, "ordered_qty": integer, "rate": number or null, "barcode": string or null}
+    {"item_name": string, "weight": string or null, "ordered_qty": integer, "rate": number or null, "barcode": string or null,
+     "pvid": string or null, "pack_size": string or null, "location": string or null}
   ]
 }
-If a field isn't clearly present in the document, use null — never invent or guess data. "items" must include every line item found.'''
+If a field isn't clearly present in the document, use null — never invent or guess data. "items" must include every line item found. "pvid", "pack_size" and "location" are optional cost-matching fields — only fill them if clearly present as their own labeled fields in the document (e.g. "PVID:", "Pack Size:", "Location:"/"Plant:"/"Branch:"); do not guess these from the product description.'''
     else:
         schema_prompt = '''You are extracting structured data from a GRN (Goods Receipt Note) document image or PDF.
 Return ONLY valid JSON, nothing else — no markdown fences, no explanation. Match this exact schema:
@@ -1016,6 +1085,8 @@ ROUTE_MODULE_MAP = {
     'trip_dispatch': 'Vehicle', 'trip_deliver': 'Vehicle', 'n1_call_now': 'Vehicle',
     # Rate Master
     'rate_master_page': 'Rate Master', 'rate_master_add': 'Rate Master', 'rate_master_delete': 'Rate Master',
+    'rate_master_bulk_template': 'Rate Master', 'rate_master_bulk_preview': 'Rate Master',
+    'rate_master_bulk_review': 'Rate Master', 'rate_master_bulk_confirm': 'Rate Master',
     # Users
     'users_page': 'Users', 'users_add': 'Users', 'users_toggle': 'Users', 'user_permissions_page': 'Users',
     # Dashboard/Reports
@@ -1094,6 +1165,8 @@ ROUTE_ACTION_MAP = {
     'trip_dispatch': 'manage', 'trip_deliver': 'manage', 'n1_call_now': 'manage',
     # Rate Master
     'rate_master_page': 'view', 'rate_master_add': 'create', 'rate_master_delete': 'delete',
+    'rate_master_bulk_template': 'view', 'rate_master_bulk_preview': 'import',
+    'rate_master_bulk_review': 'view', 'rate_master_bulk_confirm': 'import',
     # Users
     'users_page': 'view', 'users_add': 'create', 'users_toggle': 'manage', 'user_permissions_page': 'manage',
     # Dashboard/Reports
@@ -2019,6 +2092,18 @@ POS_HTML = STYLE_BLOCK + """
                     <label>Tax / GST % — optional</label>
                     <input type="number" step="0.01" name="tax_percent" placeholder="e.g. 5">
                 </div>
+                <div>
+                    <label>PVID — optional (for Cost Validation)</label>
+                    <input type="text" name="pvid" placeholder="e.g. PV1001">
+                </div>
+                <div>
+                    <label>Pack Size — optional</label>
+                    <input type="text" name="pack_size" placeholder="e.g. 500g">
+                </div>
+                <div>
+                    <label>Location — optional</label>
+                    <input type="text" name="cost_location" placeholder="e.g. Bangalore">
+                </div>
             </div>
             <button type="submit" class="btn" style="margin-top:14px;">Add PO Item (as Draft)</button>
         </form>
@@ -2043,6 +2128,11 @@ POS_HTML = STYLE_BLOCK + """
                     <span style="color:var(--text-muted); font-size:12.5px;">{{ g.rows|length }} item(s) &middot; {{ g.total_ordered }} total ordered</span>
                     {% if g.has_rate_diff %}<span class="badge badge-red">🔴 Rate Difference in this PO</span>{% endif %}
                     {% if g.has_draft %}<span class="badge badge-amber">🟡 Draft — Pending Approval</span>{% else %}<span class="badge badge-green">🟢 Approved</span>{% endif %}
+                    {% if g.cost_status_overall == 'GREEN' %}<span class="badge badge-green">✅ COST VALIDATED</span>
+                    {% elif g.cost_status_overall == 'RED' %}<span class="badge badge-red">🔴 {{ g.cv_red }} item(s) REVIEW REQUIRED &middot; ₹{{ "%.2f"|format(g.cv_total_red_variance) }} total impact</span>
+                    {% else %}<span class="badge badge-amber">🟡 {{ g.cv_unmatched }} item(s) unmatched</span>
+                    {% endif %}
+                    <span style="color:var(--text-muted); font-size:11.5px;">({{ g.cv_green }} green / {{ g.cv_red }} red / {{ g.cv_unmatched }} unmatched of {{ g.cv_total }})</span>
                 </div>
                 <div style="display:flex; gap:8px; flex-wrap:wrap;">
                     {% if g.has_draft %}
@@ -2067,18 +2157,21 @@ POS_HTML = STYLE_BLOCK + """
             </div>
             <table>
                 <thead><tr>
-                    <th>Item</th><th>Weight</th><th>Ordered Qty</th><th>Barcode</th><th>PO Rate</th><th>Rate Check</th><th>Cost Variation</th><th>Status</th><th></th>
+                    <th>Item</th><th>PVID</th><th>Pack Size</th><th>Location</th><th>Weight</th><th>Ordered Qty</th><th>Barcode</th><th>PO Rate</th><th>Rate Check</th><th>Cost Variation</th><th>Cost Status</th><th>Status</th><th></th>
                 </tr></thead>
                 <tbody>
                 {% for it in g.rows %}
                 <tr id="row-{{ it[0] }}">
                     <td>{{ it[2] }}</td>
+                    <td>{{ it[14] or '—' }}</td>
+                    <td>{{ it[15] or '—' }}</td>
+                    <td>{{ it[16] or '—' }}</td>
                     <td>{{ it[3] }}</td>
                     <td>{{ it[4] }}</td>
                     <td style="color:var(--text-muted); font-family:monospace;">{{ it[5] }}</td>
                     <td>{% if it[7] is not none %}₹{{ "%.2f"|format(it[7]) }}{% else %}—{% endif %}</td>
                     <td>
-                        {% set rc = it[14] %}
+                        {% set rc = it[17] %}
                         {% if rc.status == 'match' %}<span class="badge badge-green">🟢 Rate Matched</span>
                         {% elif rc.status == 'diff' %}<span class="badge badge-red">🔴 Diff: ₹{{ "%.2f"|format(rc.diff) }} ({{ rc.diff_pct }}%) &middot; Approved ₹{{ "%.2f"|format(rc.approved_rate) }}</span>
                         {% elif rc.status == 'unknown' %}<span class="badge badge-amber">PO Rate Missing</span>
@@ -2086,15 +2179,24 @@ POS_HTML = STYLE_BLOCK + """
                         {% endif %}
                     </td>
                     <td>
-                        {% set cv = it[15] %}
-                        {% if cv.status == 'GREEN' %}<span class="badge badge-green">🟢 GREEN &middot; ₹{{ "%.2f"|format(cv.variance) }}</span>
+                        {% set cv = it[18] %}
+                        {% if cv.status == 'GREEN' %}<span class="badge badge-green">🟢 COST ACCEPTED &middot; ₹{{ "%.2f"|format(cv.variance) }}</span>
                         {% elif cv.status == 'RED' %}
-                            <span class="badge badge-red">🔴 RED &middot; ₹{{ "%.2f"|format(cv.variance) }}</span>
+                            <span class="badge badge-red">🔴 REVIEW REQUIRED &middot; ₹{{ "%.2f"|format(cv.variance) }}</span>
                             <form method="POST" action="/cost_variation/{{ it[0] }}/send_revised_po_email" style="display:inline; margin-left:4px;">
                                 <button type="submit" class="btn btn-outline btn-sm">📧 Send Revised PO Email</button>
                             </form>
                             <a href="/cost_variation/{{ it[0] }}/history" class="btn btn-outline btn-sm">History</a>
+                        {% elif cv.status == 'ambiguous' %}<span class="badge badge-amber" title="{{ cv.label }}">🟡 AMBIGUOUS — needs correction</span>
+                        {% elif cv.status in ['unmatched', 'not_found'] %}<span class="badge badge-amber" title="{{ cv.label }}">🟡 APPROVED COST NOT MATCHED</span>
                         {% else %}<span style="color:var(--text-muted); font-size:12px;">—</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% if it[7] is none %}<span class="badge badge-amber">🟠 PO RATE MISSING</span>
+                        {% elif cv.status == 'GREEN' %}<span class="badge badge-green">🟢 COST ACCEPTED</span>
+                        {% elif cv.status == 'RED' %}<span class="badge badge-red">🔴 REVIEW REQUIRED</span>
+                        {% else %}<span class="badge badge-amber">🟡 NOT MATCHED</span>
                         {% endif %}
                     </td>
                     <td>
@@ -2113,13 +2215,16 @@ POS_HTML = STYLE_BLOCK + """
                 </tr>
                 {% if it[8] == 'Draft' %}
                 <tr id="edit-{{ it[0] }}" style="display:none; background:rgba(255,255,255,0.03);">
-                    <td colspan="9">
+                    <td colspan="13">
                         <form method="POST" action="/pos/edit/{{ it[0] }}" style="display:flex; gap:8px; flex-wrap:wrap; align-items:flex-end; padding:8px 0;">
                             <div><label style="font-size:11px;">Item</label><input type="text" name="item_name" value="{{ it[2] }}" style="margin:0; min-width:140px;" required></div>
                             <div><label style="font-size:11px;">Weight</label><input type="text" name="weight" value="{{ it[3] }}" style="margin:0; min-width:90px;" required></div>
                             <div><label style="font-size:11px;">Qty</label><input type="number" name="ordered_qty" value="{{ it[4] }}" style="margin:0; min-width:80px;" required></div>
                             <div><label style="font-size:11px;">Barcode</label><input type="text" name="barcode" value="{{ it[5] }}" style="margin:0; min-width:120px;" required></div>
                             <div><label style="font-size:11px;">Rate (₹)</label><input type="number" step="0.01" name="rate" value="{{ it[7] if it[7] is not none else '' }}" style="margin:0; min-width:90px;"></div>
+                            <div><label style="font-size:11px;">PVID</label><input type="text" name="pvid" value="{{ it[14] or '' }}" style="margin:0; min-width:90px;"></div>
+                            <div><label style="font-size:11px;">Pack Size</label><input type="text" name="pack_size" value="{{ it[15] or '' }}" style="margin:0; min-width:90px;"></div>
+                            <div><label style="font-size:11px;">Location</label><input type="text" name="cost_location" value="{{ it[16] or '' }}" style="margin:0; min-width:110px;"></div>
                             <button type="submit" class="btn btn-sm">Save</button>
                             <button type="button" class="btn btn-outline btn-sm" onclick="document.getElementById('edit-{{ it[0] }}').style.display='none';">Cancel</button>
                         </form>
@@ -2142,6 +2247,57 @@ POS_HTML = STYLE_BLOCK + """
 </html>
 """
 
+RATE_MASTER_BULK_REVIEW_HTML = STYLE_BLOCK + """
+<title>Review Bulk Cost Import | {{ factory_display_name }}</title>
+</head>
+<body>
+<div class="container">
+""" + TOPBAR_TEMPLATE.replace("__NAV__", nav_html('rate_master')) + """
+    <div class="card">
+        <div class="card-header"><h2>🔍 Review Approved Cost Sheet — {{ filename }}</h2></div>
+        <div class="stats-grid">
+            <div class="stat-card"><div class="label">Rows Detected</div><div class="value">{{ counts.total }}</div></div>
+            <div class="stat-card"><div class="label">Valid</div><div class="value">{{ counts.valid }}</div></div>
+            <div class="stat-card"><div class="label">Invalid</div><div class="value">{{ counts.invalid }}</div></div>
+            <div class="stat-card"><div class="label">Duplicates in File</div><div class="value">{{ counts.duplicates_in_file }}</div></div>
+            <div class="stat-card"><div class="label">Will Insert</div><div class="value">{{ counts.will_insert }}</div></div>
+            <div class="stat-card"><div class="label">Will Update</div><div class="value">{{ counts.will_update }}</div></div>
+        </div>
+        {% if status == 'committed' %}
+        <div class="badge badge-green" style="display:block; padding:10px 14px;">✅ Already imported.</div>
+        {% else %}
+        <table style="margin-top:10px;">
+            <thead><tr><th>#</th><th>Company</th><th>PVID</th><th>Product</th><th>Pack Size</th><th>Location</th><th>Rate</th><th>Action</th><th>Errors</th></tr></thead>
+            <tbody>
+            {% for r in rows %}
+            <tr style="{% if r.errors %}background:rgba(239,68,68,0.06);{% elif r.is_duplicate_in_file %}background:rgba(245,158,11,0.06);{% endif %}">
+                <td>{{ r.row_num }}</td><td>{{ r.company or '—' }}</td><td>{{ r.pvid }}</td><td>{{ r.product_name }}</td>
+                <td>{{ r.pack_size }}</td><td>{{ r.location }}</td>
+                <td>{% if r.approved_rate is not none %}₹{{ "%.2f"|format(r.approved_rate) }}{% else %}—{% endif %}</td>
+                <td>
+                    {% if r.errors %}<span class="badge badge-red">Invalid</span>
+                    {% elif r.is_duplicate_in_file %}<span class="badge badge-amber">Duplicate in file</span>
+                    {% elif r.will_action == 'INSERT' %}<span class="badge badge-green">Insert</span>
+                    {% else %}<span class="badge badge-blue">Update</span>
+                    {% endif %}
+                </td>
+                <td style="color:#f87171; font-size:12px;">{{ r.errors|join(', ') if r.errors else '—' }}</td>
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+        <form method="POST" action="/rate_master/bulk_import/review/{{ staging_id }}/confirm" style="margin-top:16px;">
+            <button type="submit" class="btn" {% if counts.valid == 0 %}disabled{% endif %}>✅ Confirm Import ({{ counts.valid - counts.duplicates_in_file }} rows)</button>
+            <a href="/rate_master" class="btn btn-outline" style="text-decoration:none;">Cancel</a>
+        </form>
+        {% endif %}
+    </div>
+    <footer>{{ factory_display_name }} &middot; {{ platform_name }}</footer>
+</div>
+</body>
+</html>
+"""
+
 RATE_MASTER_HTML = STYLE_BLOCK + """
 <title>Rate Master | {{ factory_display_name }}</title>
 </head>
@@ -2151,10 +2307,40 @@ RATE_MASTER_HTML = STYLE_BLOCK + """
     {% if error_msg %}
     <div class="badge badge-amber" style="display:block; padding:10px 14px; margin-bottom:14px; font-size:13px;">{{ error_msg }}</div>
     {% endif %}
+    {% if ok_msg %}
+    <div class="badge badge-green" style="display:block; padding:10px 14px; margin-bottom:14px; font-size:13px;">{{ ok_msg }}</div>
+    {% endif %}
+
     <div class="card">
-        <div class="card-header"><h2>💰 ERP Approved Rate Master</h2></div>
+        <div class="card-header"><h2>📤 Bulk Approved Cost Sheet Import</h2>
+            <a href="/rate_master/bulk_import/template" class="btn btn-outline btn-sm">⬇ Download Template</a>
+        </div>
         <div style="color:var(--text-muted); font-size:12.5px; margin-bottom:14px;">
-            Save the approved rate for each company + product here. Every PO item is automatically checked against this rate on the Manage POs page — 🟢 if it matches, 🔴 if it differs.
+            Upload a .csv or .xlsx with columns for PVID, Product, Pack Size, Location and Approved Rate (common header names/aliases are recognized automatically).
+            Company can be selected below OR included as its own column in the file. Nothing is written until you review and confirm.
+        </div>
+        <form method="POST" action="/rate_master/bulk_import/preview" enctype="multipart/form-data">
+            <div class="form-grid">
+                <div>
+                    <label>Company (optional if file has a company column)</label>
+                    <select name="company">
+                        <option value="">— use file's company column —</option>
+                        {% for c in companies %}<option value="{{ c }}">{{ c }}</option>{% endfor %}
+                    </select>
+                </div>
+                <div>
+                    <label>Approved Cost Sheet (.csv or .xlsx)</label>
+                    <input type="file" name="cost_sheet_file" accept=".csv,.xlsx" required style="padding:10px;">
+                </div>
+            </div>
+            <button type="submit" class="btn" style="margin-top:10px;">Upload &amp; Preview</button>
+        </form>
+    </div>
+
+    <div class="card">
+        <div class="card-header"><h2>➕ Manual Approved Cost Entry</h2></div>
+        <div style="color:var(--text-muted); font-size:12.5px; margin-bottom:14px;">
+            Fill PVID + Pack Size + Location for the new matching workflow, or leave them blank to use the legacy Company+Product entry (still supported).
         </div>
         <form method="POST" action="/rate_master/add">
             <div class="form-grid">
@@ -2168,15 +2354,35 @@ RATE_MASTER_HTML = STYLE_BLOCK + """
                     </select>
                 </div>
                 <div>
-                    <label>Product Name (must match item name exactly)</label>
+                    <label>PVID</label>
+                    <input type="text" name="pvid" placeholder="e.g. PV1001">
+                </div>
+                <div>
+                    <label>Product Name / Description</label>
                     <input type="text" name="product_name" placeholder="e.g. Instant Noodles" required>
                 </div>
                 <div>
-                    <label>Approved Rate (₹)</label>
+                    <label>Pack Size</label>
+                    <input type="text" name="pack_size" placeholder="e.g. 500g">
+                </div>
+                <div>
+                    <label>Location</label>
+                    <input type="text" name="location" placeholder="e.g. Bangalore">
+                </div>
+                <div>
+                    <label>Approved Unit Rate (₹)</label>
                     <input type="number" step="0.01" name="approved_rate" placeholder="e.g. 45.50" required>
                 </div>
+                <div>
+                    <label>Effective Date (optional)</label>
+                    <input type="date" name="effective_date">
+                </div>
+                <div>
+                    <label>Source / Remarks (optional)</label>
+                    <input type="text" name="remarks" placeholder="optional">
+                </div>
             </div>
-            <button type="submit" class="btn" style="margin-top:14px;">Save Approved Rate</button>
+            <button type="submit" class="btn" style="margin-top:14px;">Save Approved Cost</button>
         </form>
         {% if companies|length == 0 %}
         <div style="color:var(--text-muted); font-size:12.5px; margin-top:10px;">No companies yet — <a href="/companies" style="color:var(--primary);">add one first</a>.</div>
@@ -2184,19 +2390,36 @@ RATE_MASTER_HTML = STYLE_BLOCK + """
     </div>
 
     <div class="card">
-        <div class="card-header"><h2>📋 Approved Rates</h2></div>
+        <div class="card-header"><h2>📋 Approved Cost Master</h2></div>
+        <form method="GET" action="/rate_master" style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:14px;">
+            <select name="company" onchange="this.form.submit()" style="max-width:200px;">
+                <option value="">All Companies</option>
+                {% for c in companies %}<option value="{{ c }}" {% if c == filter_company %}selected{% endif %}>{{ c }}</option>{% endfor %}
+            </select>
+            <input type="text" name="pvid" value="{{ filter_pvid }}" placeholder="Search PVID" style="max-width:160px; margin:0;">
+            <input type="text" name="product" value="{{ filter_product }}" placeholder="Search Product" style="max-width:180px; margin:0;">
+            <input type="text" name="location" value="{{ filter_location }}" placeholder="Search Location" style="max-width:160px; margin:0;">
+            <button type="submit" class="btn btn-outline btn-sm">Filter</button>
+            {% if filter_company or filter_pvid or filter_product or filter_location %}<a href="/rate_master" class="btn btn-outline btn-sm" style="text-decoration:none;">Clear</a>{% endif %}
+        </form>
         {% if rates|length > 0 %}
         <table>
-            <thead><tr><th>Company</th><th>Product</th><th>Approved Rate</th><th>Last Updated</th><th></th></tr></thead>
+            <thead><tr><th>Company</th><th>PVID</th><th>Product</th><th>Pack Size</th><th>Location</th><th>Approved Rate</th><th>Effective Date</th><th>Updated At</th><th>Updated By</th><th></th></tr></thead>
             <tbody>
             {% for r in rates %}
             <tr>
                 <td><span class="badge badge-blue">{{ r[1] }}</span></td>
+                <td>{{ r[5] or '—' }}</td>
                 <td>{{ r[2] }}</td>
+                <td>{{ r[6] or '—' }}</td>
+                <td>{{ r[7] or '—' }}</td>
                 <td>₹{{ "%.2f"|format(r[3]) }}</td>
+                <td style="font-size:12px; color:var(--text-muted);">{{ r[8] or '—' }}</td>
                 <td style="color:var(--text-muted); font-size:12px;">{{ r[4][:16] if r[4] else '—' }}</td>
+                <td style="color:var(--text-muted); font-size:12px;">{{ r[9] or '—' }}</td>
                 <td>
-                    <form method="POST" action="/rate_master/delete/{{ r[0] }}" onsubmit="return confirm('Delete this approved rate?');">
+                    {% if not r[5] or not r[6] or not r[7] %}<span class="badge badge-amber" title="Missing PVID/Pack Size/Location — Legacy record">Legacy</span>{% endif %}
+                    <form method="POST" action="/rate_master/delete/{{ r[0] }}" onsubmit="return confirm('Delete this approved rate?');" style="display:inline;">
                         <button type="submit" class="btn btn-danger btn-sm">Delete</button>
                     </form>
                 </td>
@@ -2205,7 +2428,7 @@ RATE_MASTER_HTML = STYLE_BLOCK + """
             </tbody>
         </table>
         {% else %}
-        <div class="empty-state">No approved rates set yet. Add one above.</div>
+        <div class="empty-state">No approved cost records set yet. Add one above or bulk-import a sheet.</div>
         {% endif %}
     </div>
 
@@ -2298,7 +2521,7 @@ AI_IMPORT_REVIEW_PO_HTML = STYLE_BLOCK + """
                 <div><label>Tax / GST %</label><input type="number" step="0.01" name="tax_percent" value="{{ extracted.tax_percent if extracted.tax_percent is not none else '' }}"></div>
             </div>
             <table style="margin-top:16px;">
-                <thead><tr><th></th><th>Item</th><th>Weight</th><th>Qty</th><th>Rate</th><th>Barcode</th></tr></thead>
+                <thead><tr><th></th><th>Item</th><th>Weight</th><th>Qty</th><th>Rate</th><th>Barcode</th><th>PVID</th><th>Pack Size</th><th>Location</th></tr></thead>
                 <tbody>
                 {% for it in extracted['items'] %}
                 <tr>
@@ -2308,10 +2531,13 @@ AI_IMPORT_REVIEW_PO_HTML = STYLE_BLOCK + """
                     <td><input type="number" name="ordered_qty" value="{{ it.ordered_qty or '' }}" style="margin:0; min-width:80px;"></td>
                     <td><input type="number" step="0.01" name="rate" value="{{ it.rate if it.rate is not none else '' }}" style="margin:0; min-width:80px;"></td>
                     <td><input type="text" name="barcode" value="{{ it.barcode or '' }}" style="margin:0; min-width:120px;"></td>
+                    <td><input type="text" name="pvid" value="{{ it.pvid or '' }}" style="margin:0; min-width:90px;" placeholder="optional"></td>
+                    <td><input type="text" name="pack_size" value="{{ it.pack_size or '' }}" style="margin:0; min-width:90px;" placeholder="optional"></td>
+                    <td><input type="text" name="cost_location" value="{{ it.location or '' }}" style="margin:0; min-width:100px;" placeholder="optional"></td>
                 </tr>
                 {% endfor %}
                 {% if extracted['items']|length == 0 %}
-                <tr><td colspan="6" style="text-align:center; color:var(--text-muted);">No items were extracted — the document may be unclear. You can still add items manually on the Manage POs page.</td></tr>
+                <tr><td colspan="9" style="text-align:center; color:var(--text-muted);">No items were extracted — the document may be unclear. You can still add items manually on the Manage POs page.</td></tr>
                 {% endif %}
                 </tbody>
             </table>
@@ -3593,18 +3819,32 @@ def rate_master_page():
     if not session.get('logged_in'): return redirect('/login')
     fid = current_factory_id()
     filter_company = request.args.get('company', '').strip()
+    filter_pvid = request.args.get('pvid', '').strip()
+    filter_product = request.args.get('product', '').strip()
+    filter_location = request.args.get('location', '').strip()
     conn = get_conn()
     cursor = conn.cursor()
     cursor.execute('SELECT name FROM companies WHERE factory_id = %s ORDER BY name', (fid,))
     companies = [r[0] for r in cursor.fetchall()]
+    where = 'factory_id = %s'
+    params = [fid]
     if filter_company:
-        cursor.execute('SELECT id, company, product_name, approved_rate, updated_at FROM rate_master WHERE factory_id = %s AND company = %s ORDER BY company, product_name', (fid, filter_company))
-    else:
-        cursor.execute('SELECT id, company, product_name, approved_rate, updated_at FROM rate_master WHERE factory_id = %s ORDER BY company, product_name', (fid,))
+        where += ' AND company = %s'; params.append(filter_company)
+    if filter_pvid:
+        where += ' AND pvid ILIKE %s'; params.append(f'%{filter_pvid}%')
+    if filter_product:
+        where += ' AND product_name ILIKE %s'; params.append(f'%{filter_product}%')
+    if filter_location:
+        where += ' AND location ILIKE %s'; params.append(f'%{filter_location}%')
+    cursor.execute(f'''SELECT id, company, product_name, approved_rate, updated_at, pvid, pack_size, location,
+                        effective_date, updated_by FROM rate_master WHERE {where} ORDER BY company, product_name''', params)
     rates = cursor.fetchall()
     conn.close()
     error_msg = request.args.get('error')
-    return render_template_string(RATE_MASTER_HTML, rates=rates, companies=companies, filter_company=filter_company, error_msg=error_msg)
+    ok_msg = request.args.get('msg') if request.args.get('ok') else None
+    return render_template_string(RATE_MASTER_HTML, rates=rates, companies=companies, filter_company=filter_company,
+                                   filter_pvid=filter_pvid, filter_product=filter_product, filter_location=filter_location,
+                                   error_msg=error_msg, ok_msg=ok_msg)
 
 @app.route('/rate_master/add', methods=['POST'])
 def rate_master_add():
@@ -3613,6 +3853,11 @@ def rate_master_add():
     company = request.form.get('company', '').strip()
     product_name = request.form.get('product_name', '').strip()
     rate_raw = request.form.get('approved_rate', '').strip()
+    pvid = request.form.get('pvid', '').strip()
+    pack_size = request.form.get('pack_size', '').strip()
+    location = request.form.get('location', '').strip()
+    effective_date = request.form.get('effective_date', '').strip()
+    remarks = request.form.get('remarks', '').strip()
     if not company or not product_name or not rate_raw:
         return redirect('/rate_master?error=' + quote('Company, product name and rate are all required.'))
     try:
@@ -3621,20 +3866,220 @@ def rate_master_add():
         return redirect('/rate_master?error=' + quote('Rate must be a number.'))
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute('SELECT approved_rate FROM rate_master WHERE factory_id = %s AND company = %s AND product_name = %s', (fid, company, product_name))
-    existing = cursor.fetchone()
     ts = now_ist().isoformat()
-    cursor.execute('''INSERT INTO rate_master (factory_id, company, product_name, approved_rate, updated_at, updated_by)
-                       VALUES (%s,%s,%s,%s,%s,%s)
-                       ON CONFLICT (factory_id, company, product_name) DO UPDATE SET approved_rate = EXCLUDED.approved_rate, updated_at = EXCLUDED.updated_at, updated_by = EXCLUDED.updated_by''',
-                   (fid, company, product_name, approved_rate, ts, session.get('user_name')))
-    if existing and existing[0] != approved_rate:
-        log_audit(cursor, 'PO Rate Changed', 'Rate Master', product_name, f'{company}: ₹{existing[0]} to ₹{approved_rate}')
-    elif not existing:
-        log_audit(cursor, 'Approved Rate Added', 'Rate Master', product_name, f'{company}: set to ₹{approved_rate}')
+    pvid_n, pack_n, loc_n = _norm_key(pvid), _norm_key(pack_size), _norm_key(location)
+    if pvid_n and pack_n and loc_n:
+        # Full business key present — matches/upserts on PVID+Pack Size+Location (the new primary key).
+        cursor.execute('''SELECT approved_rate FROM rate_master WHERE factory_id = %s AND company = %s
+                           AND pvid_norm = %s AND pack_size_norm = %s AND location_norm = %s''',
+                       (fid, company, pvid_n, pack_n, loc_n))
+        existing = cursor.fetchone()
+        cursor.execute('''INSERT INTO rate_master (factory_id, company, product_name, approved_rate, pvid, pack_size, location,
+                           effective_date, remarks, pvid_norm, pack_size_norm, location_norm, updated_at, updated_by)
+                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                           ON CONFLICT (factory_id, company, pvid_norm, pack_size_norm, location_norm)
+                           DO UPDATE SET approved_rate=EXCLUDED.approved_rate, product_name=EXCLUDED.product_name,
+                           pvid=EXCLUDED.pvid, pack_size=EXCLUDED.pack_size, location=EXCLUDED.location,
+                           effective_date=EXCLUDED.effective_date, remarks=EXCLUDED.remarks,
+                           updated_at=EXCLUDED.updated_at, updated_by=EXCLUDED.updated_by''',
+                       (fid, company, product_name, approved_rate, pvid, pack_size, location,
+                        effective_date or None, remarks or None, pvid_n, pack_n, loc_n, ts, session.get('user_name')))
+        if existing and existing[0] != approved_rate:
+            log_audit(cursor, 'Approved Rate Changed', 'Rate Master', pvid, f'{company} {pvid}/{pack_size}/{location}: ₹{existing[0]} -> ₹{approved_rate}')
+        elif not existing:
+            log_audit(cursor, 'Approved Rate Added', 'Rate Master', pvid, f'{company} {pvid}/{pack_size}/{location}: set to ₹{approved_rate}')
+    else:
+        # Legacy path — unchanged, exact original behavior for backward compatibility.
+        cursor.execute('SELECT approved_rate FROM rate_master WHERE factory_id = %s AND company = %s AND product_name = %s', (fid, company, product_name))
+        existing = cursor.fetchone()
+        cursor.execute('''INSERT INTO rate_master (factory_id, company, product_name, approved_rate, updated_at, updated_by)
+                           VALUES (%s,%s,%s,%s,%s,%s)
+                           ON CONFLICT (factory_id, company, product_name) DO UPDATE SET approved_rate = EXCLUDED.approved_rate, updated_at = EXCLUDED.updated_at, updated_by = EXCLUDED.updated_by''',
+                       (fid, company, product_name, approved_rate, ts, session.get('user_name')))
+        if existing and existing[0] != approved_rate:
+            log_audit(cursor, 'PO Rate Changed', 'Rate Master', product_name, f'{company}: ₹{existing[0]} to ₹{approved_rate}')
+        elif not existing:
+            log_audit(cursor, 'Approved Rate Added', 'Rate Master', product_name, f'{company}: set to ₹{approved_rate}')
     conn.commit()
     conn.close()
     return redirect('/rate_master?company=' + quote(company) if company else '/rate_master')
+
+@app.route('/rate_master/bulk_import/template')
+def rate_master_bulk_template():
+    """Part 2: downloadable sample CSV for the bulk Approved Cost Sheet — shows the exact expected
+    logical columns (any supported alias also works on upload, but the template uses the primary names)."""
+    if not session.get('logged_in'): return redirect('/login')
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(['company', 'pvid', 'product_name', 'pack_size', 'location', 'approved_rate', 'effective_date', 'remarks'])
+    writer.writerow(['Zepto', 'PV1001', 'Instant Noodles', '500g', 'Bangalore', '145.00', '2026-01-01', 'Sample row'])
+    return Response(output.getvalue(), mimetype='text/csv',
+                     headers={'Content-Disposition': 'attachment; filename=approved_cost_sheet_template.csv'})
+
+@app.route('/rate_master/bulk_import/preview', methods=['POST'])
+def rate_master_bulk_preview():
+    """Part 2: parses the uploaded sheet and stores a REVIEW-ONLY record — nothing is written to
+    rate_master here. The person must explicitly Confirm Import (below) before anything changes."""
+    if not session.get('logged_in'): return redirect('/login')
+    fid = current_factory_id()
+    ui_company = request.form.get('company', '').strip()
+    file = request.files.get('cost_sheet_file')
+    if not file or file.filename == '':
+        return redirect('/rate_master?error=' + quote('No file selected for bulk import.'))
+    filename_lower = file.filename.lower()
+    if not (filename_lower.endswith('.csv') or filename_lower.endswith('.xlsx')):
+        return redirect('/rate_master?error=' + quote('Please upload a .csv or .xlsx file.'))
+    fieldnames, rows = _read_spreadsheet_rows(file)
+    if fieldnames is None:
+        return redirect('/rate_master?error=' + quote('Could not read the file — check it has a header row.'))
+    colmap = _map_csv_headers(fieldnames, COST_MASTER_HEADER_MAP)
+    required = ['pvid', 'product_name', 'pack_size', 'location', 'approved_rate']
+    missing_cols = [k for k in required if k not in colmap]
+    if missing_cols:
+        return redirect('/rate_master?error=' + quote(f'These required columns were not found (or no recognized alias): {", ".join(missing_cols)}'))
+
+    conn = get_conn()
+    cursor = conn.cursor()
+    preview_rows = []
+    seen_keys_in_file = {}
+    counts = {'total': 0, 'valid': 0, 'invalid': 0, 'will_insert': 0, 'will_update': 0, 'duplicates_in_file': 0}
+    for idx, row in enumerate(rows):
+        counts['total'] += 1
+        file_company = (row.get(colmap.get('company', '')) or '').strip() if 'company' in colmap else ''
+        pvid = (row.get(colmap['pvid']) or '').strip()
+        product_name = (row.get(colmap['product_name']) or '').strip()
+        pack_size = (row.get(colmap['pack_size']) or '').strip()
+        location = (row.get(colmap['location']) or '').strip()
+        rate_raw = (row.get(colmap['approved_rate']) or '').strip()
+        effective_date = (row.get(colmap.get('effective_date', '')) or '').strip() if 'effective_date' in colmap else ''
+        remarks = (row.get(colmap.get('remarks', '')) or '').strip() if 'remarks' in colmap else ''
+
+        errors = []
+        company = ui_company
+        if ui_company and file_company and _norm_key(ui_company) != _norm_key(file_company):
+            errors.append(f"Company conflict: UI selected '{ui_company}' but file row says '{file_company}'")
+        elif file_company and not ui_company:
+            company = file_company
+        if not company:
+            errors.append('Company missing (not selected in UI and not present in file)')
+        if not pvid: errors.append('PVID missing')
+        if not product_name: errors.append('Product name missing')
+        if not pack_size: errors.append('Pack Size missing')
+        if not location: errors.append('Location missing')
+        approved_rate = None
+        if not rate_raw:
+            errors.append('Approved Rate missing')
+        else:
+            try:
+                approved_rate = float(rate_raw)
+                if approved_rate < 0:
+                    errors.append('Approved Rate cannot be negative')
+            except ValueError:
+                errors.append(f"Approved Rate '{rate_raw}' is not a number")
+
+        is_dup_in_file = False
+        will_action = None
+        if not errors:
+            key = (fid, _norm_key(company), _norm_key(pvid), _norm_key(pack_size), _norm_key(location))
+            if key in seen_keys_in_file:
+                is_dup_in_file = True
+                counts['duplicates_in_file'] += 1
+            seen_keys_in_file[key] = idx
+            cursor.execute('''SELECT approved_rate FROM rate_master WHERE factory_id = %s AND company = %s
+                               AND pvid_norm = %s AND pack_size_norm = %s AND location_norm = %s''',
+                           (fid, company, _norm_key(pvid), _norm_key(pack_size), _norm_key(location)))
+            existing = cursor.fetchone()
+            will_action = 'UPDATE' if existing else 'INSERT'
+            if will_action == 'UPDATE':
+                counts['will_update'] += 1
+            else:
+                counts['will_insert'] += 1
+            counts['valid'] += 1
+        else:
+            counts['invalid'] += 1
+
+        preview_rows.append({'row_num': idx + 1, 'company': company, 'pvid': pvid, 'product_name': product_name,
+                              'pack_size': pack_size, 'location': location, 'approved_rate': approved_rate,
+                              'effective_date': effective_date, 'remarks': remarks, 'errors': errors,
+                              'is_duplicate_in_file': is_dup_in_file, 'will_action': will_action})
+
+    ts = now_ist().isoformat()
+    cursor.execute('''INSERT INTO ai_import_staging (factory_id, import_type, company, source_filename, extracted_json, status, created_at, created_by)
+                       VALUES (%s,'COST_MASTER',%s,%s,%s,'pending_review',%s,%s) RETURNING id''',
+                   (fid, ui_company, file.filename, json.dumps({'rows': preview_rows, 'counts': counts}), ts, session.get('user_name')))
+    staging_id = cursor.fetchone()[0]
+    log_audit(cursor, 'Approved Cost Sheet Uploaded', 'Rate Master', staging_id, f'{file.filename}: {counts["total"]} rows detected, {counts["valid"]} valid, {counts["invalid"]} invalid')
+    conn.commit()
+    conn.close()
+    return redirect(f'/rate_master/bulk_import/review/{staging_id}')
+
+@app.route('/rate_master/bulk_import/review/<int:staging_id>')
+def rate_master_bulk_review(staging_id):
+    if not session.get('logged_in'): return redirect('/login')
+    fid = current_factory_id()
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT source_filename, extracted_json, status FROM ai_import_staging WHERE id = %s AND factory_id = %s AND import_type = 'COST_MASTER'", (staging_id, fid))
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return "Import not found. <a href='/rate_master'>Back</a>", 404
+    filename, extracted_json, status = row
+    data = json.loads(extracted_json) if extracted_json else {'rows': [], 'counts': {}}
+    return render_template_string(RATE_MASTER_BULK_REVIEW_HTML, staging_id=staging_id, filename=filename,
+                                   rows=data.get('rows', []), counts=data.get('counts', {}), status=status)
+
+@app.route('/rate_master/bulk_import/review/<int:staging_id>/confirm', methods=['POST'])
+def rate_master_bulk_confirm(staging_id):
+    """Part 2: ONLY here does anything actually get written to rate_master — an explicit human
+    Confirm Import action. UPSERT per row; existing rows never deleted merely for being absent from
+    the sheet (a later upload is incremental, never a destructive sync)."""
+    if not session.get('logged_in'): return redirect('/login')
+    fid = current_factory_id()
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT extracted_json, status FROM ai_import_staging WHERE id = %s AND factory_id = %s AND import_type = 'COST_MASTER'", (staging_id, fid))
+    row = cursor.fetchone()
+    if not row or row[1] == 'committed':
+        conn.close()
+        return redirect('/rate_master')
+    data = json.loads(row[0])
+    ts = now_ist().isoformat()
+    inserted, updated, skipped = 0, 0, 0
+    seen_this_run = set()
+    for r in data.get('rows', []):
+        if r['errors'] or r['is_duplicate_in_file']:
+            skipped += 1
+            continue  # invalid rows and in-file duplicates (after the first) are never written
+        key = (_norm_key(r['company']), _norm_key(r['pvid']), _norm_key(r['pack_size']), _norm_key(r['location']))
+        if key in seen_this_run:
+            skipped += 1
+            continue
+        seen_this_run.add(key)
+        cursor.execute('''SELECT approved_rate FROM rate_master WHERE factory_id = %s AND company = %s
+                           AND pvid_norm = %s AND pack_size_norm = %s AND location_norm = %s''',
+                       (fid, r['company'], key[1], key[2], key[3]))
+        existing = cursor.fetchone()
+        cursor.execute('''INSERT INTO rate_master (factory_id, company, product_name, approved_rate, pvid, pack_size, location,
+                           effective_date, remarks, pvid_norm, pack_size_norm, location_norm, updated_at, updated_by)
+                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                           ON CONFLICT (factory_id, company, pvid_norm, pack_size_norm, location_norm)
+                           DO UPDATE SET approved_rate=EXCLUDED.approved_rate, product_name=EXCLUDED.product_name,
+                           pack_size=EXCLUDED.pack_size, location=EXCLUDED.location, effective_date=EXCLUDED.effective_date,
+                           remarks=EXCLUDED.remarks, updated_at=EXCLUDED.updated_at, updated_by=EXCLUDED.updated_by''',
+                       (fid, r['company'], r['product_name'], r['approved_rate'], r['pvid'], r['pack_size'], r['location'],
+                        r.get('effective_date') or None, r.get('remarks') or None, key[1], key[2], key[3], ts, session.get('user_name')))
+        if existing:
+            updated += 1
+            if existing[0] != r['approved_rate']:
+                log_audit(cursor, 'Approved Rate Changed', 'Rate Master', r['pvid'], f'{r["company"]} {r["pvid"]}/{r["pack_size"]}/{r["location"]}: ₹{existing[0]} -> ₹{r["approved_rate"]}')
+        else:
+            inserted += 1
+    cursor.execute("UPDATE ai_import_staging SET status = 'committed' WHERE id = %s", (staging_id,))
+    log_audit(cursor, 'Bulk Import Confirmed', 'Rate Master', staging_id, f'{inserted} inserted, {updated} updated, {skipped} skipped')
+    conn.commit()
+    conn.close()
+    return redirect('/rate_master?ok=1&msg=' + quote(f'Bulk import confirmed: {inserted} inserted, {updated} updated, {skipped} skipped.'))
 
 @app.route('/rate_master/delete/<int:rate_id>', methods=['POST'])
 def rate_master_delete(rate_id):
@@ -4165,10 +4610,11 @@ def pos_page():
     filter_company = request.args.get('company', '').strip()
     conn = get_conn()
     cursor = conn.cursor()
+    base_cols = 'id, po_number, item_name, weight, ordered_qty, barcode, company, rate, status, po_date, delivery_date, tax_percent, approved_by, approved_at, pvid, pack_size, cost_location'
     if filter_company:
-        cursor.execute('SELECT id, po_number, item_name, weight, ordered_qty, barcode, company, rate, status, po_date, delivery_date, tax_percent, approved_by, approved_at FROM po_items WHERE factory_id = %s AND company = %s ORDER BY po_number, id DESC', (fid, filter_company))
+        cursor.execute(f'SELECT {base_cols} FROM po_items WHERE factory_id = %s AND company = %s ORDER BY po_number, id DESC', (fid, filter_company))
     else:
-        cursor.execute('SELECT id, po_number, item_name, weight, ordered_qty, barcode, company, rate, status, po_date, delivery_date, tax_percent, approved_by, approved_at FROM po_items WHERE factory_id = %s ORDER BY po_number, id DESC', (fid,))
+        cursor.execute(f'SELECT {base_cols} FROM po_items WHERE factory_id = %s ORDER BY po_number, id DESC', (fid,))
     rows = cursor.fetchall()
     cursor.execute('SELECT name FROM companies WHERE factory_id = %s ORDER BY name', (fid,))
     companies = [r[0] for r in cursor.fetchall()]
@@ -4180,16 +4626,36 @@ def pos_page():
         key = (it[6] or '', it[1])
         if key not in groups_map:
             groups_map[key] = {'company': it[6] or '', 'po_number': it[1], 'rows': [], 'total_ordered': 0,
-                                'has_rate_diff': False, 'has_draft': False, 'po_date': it[9], 'delivery_date': it[10]}
+                                'has_rate_diff': False, 'has_draft': False, 'po_date': it[9], 'delivery_date': it[10],
+                                'cv_total': 0, 'cv_green': 0, 'cv_red': 0, 'cv_unmatched': 0, 'cv_total_red_variance': 0.0}
             order.append(key)
         rate_info = get_rate_status(cursor, fid, it[6], it[2], it[7])
-        cost_variation = get_cost_variation(cursor, fid, it[6], it[2], it[7], it[4])
+        # PO Cost Variance Control: use PVID+Pack Size+Location matching (Part 4) when the item has
+        # all three keys; fall back to the legacy product-name-based get_cost_variation() when they
+        # are absent (old PO records) — never crashes, never silently fuzzy-matches.
+        pvid, pack_size, cost_location = it[14], it[15], it[16]
+        cost_match = evaluate_po_item_cost(cursor, fid, it[6], it[2], pvid, pack_size, cost_location, it[7], it[4])
         if rate_info['status'] == 'diff':
             groups_map[key]['has_rate_diff'] = True
         if (it[8] or 'Draft') == 'Draft':
             groups_map[key]['has_draft'] = True
-        groups_map[key]['rows'].append(it + (rate_info, cost_variation))
+        groups_map[key]['rows'].append(it + (rate_info, cost_match))
         groups_map[key]['total_ordered'] += it[4] or 0
+        groups_map[key]['cv_total'] += 1
+        if cost_match['status'] == 'GREEN':
+            groups_map[key]['cv_green'] += 1
+        elif cost_match['status'] == 'RED':
+            groups_map[key]['cv_red'] += 1
+            groups_map[key]['cv_total_red_variance'] += cost_match['variance'] or 0
+        elif cost_match['status'] in ('unmatched', 'not_found', 'ambiguous', 'none'):
+            groups_map[key]['cv_unmatched'] += 1
+    for g in groups_map.values():
+        if g['cv_red'] > 0:
+            g['cost_status_overall'] = 'RED'
+        elif g['cv_unmatched'] > 0:
+            g['cost_status_overall'] = 'UNMATCHED'
+        else:
+            g['cost_status_overall'] = 'GREEN'
     po_groups = [groups_map[k] for k in order]
     conn.close()
 
@@ -4251,11 +4717,14 @@ def pos_edit_item(item_id):
     barcode = request.form.get('barcode', '').strip()
     rate_raw = request.form.get('rate', '').strip()
     rate = float(rate_raw) if rate_raw else None
+    pvid = request.form.get('pvid', '').strip()
+    pack_size = request.form.get('pack_size', '').strip()
+    cost_location = request.form.get('cost_location', '').strip()
     conn = get_conn()
     cursor = conn.cursor()
     # Only editable while still in Draft — an Approved item must be reopened first, so a final PO can't silently change.
-    cursor.execute("UPDATE po_items SET item_name = %s, weight = %s, ordered_qty = %s, barcode = %s, rate = %s WHERE id = %s AND factory_id = %s AND status = 'Draft'",
-                   (item_name, weight, int(ordered_qty), barcode, rate, item_id, fid))
+    cursor.execute("UPDATE po_items SET item_name = %s, weight = %s, ordered_qty = %s, barcode = %s, rate = %s, pvid = %s, pack_size = %s, cost_location = %s WHERE id = %s AND factory_id = %s AND status = 'Draft'",
+                   (item_name, weight, int(ordered_qty), barcode, rate, pvid or None, pack_size or None, cost_location or None, item_id, fid))
     log_audit(cursor, 'PO Item Edited', 'Manage POs', item_id, f'Edited {item_name} ({ordered_qty})')
     conn.commit()
     conn.close()
@@ -4277,11 +4746,15 @@ def pos_add():
     delivery_date = request.form.get('delivery_date', '').strip()
     tax_raw = request.form.get('tax_percent', '').strip()
     tax_percent = float(tax_raw) if tax_raw else None
+    pvid = request.form.get('pvid', '').strip()
+    pack_size = request.form.get('pack_size', '').strip()
+    cost_location = request.form.get('cost_location', '').strip()
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute('''INSERT INTO po_items (factory_id, po_number, item_name, weight, ordered_qty, barcode, company, rate, status, po_date, delivery_date, tax_percent)
-                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'Draft', %s, %s, %s)''',
-                   (fid, po_number, item_name, weight, int(ordered_qty), barcode, company, rate, po_date or None, delivery_date or None, tax_percent))
+    cursor.execute('''INSERT INTO po_items (factory_id, po_number, item_name, weight, ordered_qty, barcode, company, rate, status, po_date, delivery_date, tax_percent, pvid, pack_size, cost_location)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'Draft', %s, %s, %s, %s, %s, %s)''',
+                   (fid, po_number, item_name, weight, int(ordered_qty), barcode, company, rate, po_date or None, delivery_date or None, tax_percent,
+                    pvid or None, pack_size or None, cost_location or None))
     log_audit(cursor, 'Product Updated', 'Manage POs', po_number, f'Added {item_name} ({ordered_qty}) to PO {po_number} (Draft)')
     conn.commit()
     conn.close()
@@ -4299,6 +4772,25 @@ CSV_HEADER_MAP = {
     'po_date': ['po_date', 'po date', 'order date', 'order_date', 'date'],
     'delivery_date': ['delivery_date', 'delivery date', 'due date', 'due_date', 'expected delivery'],
     'tax_percent': ['tax_percent', 'tax', 'gst', 'tax %', 'gst %', 'gst_percent'],
+    # PO Cost Variance Control (Part 3): optional matching-key columns in a PO import sheet.
+    'pvid': ['pvid', 'pvid_code', 'sku_code', 'product_id', 'item_code'],
+    'pack_size': ['pack_size', 'packing_size', 'pack', 'size'],
+    'cost_location': ['location', 'plant', 'branch', 'warehouse', 'city', 'cost_location'],
+}
+
+# PO Cost Variance Control — Part 2: bulk Approved Cost Sheet aliases. Kept SEPARATE from
+# CSV_HEADER_MAP above (not merged) because 'cost'/'rate' mean different things in a PO sheet
+# (item price) vs a cost-master sheet (approved unit rate) — merging would create ambiguous alias
+# collisions. _map_csv_headers() itself is unchanged/reused; only the alias dictionary differs.
+COST_MASTER_HEADER_MAP = {
+    'pvid': ['pvid', 'pvid_code', 'sku', 'sku_code', 'product_id', 'item_code'],
+    'product_name': ['product_name', 'item_name', 'description', 'product'],
+    'pack_size': ['pack_size', 'packing_size', 'pack', 'size', 'weight'],
+    'location': ['location', 'plant', 'branch', 'warehouse', 'city'],
+    'approved_rate': ['approved_rate', 'approved_cost', 'unit_rate', 'unit_cost', 'erp_rate', 'cost'],
+    'company': ['company', 'client', 'customer'],
+    'effective_date': ['effective_date', 'effective date'],
+    'remarks': ['remarks', 'source', 'notes'],
 }
 
 WEIGHT_PATTERN = re.compile(r'\(?(\d+(?:\.\d+)?)\s*(kg|kgs|gm|gms|g|ml|ltr|l)\)?(?:\s|$)', re.IGNORECASE)
@@ -4311,10 +4803,13 @@ def _extract_weight(text):
     amount, unit = matches[-1]
     return f"{amount}{unit.lower()}"
 
-def _map_csv_headers(fieldnames):
+def _map_csv_headers(fieldnames, alias_map=None):
+    """Generic — REUSED as-is for both PO import (default CSV_HEADER_MAP) and the new bulk Approved
+    Cost Sheet import (COST_MASTER_HEADER_MAP passed explicitly). No behavior change for any
+    existing caller that doesn't pass alias_map."""
     normalized = {f.strip().lower(): f for f in fieldnames if f}
     resolved = {}
-    for key, aliases in CSV_HEADER_MAP.items():
+    for key, aliases in (alias_map or CSV_HEADER_MAP).items():
         for alias in aliases:
             if alias in normalized:
                 resolved[key] = normalized[alias]
@@ -4454,6 +4949,9 @@ def pos_ai_import_commit(staging_id):
     qtys = request.form.getlist('ordered_qty')
     rates = request.form.getlist('rate')
     barcodes = request.form.getlist('barcode')
+    pvids = request.form.getlist('pvid')
+    pack_sizes = request.form.getlist('pack_size')
+    cost_locations = request.form.getlist('cost_location')
     includes = request.form.getlist('include')  # indices of rows the user kept checked
 
     if not po_number or not item_names:
@@ -4476,9 +4974,13 @@ def pos_ai_import_commit(staging_id):
         weight = weights[i].strip() if i < len(weights) else ''
         rate = float(rates[i]) if i < len(rates) and rates[i].strip() else None
         barcode = barcodes[i].strip() if i < len(barcodes) else ''
-        cursor.execute('''INSERT INTO po_items (factory_id, po_number, item_name, weight, ordered_qty, barcode, company, rate, status, po_date, delivery_date, tax_percent)
-                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'Draft',%s,%s,%s)''',
-                       (fid, po_number, item_name, weight, ordered_qty, barcode, company, rate, po_date, delivery_date, tax_percent))
+        pvid = pvids[i].strip() if i < len(pvids) else ''
+        pack_size = pack_sizes[i].strip() if i < len(pack_sizes) else ''
+        cost_location = cost_locations[i].strip() if i < len(cost_locations) else ''
+        cursor.execute('''INSERT INTO po_items (factory_id, po_number, item_name, weight, ordered_qty, barcode, company, rate, status, po_date, delivery_date, tax_percent, pvid, pack_size, cost_location)
+                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'Draft',%s,%s,%s,%s,%s,%s)''',
+                       (fid, po_number, item_name, weight, ordered_qty, barcode, company, rate, po_date, delivery_date, tax_percent,
+                        pvid or None, pack_size or None, cost_location or None))
         inserted += 1
 
     cursor.execute("UPDATE ai_import_staging SET status = 'committed' WHERE id = %s", (staging_id,))
@@ -4559,9 +5061,13 @@ def pos_import_csv():
                 tax_percent = float(tax_raw)
             except ValueError:
                 tax_percent = None
-        cursor.execute('''INSERT INTO po_items (factory_id, po_number, item_name, weight, ordered_qty, barcode, company, rate, status, po_date, delivery_date, tax_percent)
-                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'Draft', %s, %s, %s)''',
-                       (fid, po_number, item_name, weight, ordered_qty, barcode, company, rate, po_date or None, delivery_date or None, tax_percent))
+        pvid = (row.get(colmap['pvid']) or '').strip() if 'pvid' in colmap else ''
+        pack_size = (row.get(colmap['pack_size']) or '').strip() if 'pack_size' in colmap else ''
+        cost_location = (row.get(colmap['cost_location']) or '').strip() if 'cost_location' in colmap else ''
+        cursor.execute('''INSERT INTO po_items (factory_id, po_number, item_name, weight, ordered_qty, barcode, company, rate, status, po_date, delivery_date, tax_percent, pvid, pack_size, cost_location)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'Draft', %s, %s, %s, %s, %s, %s)''',
+                       (fid, po_number, item_name, weight, ordered_qty, barcode, company, rate, po_date or None, delivery_date or None, tax_percent,
+                        pvid or None, pack_size or None, cost_location or None))
         inserted += 1
     conn.commit()
     conn.close()
@@ -4599,13 +5105,13 @@ def cost_variation_preview_email(item_id):
         return redirect(f'/cost_variation/{item_id}/send_revised_po_email')
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute('SELECT po_number, item_name, company, ordered_qty, rate FROM po_items WHERE id = %s AND factory_id = %s', (item_id, fid))
+    cursor.execute('SELECT po_number, item_name, company, ordered_qty, rate, pvid, pack_size, cost_location FROM po_items WHERE id = %s AND factory_id = %s', (item_id, fid))
     row = cursor.fetchone()
     if not row:
         conn.close()
         return redirect('/pos')
-    po_number, item_name, po_company, qty, po_rate = row
-    cv = get_cost_variation(cursor, fid, po_company, item_name, po_rate, qty)
+    po_number, item_name, po_company, qty, po_rate, pvid, pack_size, cost_location = row
+    cv = evaluate_po_item_cost(cursor, fid, po_company, item_name, pvid, pack_size, cost_location, po_rate, qty)
     cursor.execute('SELECT to_email, cc_email FROM email_contacts WHERE factory_id = %s AND company_name = %s AND is_active = TRUE', (fid, selected_company))
     contact = cursor.fetchone()
     conn.close()
@@ -4617,7 +5123,8 @@ def cost_variation_preview_email(item_id):
             f"During review of the following Purchase Order, we found a cost variation above our approved limit:\n\n"
             f"PO Number: {po_number}\n"
             f"Item: {item_name}\n"
-            f"Quantity: {qty}\n"
+            + (f"PVID: {pvid}\nPack Size: {pack_size}\nLocation: {cost_location}\n" if (pvid and pack_size and cost_location) else "")
+            + f"Quantity: {qty}\n"
             f"PO Rate: ₹{po_rate}\n"
             f"Applicable Approved Cost: ₹{cv['approved_rate']}\n"
             f"Total Variance: ₹{cv['variance']:.2f}\n"
@@ -4654,6 +5161,18 @@ def cost_variation_send_email(item_id):
         return redirect('/pos?ok=1&msg=' + quote('Revised PO email sent successfully.'))
     return redirect('/pos?ok=0&msg=' + quote(result))
 
+def evaluate_po_item_cost(cursor, fid, company, item_name, pvid, pack_size, cost_location, po_rate, po_qty):
+    """Single shared entry point for 'which cost-match function applies to this PO line' — used by
+    BOTH pos_page() (Part 4, initial display) AND the revised-PO recalculation route (Part 8), so
+    the exact same PVID+Pack+Location-first / legacy-fallback logic is never duplicated/diverged."""
+    if pvid and pack_size and cost_location:
+        return get_cost_match(cursor, fid, company, pvid, pack_size, cost_location, po_rate, po_qty)
+    result = get_cost_variation(cursor, fid, company, item_name, po_rate, po_qty)
+    if result['status'] == 'none':
+        return {'status': 'unmatched', 'variance': None, 'approved_rate': None,
+                'label': 'Approved Cost Not Matched — PVID / Pack Size / Location required'}
+    return result
+
 @app.route('/cost_variation/<int:item_id>/upload_revised_po', methods=['GET', 'POST'])
 def cost_variation_upload_revised_po(item_id):
     """P4: uploads a revised PO document, NEVER touching/overwriting the original po_items row.
@@ -4662,16 +5181,16 @@ def cost_variation_upload_revised_po(item_id):
     fid = current_factory_id()
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute('SELECT po_number, item_name, company, ordered_qty, rate FROM po_items WHERE id = %s AND factory_id = %s', (item_id, fid))
+    cursor.execute('SELECT po_number, item_name, company, ordered_qty, rate, pvid, pack_size, cost_location FROM po_items WHERE id = %s AND factory_id = %s', (item_id, fid))
     row = cursor.fetchone()
     if not row:
         conn.close()
         return redirect('/pos')
-    po_number, item_name, company, orig_qty, orig_rate = row
+    po_number, item_name, company, orig_qty, orig_rate, pvid, pack_size, cost_location = row
     if request.method == 'GET':
         cursor.execute('SELECT MAX(version) FROM po_revisions WHERE po_item_id = %s AND factory_id = %s', (item_id, fid))
         last_version = cursor.fetchone()[0] or 0
-        cv_orig = get_cost_variation(cursor, fid, company, item_name, orig_rate, orig_qty)
+        cv_orig = evaluate_po_item_cost(cursor, fid, company, item_name, pvid, pack_size, cost_location, orig_rate, orig_qty)
         conn.close()
         return render_template_string(UPLOAD_REVISED_PO_HTML, item_id=item_id, po_number=po_number, item_name=item_name,
                                        next_version=last_version + 1, current_variance=cv_orig)
@@ -4690,12 +5209,12 @@ def cost_variation_upload_revised_po(item_id):
     new_version = last_version + 1
     # Previous variance = the LAST known variance (original PO's, or the prior revision's if this is V2+)
     if new_version == 1:
-        prev_variance = get_cost_variation(cursor, fid, company, item_name, orig_rate, orig_qty)['variance']
+        prev_variance = evaluate_po_item_cost(cursor, fid, company, item_name, pvid, pack_size, cost_location, orig_rate, orig_qty)['variance']
     else:
         cursor.execute('SELECT new_variance FROM po_revisions WHERE po_item_id = %s AND factory_id = %s AND version = %s', (item_id, fid, last_version))
         pv_row = cursor.fetchone()
         prev_variance = pv_row[0] if pv_row else None
-    new_cv = get_cost_variation(cursor, fid, company, item_name, revised_rate, revised_qty)
+    new_cv = evaluate_po_item_cost(cursor, fid, company, item_name, pvid, pack_size, cost_location, revised_rate, revised_qty)
     file_name, file_data = None, None
     if file_obj and file_obj.filename:
         file_name = file_obj.filename
