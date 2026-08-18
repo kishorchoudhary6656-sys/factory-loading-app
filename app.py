@@ -1,5 +1,8 @@
 from flask import Flask, render_template_string, request, redirect, session, Response, jsonify
-import os, csv, io, re, json, secrets, math, base64
+import os, csv, io, re, json, secrets, math, base64, smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.application import MIMEApplication
 import requests
 import psycopg2
 from datetime import datetime, timezone, timedelta
@@ -76,6 +79,12 @@ def init_db():
         subscription_status TEXT DEFAULT 'Active', plan_start_date TEXT, plan_end_date TEXT,
         created_at TEXT, updated_at TEXT, created_by TEXT
     )''')
+    # P9/X: fixed, tenant-configured Factory Loading Location — settable only by a Factory Admin
+    # (via /settings/loading_location below), shown read-only at Start Loading so normal users can't
+    # freely change it. Additive/nullable — existing factories simply show "not set yet" until configured.
+    cursor.execute('ALTER TABLE factories ADD COLUMN IF NOT EXISTS loading_location_name TEXT')
+    cursor.execute('ALTER TABLE factories ADD COLUMN IF NOT EXISTS loading_location_lat DOUBLE PRECISION')
+    cursor.execute('ALTER TABLE factories ADD COLUMN IF NOT EXISTS loading_location_lng DOUBLE PRECISION')
     cursor.execute('''CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
         factory_id INTEGER REFERENCES factories(id),
@@ -162,6 +171,28 @@ def init_db():
         qc_name TEXT, qc_photo TEXT,
         prod_date TEXT, prod_time TEXT, created_at TEXT
     )''')
+    # P7: worker who submitted the entry, and QC's own re-verified field values (may differ from
+    # what the worker originally logged) plus mandatory rejection reason. All additive/nullable —
+    # existing historical rows are untouched.
+    cursor.execute('ALTER TABLE daily_production ADD COLUMN IF NOT EXISTS worker_name TEXT')
+    cursor.execute('ALTER TABLE daily_production ADD COLUMN IF NOT EXISTS verified_quantity INTEGER')
+    cursor.execute('ALTER TABLE daily_production ADD COLUMN IF NOT EXISTS verified_barcode TEXT')
+    cursor.execute('ALTER TABLE daily_production ADD COLUMN IF NOT EXISTS verified_packing_date TEXT')
+    cursor.execute('ALTER TABLE daily_production ADD COLUMN IF NOT EXISTS verified_use_by_date TEXT')
+    cursor.execute('ALTER TABLE daily_production ADD COLUMN IF NOT EXISTS verified_batch_number TEXT')
+    cursor.execute('ALTER TABLE daily_production ADD COLUMN IF NOT EXISTS rejection_reason TEXT')
+    # P7/Q: append-only QC history — every submit/verify/reject/resubmit event, tenant-scoped, never overwritten.
+    cursor.execute('''CREATE TABLE IF NOT EXISTS qc_history (
+        id SERIAL PRIMARY KEY,
+        factory_id INTEGER,
+        production_id INTEGER,
+        event_type TEXT,
+        quantity INTEGER, barcode TEXT, packing_date TEXT, use_by_date TEXT, batch_number TEXT,
+        qc_name TEXT, verdict TEXT, reason TEXT,
+        performed_by TEXT, performed_at TEXT
+    )''')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_qc_history_production ON qc_history(production_id)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_qc_history_factory ON qc_history(factory_id)')
     # --- Vehicle Master + Trip/Loading Sessions + Live GPS Tracking ---
     # Vehicle Master = permanent vehicle record (always exists, independent of any loading).
     # Trip = one particular loading/dispatch operation for that vehicle (a vehicle can have many trips over time).
@@ -192,6 +223,13 @@ def init_db():
     # (never silently reinterpreted as 'Outside Vehicle').
     cursor.execute("ALTER TABLE vehicle_master ADD COLUMN IF NOT EXISTS vehicle_type TEXT DEFAULT 'Company Vehicle'")
     cursor.execute("UPDATE vehicle_master SET vehicle_type = 'Company Vehicle' WHERE vehicle_type IS NULL")
+    # P8/R/S: persistent driver info directly on the vehicle (distinct from per-trip driver_name/
+    # driver_mobile on `trips`, which stays as-is for trip-specific history) — this is the vehicle's
+    # OWN current/default driver, editable at any time. Driver Photo is enforced as required for
+    # Company Vehicles specifically (never for Outside Vehicles) at the route level, not here.
+    cursor.execute('ALTER TABLE vehicle_master ADD COLUMN IF NOT EXISTS driver_name TEXT')
+    cursor.execute('ALTER TABLE vehicle_master ADD COLUMN IF NOT EXISTS driver_mobile TEXT')
+    cursor.execute('ALTER TABLE vehicle_master ADD COLUMN IF NOT EXISTS driver_photo TEXT')
     cursor.execute('''CREATE TABLE IF NOT EXISTS trips (
         id SERIAL PRIMARY KEY,
         factory_id INTEGER,
@@ -226,6 +264,43 @@ def init_db():
     cursor.execute('ALTER TABLE location_history ADD COLUMN IF NOT EXISTS is_suspicious BOOLEAN DEFAULT FALSE')
     cursor.execute('ALTER TABLE location_history ADD COLUMN IF NOT EXISTS anomaly_reason TEXT')
     cursor.execute('ALTER TABLE location_history ADD COLUMN IF NOT EXISTS calculated_speed_kmph DOUBLE PRECISION')
+
+    # --- Retention/Cleanup (confirmed audit): location_history is the ONLY table classified as safe
+    # ROUTINE history — every other table (audit_log, qc_history, dispatch_log, po_revisions,
+    # email_log, driver_followups, temp_access_grants, all master data) is BUSINESS/SECURITY/
+    # COMPLIANCE per the confirmed retention matrix and is NEVER touched by this cleanup.
+    # archived_location_history preserves original_id + factory_id + all original fields, so nothing
+    # is ever truly lost — only moved out of the hot table. archived_at + a UNIQUE constraint on
+    # original_id make re-running cleanup idempotent (a row already archived is never re-archived
+    # or double-counted).
+    cursor.execute('''CREATE TABLE IF NOT EXISTS archived_location_history (
+        id SERIAL PRIMARY KEY,
+        original_id INTEGER UNIQUE,
+        factory_id INTEGER,
+        vehicle_id INTEGER, trip_id INTEGER,
+        latitude DOUBLE PRECISION, longitude DOUBLE PRECISION, accuracy DOUBLE PRECISION,
+        recorded_at TEXT, is_suspicious BOOLEAN, anomaly_reason TEXT, calculated_speed_kmph DOUBLE PRECISION,
+        archived_at TEXT
+    )''')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_archived_lh_factory ON archived_location_history(factory_id)')
+    # Cleanup execution log — one summary row per run, never one row per deleted GPS ping (spec 10:
+    # "do not flood the normal business Audit Log with one entry per deleted routine record").
+    cursor.execute('''CREATE TABLE IF NOT EXISTS cleanup_runs (
+        id SERIAL PRIMARY KEY,
+        run_id TEXT UNIQUE,
+        started_at TEXT, finished_at TEXT,
+        mode TEXT, factory_id INTEGER,
+        table_name TEXT,
+        examined INTEGER, archived INTEGER, deleted INTEGER, protected INTEGER, skipped INTEGER,
+        errors TEXT, duration_seconds DOUBLE PRECISION,
+        triggered_by TEXT
+    )''')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_cleanup_runs_factory ON cleanup_runs(factory_id)')
+    # Indexes justified by the actual cleanup query pattern: filter by (factory_id, recorded_at) and
+    # join against trips.trip_status — location_history(trip_id) and trips(id) are already indexed
+    # from earlier phases, so only this composite is newly needed.
+    # (idx_location_history_factory_recorded index moved below, after the factory_id backfill loop —
+    # an old pre-multi-tenant schema doesn't have factory_id on location_history until that backfill runs)
 
     # --- Multi-tenant column backfill for tables that may already exist from before this upgrade ---
     for tbl in ['po_items', 'dispatch_log', 'companies', 'quality_checkers', 'barcode_catalog',
@@ -465,6 +540,61 @@ def init_db():
         received_qty INTEGER,
         created_at TEXT, created_by TEXT
     )''')
+
+    # --- P1: Multi-tenant SMTP email architecture. Additive. Password stored ENCRYPTED at rest
+    # (Fernet, key from EMAIL_CRYPT_KEY env var — never hardcoded, never logged). Provider-agnostic:
+    # any SMTP host/port works (Gmail, Office365, SendGrid-SMTP, AWS SES-SMTP, Postmark-SMTP, etc.),
+    # so the provider can change later without any code change — only the tenant's config values.
+    cursor.execute('''CREATE TABLE IF NOT EXISTS email_config (
+        id SERIAL PRIMARY KEY,
+        factory_id INTEGER UNIQUE,
+        smtp_host TEXT, smtp_port INTEGER, smtp_username TEXT,
+        smtp_password_encrypted TEXT,
+        from_email TEXT, from_name TEXT,
+        use_tls BOOLEAN DEFAULT TRUE,
+        is_configured BOOLEAN DEFAULT FALSE,
+        updated_at TEXT, updated_by TEXT
+    )''')
+    # Company Email Master (P1/C) — tenant-scoped To/CC contacts so users never re-type them.
+    cursor.execute('''CREATE TABLE IF NOT EXISTS email_contacts (
+        id SERIAL PRIMARY KEY,
+        factory_id INTEGER,
+        company_name TEXT, to_email TEXT, cc_email TEXT,
+        contact_person TEXT, is_active BOOLEAN DEFAULT TRUE,
+        created_at TEXT
+    )''')
+    cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS uq_email_contacts_factory_company ON email_contacts(factory_id, company_name)')
+    # Email Delivery History (P1/D + AN) — every send attempt (test or revised-PO), success or failure.
+    cursor.execute('''CREATE TABLE IF NOT EXISTS email_log (
+        id SERIAL PRIMARY KEY,
+        factory_id INTEGER,
+        email_type TEXT,
+        po_number TEXT, to_email TEXT, cc_email TEXT, subject TEXT, body TEXT,
+        sent_by TEXT, sent_at TEXT,
+        status TEXT, message_id TEXT, failure_reason TEXT
+    )''')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_email_log_factory ON email_log(factory_id)')
+
+    # --- P4/P5: Revised PO versioning + cost-variation decision history. Additive. Never touches
+    # po_items (the ORIGINAL PO row) — every revision is its own new row, linked back by po_item_id,
+    # so the original PO is never overwritten or deleted, satisfying the "never overwrite" rule.
+    cursor.execute('''CREATE TABLE IF NOT EXISTS po_revisions (
+        id SERIAL PRIMARY KEY,
+        factory_id INTEGER,
+        po_item_id INTEGER,
+        version INTEGER,
+        revised_rate DOUBLE PRECISION, revised_qty INTEGER,
+        previous_rate DOUBLE PRECISION, previous_variance DOUBLE PRECISION,
+        new_variance DOUBLE PRECISION, variance_status TEXT,
+        revision_reason TEXT,
+        file_name TEXT, file_data TEXT,
+        uploaded_by TEXT, uploaded_at TEXT,
+        email_log_id INTEGER,
+        final_decision TEXT, decided_by TEXT, decided_at TEXT
+    )''')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_po_revisions_factory ON po_revisions(factory_id)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_po_revisions_po_item ON po_revisions(po_item_id)')
+
     for col, ddl in [('plan', "TEXT DEFAULT 'Free'"), ('user_limit', 'INTEGER DEFAULT 5'), ('vehicle_limit', 'INTEGER DEFAULT 10'),
                       ('subscription_status', "TEXT DEFAULT 'Active'"), ('plan_start_date', 'TEXT'), ('plan_end_date', 'TEXT')]:
         cursor.execute(f'ALTER TABLE factories ADD COLUMN IF NOT EXISTS {col} {ddl}')
@@ -496,6 +626,7 @@ def init_db():
         'CREATE INDEX IF NOT EXISTS idx_temp_access_grants_factory_active ON temp_access_grants(factory_id, is_active)',
         'CREATE INDEX IF NOT EXISTS idx_users_factory ON users(factory_id)',
         'CREATE INDEX IF NOT EXISTS idx_companies_factory ON companies(factory_id)',
+        'CREATE INDEX IF NOT EXISTS idx_location_history_factory_recorded ON location_history(factory_id, recorded_at)',
     ]:
         cursor.execute(idx_sql)
 
@@ -593,50 +724,117 @@ def get_rate_status(cursor, fid, company, item_name, po_rate):
         return {'status': 'match', 'label': 'Rate Matched', 'approved_rate': approved_rate, 'diff': 0, 'diff_pct': 0}
     return {'status': 'diff', 'label': 'Rate Difference', 'approved_rate': approved_rate, 'diff': diff, 'diff_pct': diff_pct}
 
-def get_po_shortage_map(cursor, fid, company=None, po_number=None):
-    """Computes ordered/received/pending quantity per (company, po_number, item_name), by summing
-    po_items.ordered_qty and grn_log.received_qty. Returns {(company, po_number, item_name): dict}.
-    Optionally scoped to a single company/po_number for efficiency."""
-    where = 'factory_id = %s'
-    params = [fid]
-    if company:
-        where += ' AND company = %s'
-        params.append(company)
-    if po_number:
-        where += ' AND po_number = %s'
-        params.append(po_number)
-    cursor.execute(f'SELECT company, po_number, item_name, SUM(ordered_qty) FROM po_items WHERE {where} GROUP BY company, po_number, item_name', params)
-    ordered_map = {(r[0] or '', r[1], r[2]): (r[3] or 0) for r in cursor.fetchall()}
-    cursor.execute(f'SELECT company, po_number, item_name, SUM(received_qty) FROM grn_log WHERE {where} GROUP BY company, po_number, item_name', params)
-    received_map = {(r[0] or '', r[1], r[2]): (r[3] or 0) for r in cursor.fetchall()}
-    result = {}
-    for key, ordered in ordered_map.items():
-        received = received_map.get(key, 0)
-        pending = max(ordered - received, 0)
-        result[key] = {'ordered': ordered, 'received': received, 'pending': pending, 'fulfilled': pending <= 0}
-    return result
+# P2: Cost Variation threshold — ₹1,000 inclusive counts as GREEN, per exact confirmed spec.
+COST_VARIATION_THRESHOLD = float(os.environ.get('COST_VARIATION_THRESHOLD', '1000'))
 
-def check_grn_capacity(cursor, fid, company, po_number, item_name, new_qty):
-    """I1: server-side, race-condition-safe over-receiving protection. MUST be called on the same
-    cursor/connection as the subsequent GRN INSERT, inside the same transaction (i.e. before that
-    connection's commit()) — the SELECT ... FOR UPDATE below locks the matching po_items rows until
-    that commit, so two concurrent GRN requests against the same PO/item are forced to process
-    sequentially rather than both reading a stale 'pending' value and both succeeding.
-    Returns (ok, error_message_or_None, pending_before_this_receipt)."""
-    cursor.execute('''SELECT COALESCE(SUM(ordered_qty), 0) FROM po_items
-                       WHERE factory_id = %s AND company = %s AND po_number = %s AND item_name = %s FOR UPDATE''',
-                   (fid, company, po_number, item_name))
-    ordered = cursor.fetchone()[0] or 0
-    if ordered <= 0:
-        return False, f'No matching PO item found for {company} / {po_number} / {item_name} — cannot receive against a PO that does not have this line item.', 0
-    cursor.execute('''SELECT COALESCE(SUM(received_qty), 0) FROM grn_log
-                       WHERE factory_id = %s AND company = %s AND po_number = %s AND item_name = %s''',
-                   (fid, company, po_number, item_name))
-    already_received = cursor.fetchone()[0] or 0
-    pending = max(ordered - already_received, 0)
-    if new_qty > pending:
-        return False, f'Cannot receive {new_qty} — only {pending} is pending against PO {po_number} for {item_name} (ordered: {ordered}, already received: {already_received}).', pending
-    return True, None, pending
+def get_cost_variation(cursor, fid, company, item_name, po_rate, po_qty):
+    """P2: Cost Variation = ABS(PO Unit Rate - Applicable Approved Cost) x PO Quantity.
+    GREEN if <= COST_VARIATION_THRESHOLD (inclusive), RED if strictly greater. Reuses the SAME
+    rate_master lookup as get_rate_status() above (does not duplicate/replace it — that function
+    is still used for the existing per-unit rate-difference display; this one is the new
+    total-rupee-variance calculation P2 specifically requires)."""
+    cursor.execute('SELECT approved_rate FROM rate_master WHERE factory_id = %s AND company = %s AND product_name = %s',
+                   (fid, company or '', item_name or ''))
+    row = cursor.fetchone()
+    approved_rate = row[0] if row else None
+    if approved_rate is None or po_rate is None or po_qty is None:
+        return {'status': 'none', 'variance': None, 'approved_rate': approved_rate}
+    variance = round(abs(po_rate - approved_rate) * po_qty, 2)
+    status = 'GREEN' if variance <= COST_VARIATION_THRESHOLD else 'RED'
+    return {'status': status, 'variance': variance, 'approved_rate': approved_rate}
+
+
+# ===========================================================================
+# P1: MULTI-TENANT SMTP EMAIL ARCHITECTURE
+# ===========================================================================
+# EMAIL_CRYPT_KEY: a Fernet key (44-char urlsafe-base64 string) used ONLY to encrypt/decrypt each
+# tenant's own SMTP password at rest in the database — never a global email credential itself.
+# Generate one with: python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+# Missing this env var disables SAVING/SENDING (graceful, same pattern as ANTHROPIC_API_KEY/EXOTEL_*)
+# — it never crashes the app at boot.
+from cryptography.fernet import Fernet, InvalidToken
+
+def _email_cipher():
+    key = os.environ.get('EMAIL_CRYPT_KEY')
+    if not key:
+        return None
+    try:
+        return Fernet(key.encode())
+    except Exception:
+        return None
+
+def encrypt_smtp_password(plain_password):
+    cipher = _email_cipher()
+    if not cipher or not plain_password:
+        return None
+    return cipher.encrypt(plain_password.encode()).decode()
+
+def decrypt_smtp_password(encrypted_password):
+    cipher = _email_cipher()
+    if not cipher or not encrypted_password:
+        return None
+    try:
+        return cipher.decrypt(encrypted_password.encode()).decode()
+    except (InvalidToken, Exception):
+        return None
+
+def get_email_config(cursor, fid):
+    cursor.execute('''SELECT smtp_host, smtp_port, smtp_username, smtp_password_encrypted, from_email,
+                       from_name, use_tls, is_configured FROM email_config WHERE factory_id = %s''', (fid,))
+    row = cursor.fetchone()
+    if not row:
+        return None
+    return {'smtp_host': row[0], 'smtp_port': row[1], 'smtp_username': row[2], 'smtp_password_encrypted': row[3],
+            'from_email': row[4], 'from_name': row[5], 'use_tls': row[6], 'is_configured': row[7]}
+
+def send_tenant_email(cursor, fid, to_email, cc_email, subject, body, sent_by, po_number='', email_type='revised_po', attachment=None):
+    """P1/P3: sends via the CURRENT tenant's own configured SMTP server only — never a shared/global
+    sender, never any other tenant's credentials. Always writes an email_log row (success or
+    failure) before returning, so delivery history is complete either way. Returns (ok, message)."""
+    cfg = get_email_config(cursor, fid)
+    ts = now_ist().isoformat()
+    if not cfg or not cfg['is_configured']:
+        cursor.execute('''INSERT INTO email_log (factory_id, email_type, po_number, to_email, cc_email, subject, body,
+                           sent_by, sent_at, status, failure_reason) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'failed',%s)''',
+                       (fid, email_type, po_number, to_email, cc_email, subject, body, sent_by, ts, 'Email is not configured for this company yet.'))
+        return False, 'Email is not configured for this company yet. Go to Email Configuration first.'
+    password = decrypt_smtp_password(cfg['smtp_password_encrypted'])
+    if password is None:
+        cursor.execute('''INSERT INTO email_log (factory_id, email_type, po_number, to_email, cc_email, subject, body,
+                           sent_by, sent_at, status, failure_reason) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'failed',%s)''',
+                       (fid, email_type, po_number, to_email, cc_email, subject, body, sent_by, ts, 'Could not decrypt stored SMTP credentials — EMAIL_CRYPT_KEY may be missing/changed.'))
+        return False, 'Could not decrypt stored SMTP credentials — contact your administrator.'
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = f"{cfg['from_name']} <{cfg['from_email']}>" if cfg['from_name'] else cfg['from_email']
+        msg['To'] = to_email
+        if cc_email:
+            msg['Cc'] = cc_email
+        msg['Subject'] = subject
+        msg.attach(MIMEText(body, 'plain'))
+        if attachment:
+            part = MIMEApplication(attachment['data'], Name=attachment['filename'])
+            part['Content-Disposition'] = f'attachment; filename="{attachment["filename"]}"'
+            msg.attach(part)
+        recipients = [to_email] + ([cc_email] if cc_email else [])
+        server = smtplib.SMTP(cfg['smtp_host'], cfg['smtp_port'], timeout=20)
+        if cfg['use_tls']:
+            server.starttls()
+        server.login(cfg['smtp_username'], password)
+        server.sendmail(cfg['from_email'], recipients, msg.as_string())
+        server.quit()
+        cursor.execute('''INSERT INTO email_log (factory_id, email_type, po_number, to_email, cc_email, subject, body,
+                           sent_by, sent_at, status) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'sent') RETURNING id''',
+                       (fid, email_type, po_number, to_email, cc_email, subject, body, sent_by, ts))
+        log_id = cursor.fetchone()[0]
+        return True, log_id
+    except Exception as e:
+        # Never log the SMTP password itself — only the exception's own message (which smtplib
+        # never includes credentials in for standard auth/connection failures).
+        cursor.execute('''INSERT INTO email_log (factory_id, email_type, po_number, to_email, cc_email, subject, body,
+                           sent_by, sent_at, status, failure_reason) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'failed',%s)''',
+                       (fid, email_type, po_number, to_email, cc_email, subject, body, sent_by, ts, str(type(e).__name__) + ': ' + str(e)[:200]))
+        return False, f'Email send failed: {type(e).__name__}'
 
 def call_ai_extraction(file_bytes, mimetype, doc_type):
     """Calls the Anthropic API (vision/document understanding) to extract structured PO or GRN
@@ -774,7 +972,7 @@ def enforce_viewer_readonly():
 # Endpoints that legitimately receive POST requests without any ERP login/session — CSRF's
 # synchronizer-token pattern doesn't apply to them (no session cookie exists to protect).
 # track_ping: public driver-facing GPS endpoint, secured instead by its own unguessable token (handled separately).
-CSRF_EXEMPT_ENDPOINTS = {'track_ping', 'exotel_callback', 'n1_process_due_endpoint'}
+CSRF_EXEMPT_ENDPOINTS = {'track_ping', 'exotel_callback', 'n1_process_due_endpoint', 'cleanup_run_endpoint'}
 
 @app.before_request
 def enforce_csrf_protection():
@@ -795,9 +993,9 @@ ROUTE_MODULE_MAP = {
     'pos_page': 'PO', 'pos_add': 'PO', 'pos_edit_item': 'PO', 'pos_delete': 'PO', 'pos_delete_po': 'PO',
     'pos_approve_po': 'PO', 'pos_reopen_po': 'PO', 'pos_import_csv': 'PO',
     'pos_ai_import': 'PO', 'pos_ai_import_review': 'PO', 'pos_ai_import_commit': 'PO', 'pos_ai_import_discard': 'PO',
-    # GRN
-    'grn_page': 'GRN', 'grn_add': 'GRN', 'grn_delete': 'GRN', 'grn_import_csv': 'GRN',
-    'grn_ai_import': 'GRN', 'grn_ai_import_review': 'GRN', 'grn_ai_import_commit': 'GRN', 'grn_ai_import_discard': 'GRN',
+    'cost_variation_select_company': 'Rate Master', 'cost_variation_preview_email': 'Rate Master',
+    'cost_variation_send_email': 'Rate Master', 'cost_variation_upload_revised_po': 'Rate Master',
+    'cost_variation_decision': 'Rate Master', 'cost_variation_history': 'Rate Master',
     # Production (the shared /production page and its barcode-lookup helper also serve the QC and
     # Barcode tabs, so either of those grants is enough to view it — see 'production_page' below)
     'production_add': 'Production', 'production_edit': 'Production', 'production_delete': 'Production',
@@ -805,10 +1003,13 @@ ROUTE_MODULE_MAP = {
     'production_lookup_barcode': ('Production', 'Barcode'),
     # QC
     'production_qc_add': 'QC', 'production_qc_inspect': 'QC', 'production_qc_availability': 'QC', 'production_qc_delete': 'QC',
+    'production_resubmit': 'Production',
     # Barcode
     'barcode_catalog_add': 'Barcode', 'barcode_catalog_delete': 'Barcode', 'barcode_catalog_import': 'Barcode',
     # Vehicle (vehicle master, loading, trip lifecycle incl. dispatch/deliver status + tracking controls)
     'vehicles_page': 'Vehicle', 'vehicles_add': 'Vehicle', 'vehicles_start_loading': 'Vehicle', 'vehicle_master_detail': 'Vehicle',
+    'vehicles_dc_dashboard': 'Vehicle', 'vehicles_loading_dashboard': 'Vehicle',
+    'factory_loading_location_page': 'Vehicle', 'retention_dry_run_page': 'Vehicle',
     'vehicles_edit': 'Vehicle', 'vehicles_delete': 'Vehicle',
     'trip_detail': 'Vehicle', 'trip_add_po': 'Vehicle', 'trip_remove_po': 'Vehicle', 'trip_po_status': 'Vehicle',
     'trip_set_active_po': 'Vehicle', 'trip_regen_token': 'Vehicle', 'trip_stop_tracking': 'Vehicle', 'trip_resend_link': 'Vehicle',
@@ -827,11 +1028,14 @@ ROUTE_MODULE_MAP = {
     'start_session': 'Dispatch', 'lookup_barcode': 'Dispatch', 'process_scan': 'Dispatch',
     'dispatch_edit': 'Dispatch', 'dispatch_delete': 'Dispatch', 'history_page': 'Dispatch',
     'export_csv': 'Dispatch', 'export_progress_csv': 'Dispatch',
+    # Email (P1)
+    'email_config_page': 'Email', 'email_config_test': 'Email', 'email_contacts_page': 'Email',
+    'email_contacts_add': 'Email', 'email_contacts_delete': 'Email', 'email_history_page': 'Email',
 }
-ALL_MODULE_NAMES = ['PO', 'GRN', 'Production', 'QC', 'Barcode', 'Vehicle', 'Rate Master', 'Users',
-                     'Dashboard/Reports', 'Audit', 'Companies', 'Dispatch']
+ALL_MODULE_NAMES = ['PO', 'Production', 'QC', 'Barcode', 'Vehicle', 'Rate Master', 'Users',
+                     'Dashboard/Reports', 'Audit', 'Companies', 'Dispatch', 'Email']
 # Account-level/public endpoints this gate never touches at all (same spirit as the CSRF exemptions above).
-MODULE_GATE_EXEMPT_ENDPOINTS = {'login', 'register', 'logout', 'change_password', 'track_page', 'track_ping', 'exotel_callback', 'n1_process_due_endpoint'}
+MODULE_GATE_EXEMPT_ENDPOINTS = {'login', 'register', 'logout', 'change_password', 'track_page', 'track_ping', 'exotel_callback', 'n1_process_due_endpoint', 'cleanup_run_endpoint'}
 
 @app.before_request
 def enforce_module_access():
@@ -869,18 +1073,21 @@ ROUTE_ACTION_MAP = {
     'pos_page': 'view', 'pos_add': 'create', 'pos_edit_item': 'edit', 'pos_delete': 'delete', 'pos_delete_po': 'delete',
     'pos_approve_po': 'approve', 'pos_reopen_po': 'manage', 'pos_import_csv': 'import',
     'pos_ai_import': 'import', 'pos_ai_import_review': 'view', 'pos_ai_import_commit': 'import', 'pos_ai_import_discard': 'delete',
-    # GRN
-    'grn_page': 'view', 'grn_add': 'create', 'grn_delete': 'delete', 'grn_import_csv': 'import',
-    'grn_ai_import': 'import', 'grn_ai_import_review': 'view', 'grn_ai_import_commit': 'import', 'grn_ai_import_discard': 'delete',
+    'cost_variation_select_company': 'view', 'cost_variation_preview_email': 'view',
+    'cost_variation_send_email': 'manage', 'cost_variation_upload_revised_po': 'manage',
+    'cost_variation_decision': 'manage', 'cost_variation_history': 'view',
     # Production
     'production_add': 'create', 'production_edit': 'edit', 'production_delete': 'delete',
     'production_page': 'view', 'production_lookup_barcode': 'view',
     # QC
     'production_qc_add': 'create', 'production_qc_inspect': 'approve', 'production_qc_availability': 'edit', 'production_qc_delete': 'delete',
+    'production_resubmit': 'edit',
     # Barcode
     'barcode_catalog_add': 'create', 'barcode_catalog_delete': 'delete', 'barcode_catalog_import': 'import',
     # Vehicle
     'vehicles_page': 'view', 'vehicles_add': 'create', 'vehicles_start_loading': 'create', 'vehicle_master_detail': 'view',
+    'vehicles_dc_dashboard': 'view', 'vehicles_loading_dashboard': 'view',
+    'factory_loading_location_page': 'manage', 'retention_dry_run_page': 'view',
     'vehicles_edit': 'edit', 'vehicles_delete': 'delete',
     'trip_detail': 'view', 'trip_add_po': 'edit', 'trip_remove_po': 'edit', 'trip_po_status': 'edit', 'trip_set_active_po': 'edit',
     'trip_regen_token': 'manage', 'trip_stop_tracking': 'manage', 'trip_resend_link': 'manage',
@@ -899,6 +1106,9 @@ ROUTE_ACTION_MAP = {
     'start_session': 'manage', 'lookup_barcode': 'view', 'process_scan': 'create',
     'dispatch_edit': 'edit', 'dispatch_delete': 'delete', 'history_page': 'view',
     'export_csv': 'view', 'export_progress_csv': 'view',
+    # Email (P1)
+    'email_config_page': 'manage', 'email_config_test': 'manage', 'email_contacts_page': 'view',
+    'email_contacts_add': 'create', 'email_contacts_delete': 'delete', 'email_history_page': 'view',
 }
 ALL_PERMISSION_ACTIONS = ['view', 'create', 'edit', 'delete', 'approve', 'import', 'manage']
 
@@ -915,7 +1125,7 @@ ROLE_PERMISSIONS_DEFAULT = {
     'Viewer': {m: (set() if m in ('Users', 'Audit') else {'view'}) for m in ALL_MODULE_NAMES},
 }
 # Endpoints this permission layer never touches — same spirit/set as C1's CSRF and D1's module gate exemptions.
-PERMISSION_GATE_EXEMPT_ENDPOINTS = {'login', 'register', 'logout', 'change_password', 'track_page', 'track_ping', 'exotel_callback', 'n1_process_due_endpoint'}
+PERMISSION_GATE_EXEMPT_ENDPOINTS = {'login', 'register', 'logout', 'change_password', 'track_page', 'track_ping', 'exotel_callback', 'n1_process_due_endpoint', 'cleanup_run_endpoint'}
 
 def has_permission(cursor, user_id, role, module, action):
     """Tier 2 (per-user override) takes precedence if a row exists; otherwise falls back to Tier 1
@@ -1415,10 +1625,10 @@ def nav_html(active):
         <a href="/companies" class="{cls('companies')}">Companies</a>
         <a href="/pos" class="{cls('pos')}">Manage POs</a>
         <a href="/rate_master" class="{cls('rate_master')}">Rate Master</a>
-        <a href="/grn" class="{cls('grn')}">GRN</a>
         <a href="/production" class="{cls('production')}">Daily Production</a>
         <a href="/vehicles" class="{cls('vehicles')}">Vehicles</a>
-        <a href="/history" class="{cls('history')}">History</a>"""
+        <a href="/history" class="{cls('history')}">History</a>
+        <a href="/email/config" class="{cls('email')}">Email</a>"""
     # Role-gated nav links are written as literal Jinja syntax (evaluated per-request when the page
     # renders), since nav_html() itself only runs once at import time and can't see the logged-in user.
     users_link = "\n        {% if session.get('role') == 'Factory Admin' %}<a href=\"/users\" class=\"" + cls('users') + "\">Users</a><a href=\"/audit\" class=\"" + cls('audit') + "\">Audit Log</a>{% endif %}"
@@ -1833,7 +2043,6 @@ POS_HTML = STYLE_BLOCK + """
                     <span style="color:var(--text-muted); font-size:12.5px;">{{ g.rows|length }} item(s) &middot; {{ g.total_ordered }} total ordered</span>
                     {% if g.has_rate_diff %}<span class="badge badge-red">🔴 Rate Difference in this PO</span>{% endif %}
                     {% if g.has_draft %}<span class="badge badge-amber">🟡 Draft — Pending Approval</span>{% else %}<span class="badge badge-green">🟢 Approved</span>{% endif %}
-                    {% if g.fully_received %}<span class="badge badge-green">✅ PO Fulfilled (GRN)</span>{% else %}<span class="badge badge-amber">⏳ GRN Pending</span>{% endif %}
                 </div>
                 <div style="display:flex; gap:8px; flex-wrap:wrap;">
                     {% if g.has_draft %}
@@ -1858,7 +2067,7 @@ POS_HTML = STYLE_BLOCK + """
             </div>
             <table>
                 <thead><tr>
-                    <th>Item</th><th>Weight</th><th>Ordered Qty</th><th>Barcode</th><th>PO Rate</th><th>Rate Check</th><th>Status</th><th>GRN Received / Pending</th><th></th>
+                    <th>Item</th><th>Weight</th><th>Ordered Qty</th><th>Barcode</th><th>PO Rate</th><th>Rate Check</th><th>Cost Variation</th><th>Status</th><th></th>
                 </tr></thead>
                 <tbody>
                 {% for it in g.rows %}
@@ -1877,15 +2086,20 @@ POS_HTML = STYLE_BLOCK + """
                         {% endif %}
                     </td>
                     <td>
-                        {% if it[8] == 'Draft' %}<span class="badge badge-amber">Draft</span>
-                        {% else %}<span class="badge badge-green" title="Approved by {{ it[12] }} at {{ it[13] }}">Approved</span>
+                        {% set cv = it[15] %}
+                        {% if cv.status == 'GREEN' %}<span class="badge badge-green">🟢 GREEN &middot; ₹{{ "%.2f"|format(cv.variance) }}</span>
+                        {% elif cv.status == 'RED' %}
+                            <span class="badge badge-red">🔴 RED &middot; ₹{{ "%.2f"|format(cv.variance) }}</span>
+                            <form method="POST" action="/cost_variation/{{ it[0] }}/send_revised_po_email" style="display:inline; margin-left:4px;">
+                                <button type="submit" class="btn btn-outline btn-sm">📧 Send Revised PO Email</button>
+                            </form>
+                            <a href="/cost_variation/{{ it[0] }}/history" class="btn btn-outline btn-sm">History</a>
+                        {% else %}<span style="color:var(--text-muted); font-size:12px;">—</span>
                         {% endif %}
                     </td>
                     <td>
-                        {% set sh = it[15] %}
-                        {{ sh.received }} / {{ sh.ordered }}
-                        {% if sh.fulfilled %}<span class="badge badge-green">✅ Fulfilled</span>
-                        {% else %}<span class="badge badge-amber">⏳ {{ sh.pending }} pending</span>
+                        {% if it[8] == 'Draft' %}<span class="badge badge-amber">Draft</span>
+                        {% else %}<span class="badge badge-green" title="Approved by {{ it[12] }} at {{ it[13] }}">Approved</span>
                         {% endif %}
                     </td>
                     <td style="display:flex; gap:6px;">
@@ -2056,61 +2270,6 @@ AI_IMPORT_PO_HTML = STYLE_BLOCK + """
 </html>
 """
 
-AI_IMPORT_GRN_HTML = STYLE_BLOCK + """
-<title>AI Import | {{ factory_display_name }}</title>
-</head>
-<body>
-<div class="container">
-""" + TOPBAR_TEMPLATE.replace("__NAV__", nav_html('grn')) + """
-    {% if request.args.get('error') %}
-    <div class="badge badge-amber" style="display:block; padding:10px 14px; margin-bottom:14px; font-size:13px;">{{ request.args.get('error') }}</div>
-    {% endif %}
-    <div class="card">
-        <div class="card-header"><h2>🤖 AI Import from PDF / Photo — {{ 'Purchase Order' if import_type == 'po' else 'GRN' }}</h2>
-            <a href="{{ '/pos' if import_type == 'po' else '/grn' }}" class="btn btn-outline btn-sm">← Back</a>
-        </div>
-        <div style="color:var(--text-muted); font-size:12.5px; margin-bottom:14px; line-height:1.6;">
-            Upload a photo or PDF of a {{ 'Purchase Order' if import_type == 'po' else 'GRN' }} and AI will read it and extract the line items automatically.
-            Nothing is saved directly — you'll get a review screen to check and correct everything before it's added as a
-            {% if import_type == 'po' %}Draft PO (same Draft → Approve flow as any other import){% else %}GRN receipt{% endif %}.
-        </div>
-        {% if not api_key_set %}
-        <div class="badge badge-amber" style="display:block; padding:12px 14px; font-size:13px; line-height:1.6;">
-            ⚠️ AI import is not set up yet. This feature calls the Anthropic API (a paid external service) to read your documents.
-            To enable it: create an API key at <span style="font-family:monospace;">console.anthropic.com</span>, then add it as an
-            environment variable named <span style="font-family:monospace; color:var(--text);">ANTHROPIC_API_KEY</span> in your Render
-            service's Environment settings, and redeploy. Each document you scan will use a small amount of API credit.
-        </div>
-        {% else %}
-        <form method="POST" action="{{ action_url }}" enctype="multipart/form-data">
-            <div class="form-grid">
-                <div>
-                    <label>Company / Client</label>
-                    <select name="company" required>
-                        <option value="" disabled selected>Select company</option>
-                        {% for c in companies %}
-                        <option value="{{ c }}">{{ c }}</option>
-                        {% endfor %}
-                    </select>
-                </div>
-                <div>
-                    <label>Document (PDF, JPG or PNG)</label>
-                    <input type="file" name="doc_file" accept=".pdf,.jpg,.jpeg,.png" required style="padding:10px;">
-                </div>
-            </div>
-            <button type="submit" class="btn" style="margin-top:14px;">🤖 Scan &amp; Extract</button>
-        </form>
-        {% if companies|length == 0 %}
-        <div style="color:var(--text-muted); font-size:12.5px; margin-top:10px;">No companies yet — <a href="/companies" style="color:var(--primary);">add one first</a>.</div>
-        {% endif %}
-        {% endif %}
-    </div>
-    <footer>{{ factory_display_name }} &middot; {{ platform_name }}</footer>
-</div>
-</body>
-</html>
-"""
-
 AI_IMPORT_REVIEW_PO_HTML = STYLE_BLOCK + """
 <title>Review AI Import | {{ factory_display_name }}</title>
 </head>
@@ -2169,51 +2328,173 @@ AI_IMPORT_REVIEW_PO_HTML = STYLE_BLOCK + """
 </html>
 """
 
-AI_IMPORT_REVIEW_GRN_HTML = STYLE_BLOCK + """
-<title>Review AI Import | {{ factory_display_name }}</title>
+SELECT_COMPANY_HTML = STYLE_BLOCK + """
+<title>Send Revised PO Email | {{ factory_display_name }}</title>
 </head>
 <body>
 <div class="container">
-""" + TOPBAR_TEMPLATE.replace("__NAV__", nav_html('grn')) + """
-    {% if request.args.get('error') %}
-    <div class="badge badge-amber" style="display:block; padding:10px 14px; margin-bottom:14px; font-size:13px;">{{ request.args.get('error') }}</div>
-    {% endif %}
-    <div class="card">
-        <div class="card-header"><h2>🔍 Review Extracted GRN — {{ filename }}</h2></div>
+""" + TOPBAR_TEMPLATE.replace("__NAV__", nav_html('pos')) + """
+    <div class="card" style="max-width:480px; margin:0 auto;">
+        <div class="card-header"><h2>📧 Send Revised PO Email — Step 1</h2></div>
+        <div style="color:var(--text-muted); font-size:12.5px; margin-bottom:14px;">PO {{ po_number }} — {{ item_name }}</div>
+        <form method="POST" action="/cost_variation/{{ item_id }}/preview_email">
+            <label>Select Company</label>
+            <select name="company" required>
+                <option value="" disabled selected>Select company</option>
+                {% for c in companies %}<option value="{{ c }}">{{ c }}</option>{% endfor %}
+            </select>
+            <button type="submit" class="btn btn-block" style="margin-top:14px;">Continue — Preview Email</button>
+        </form>
+        <a href="/pos" class="btn btn-outline btn-block" style="margin-top:8px; text-decoration:none; display:block; box-sizing:border-box; text-align:center;">Cancel</a>
+    </div>
+    <footer>{{ factory_display_name }} &middot; {{ platform_name }}</footer>
+</div>
+</body>
+</html>
+"""
+
+EMAIL_PREVIEW_HTML = STYLE_BLOCK + """
+<title>Email Preview | {{ factory_display_name }}</title>
+</head>
+<body>
+<div class="container">
+""" + TOPBAR_TEMPLATE.replace("__NAV__", nav_html('pos')) + """
+    <div class="card" style="max-width:560px; margin:0 auto;">
+        <div class="card-header"><h2>📧 Full Email Preview — Step 2/3</h2></div>
+        <div style="color:var(--text-muted); font-size:12.5px; margin-bottom:14px;">Review and edit if needed before sending. Nothing is sent until you click Send Email.</div>
+        <form method="POST" action="/cost_variation/{{ item_id }}/send_email">
+            <label>To</label>
+            <input type="email" name="to_email" value="{{ to_email }}" required>
+            <label>CC</label>
+            <input type="text" name="cc_email" value="{{ cc_email }}">
+            <label>Subject</label>
+            <input type="text" name="subject" value="{{ subject }}" required>
+            <label>Body</label>
+            <textarea name="body" rows="12" style="width:100%; padding:12px 14px; border-radius:10px; border:1px solid var(--border); background:rgba(255,255,255,0.03); color:var(--text); font-family:inherit; font-size:13.5px;">{{ body }}</textarea>
+            <button type="submit" class="btn btn-block" style="margin-top:14px;">✅ Send Email</button>
+        </form>
+        <a href="/pos" class="btn btn-outline btn-block" style="margin-top:8px; text-decoration:none; display:block; box-sizing:border-box; text-align:center;">Cancel</a>
+    </div>
+    <footer>{{ factory_display_name }} &middot; {{ platform_name }}</footer>
+</div>
+</body>
+</html>
+"""
+
+UPLOAD_REVISED_PO_HTML = STYLE_BLOCK + """
+<title>Upload Revised PO | {{ factory_display_name }}</title>
+</head>
+<body>
+<div class="container">
+""" + TOPBAR_TEMPLATE.replace("__NAV__", nav_html('pos')) + """
+    {% if request.args.get('error') %}<div class="badge badge-amber" style="display:block; padding:10px 14px; margin-bottom:14px;">{{ request.args.get('error') }}</div>{% endif %}
+    <div class="card" style="max-width:520px; margin:0 auto;">
+        <div class="card-header"><h2>📤 Upload Revised PO V{{ next_version }}</h2></div>
         <div style="color:var(--text-muted); font-size:12.5px; margin-bottom:14px;">
-            AI read this document — check every field, correct anything wrong, uncheck any line that shouldn't be logged, then Confirm.
-            This links back to the original PO's shortage tracking exactly like a manual GRN entry.
+            PO {{ po_number }} — {{ item_name }}. Current variance: ₹{{ "%.2f"|format(current_variance.variance) if current_variance.variance is not none else '—' }} ({{ current_variance.status }}).
+            The original PO is never overwritten — this creates a new version.
         </div>
-        {% if status == 'committed' %}
-        <div class="badge badge-green" style="display:block; padding:10px 14px;">✅ Already imported.</div>
-        {% else %}
-        <form method="POST" action="/grn/ai_import/review/{{ staging_id }}/commit">
-            <input type="hidden" name="company" value="{{ company }}">
+        <form method="POST" action="/cost_variation/{{ item_id }}/upload_revised_po" enctype="multipart/form-data">
+            <label>Revised Rate (₹)</label>
+            <input type="number" step="0.01" name="revised_rate" required>
+            <label>Revised Quantity (leave blank to keep original)</label>
+            <input type="number" name="revised_qty">
+            <label>Revised PO File</label>
+            <input type="file" name="revised_po_file" style="padding:10px;">
+            <label>Revision Reason</label>
+            <input type="text" name="revision_reason" placeholder="e.g. Supplier confirmed corrected rate">
+            <button type="submit" class="btn btn-block" style="margin-top:14px;">Upload &amp; Recalculate</button>
+        </form>
+    </div>
+    <footer>{{ factory_display_name }} &middot; {{ platform_name }}</footer>
+</div>
+</body>
+</html>
+"""
+
+PO_REVISION_HISTORY_HTML = STYLE_BLOCK + """
+<title>PO Revision History | {{ factory_display_name }}</title>
+</head>
+<body>
+<div class="container">
+""" + TOPBAR_TEMPLATE.replace("__NAV__", nav_html('pos')) + """
+    {% if ok_msg %}<div class="badge badge-green" style="display:block; padding:10px 14px; margin-bottom:14px;">{{ ok_msg }}</div>{% endif %}
+    <div class="card">
+        <div class="card-header"><h2>📋 PO Revision History — {{ po[0] }} ({{ po[1] }})</h2>
+            <a href="/cost_variation/{{ item_id }}/upload_revised_po" class="btn btn-outline btn-sm">📤 Upload Revised PO</a>
+        </div>
+        <table class="table">
+            <tr><th>Version</th><th>Revised Rate</th><th>Qty</th><th>Prev Variance</th><th>New Variance</th><th>Status</th><th>Reason</th><th>By</th><th>When</th><th>Decision</th></tr>
+            {% for r in revisions %}
+            <tr>
+                <td>V{{ r[0] }}</td><td>₹{{ "%.2f"|format(r[1]) }}</td><td>{{ r[2] }}</td>
+                <td>{% if r[4] is not none %}₹{{ "%.2f"|format(r[4]) }}{% else %}—{% endif %}</td>
+                <td>₹{{ "%.2f"|format(r[5]) }}</td>
+                <td>{% if r[6] == 'GREEN' %}<span class="badge badge-green">GREEN</span>{% else %}<span class="badge badge-red">RED</span>{% endif %}</td>
+                <td>{{ r[7] or '—' }}</td><td>{{ r[9] or '—' }}</td><td style="font-size:12px; color:var(--text-muted);">{{ r[10][:16] if r[10] else '—' }}</td>
+                <td>
+                    {% if r[11] %}<span class="badge badge-blue">{{ r[11] }}</span>
+                    {% else %}
+                    <form method="POST" action="/cost_variation/{{ item_id }}/decision" style="display:flex; gap:4px;">
+                        <button type="submit" name="decision" value="Approved" class="btn btn-sm">Approve</button>
+                        <button type="submit" name="decision" value="Revision Required" class="btn btn-outline btn-sm">Revision Req.</button>
+                        <button type="submit" name="decision" value="Rejected" class="btn btn-danger btn-sm">Reject</button>
+                    </form>
+                    {% endif %}
+                </td>
+            </tr>
+            {% endfor %}
+            {% if not revisions %}<tr><td colspan="10" style="text-align:center; color:var(--text-dim);">No revisions yet.</td></tr>{% endif %}
+        </table>
+    </div>
+    <div class="card">
+        <div class="card-header"><h2>📧 Revision Emails Sent</h2></div>
+        <table class="table">
+            <tr><th>To</th><th>Subject</th><th>When</th><th>Status</th></tr>
+            {% for e in emails %}
+            <tr><td>{{ e[0] }}</td><td>{{ e[1] }}</td><td style="font-size:12px; color:var(--text-muted);">{{ e[2][:16] if e[2] else '—' }}</td>
+                <td>{% if e[3] == 'sent' %}<span class="badge badge-green">Sent</span>{% else %}<span class="badge badge-red">Failed</span>{% endif %}</td></tr>
+            {% endfor %}
+            {% if not emails %}<tr><td colspan="4" style="text-align:center; color:var(--text-dim);">No revision emails sent yet.</td></tr>{% endif %}
+        </table>
+    </div>
+    <footer>{{ factory_display_name }} &middot; {{ platform_name }}</footer>
+</div>
+</body>
+</html>
+"""
+
+EMAIL_CONFIG_HTML = STYLE_BLOCK + """
+<title>Email Configuration | {{ factory_display_name }}</title>
+</head>
+<body>
+<div class="container">
+""" + TOPBAR_TEMPLATE.replace("__NAV__", nav_html('email')) + """
+    {% if error_msg %}<div class="badge badge-amber" style="display:block; padding:10px 14px; margin-bottom:14px; font-size:13px;">{{ error_msg }}</div>{% endif %}
+    {% if ok_msg %}<div class="badge badge-green" style="display:block; padding:10px 14px; margin-bottom:14px; font-size:13px;">{{ ok_msg }}</div>{% endif %}
+    <div class="card">
+        <div class="card-header"><h2>📧 SMTP Email Configuration</h2></div>
+        <div style="color:var(--text-muted); font-size:12.5px; margin-bottom:14px;">
+            Provider-agnostic — works with Gmail, Office365, SendGrid, AWS SES, Postmark or any SMTP server. Password is stored encrypted, never shown again once saved.
+        </div>
+        <form method="POST" action="/email/config">
             <div class="form-grid">
-                <div><label>Company</label><input type="text" value="{{ company }}" disabled></div>
-                <div><label>PO Number</label><input type="text" name="po_number" value="{{ extracted.po_number or '' }}" required></div>
-                <div><label>GRN Number</label><input type="text" name="grn_number" value="{{ extracted.grn_number or '' }}"></div>
-                <div><label>GRN Date</label><input type="date" name="grn_date" value="{{ extracted.grn_date or '' }}"></div>
+                <div><label>SMTP Host</label><input type="text" name="smtp_host" placeholder="e.g. smtp.gmail.com" value="{{ cfg.smtp_host if cfg else '' }}" required></div>
+                <div><label>SMTP Port</label><input type="number" name="smtp_port" placeholder="e.g. 587" value="{{ cfg.smtp_port if cfg else '' }}" required></div>
+                <div><label>SMTP Username</label><input type="text" name="smtp_username" value="{{ cfg.smtp_username if cfg else '' }}" required></div>
+                <div><label>SMTP Password {% if cfg and cfg.is_configured %}(leave blank to keep existing){% endif %}</label><input type="password" name="smtp_password" placeholder="{% if cfg and cfg.is_configured %}●●●●●●●●{% endif %}"></div>
+                <div><label>From Email</label><input type="email" name="from_email" value="{{ cfg.from_email if cfg else '' }}" required></div>
+                <div><label>From Name</label><input type="text" name="from_name" value="{{ cfg.from_name if cfg else '' }}"></div>
             </div>
-            <table style="margin-top:16px;">
-                <thead><tr><th></th><th>Item</th><th>Received Qty</th></tr></thead>
-                <tbody>
-                {% for it in extracted['items'] %}
-                <tr>
-                    <td><input type="checkbox" name="include" value="{{ loop.index0 }}" checked style="width:auto;"></td>
-                    <td><input type="text" name="item_name" value="{{ it.item_name or '' }}" style="margin:0; min-width:160px;"></td>
-                    <td><input type="number" name="received_qty" value="{{ it.received_qty or '' }}" style="margin:0; min-width:100px;"></td>
-                </tr>
-                {% endfor %}
-                {% if extracted['items']|length == 0 %}
-                <tr><td colspan="3" style="text-align:center; color:var(--text-muted);">No items were extracted — the document may be unclear. You can still add entries manually on the GRN page.</td></tr>
-                {% endif %}
-                </tbody>
-            </table>
-            <div style="display:flex; gap:8px; margin-top:16px;">
-                <button type="submit" class="btn">✅ Confirm &amp; Log GRN</button>
-                <button type="submit" formaction="/grn/ai_import/review/{{ staging_id }}/discard" class="btn btn-danger">Discard</button>
-            </div>
+            <label style="display:flex; align-items:center; gap:6px; font-weight:400; margin-top:10px;">
+                <input type="checkbox" name="use_tls" {% if not cfg or cfg.use_tls %}checked{% endif %} style="width:auto;"> Use TLS/STARTTLS
+            </label>
+            <button type="submit" class="btn" style="margin-top:14px;">Save Configuration</button>
+        </form>
+        {% if cfg and cfg.is_configured %}
+        <form method="POST" action="/email/config/test" style="margin-top:18px; padding-top:18px; border-top:1px solid var(--border); display:flex; gap:8px;">
+            <input type="email" name="test_to" placeholder="Send test email to..." required style="flex:1; margin:0;">
+            <button type="submit" class="btn btn-outline">Send Test Email</button>
         </form>
         {% endif %}
     </div>
@@ -2223,137 +2504,147 @@ AI_IMPORT_REVIEW_GRN_HTML = STYLE_BLOCK + """
 </html>
 """
 
-GRN_HTML = STYLE_BLOCK + """
-<title>GRN | {{ factory_display_name }}</title>
+EMAIL_CONTACTS_HTML = STYLE_BLOCK + """
+<title>Company Email Master | {{ factory_display_name }}</title>
 </head>
 <body>
 <div class="container">
-""" + TOPBAR_TEMPLATE.replace("__NAV__", nav_html('grn')) + """
-    {% if msg %}
-    <div class="badge {% if msg_ok %}badge-green{% else %}badge-amber{% endif %}" style="display:block; padding:10px 14px; margin-bottom:14px; font-size:13px;">{{ msg }}</div>
-    {% endif %}
-
+""" + TOPBAR_TEMPLATE.replace("__NAV__", nav_html('email')) + """
+    {% if error_msg %}<div class="badge badge-amber" style="display:block; padding:10px 14px; margin-bottom:14px; font-size:13px;">{{ error_msg }}</div>{% endif %}
     <div class="card">
-        <div class="card-header"><h2>📦 GRN Shortage Tracking — by PO</h2></div>
-        <div style="color:var(--text-muted); font-size:12.5px; margin-bottom:14px;">
-            For every PO item, this shows what's been received so far via GRN entries vs. what's still pending. Log each delivery below as it comes in.
-        </div>
-        {% if shortage_rows|length > 0 %}
-        <table>
-            <thead><tr><th>Company</th><th>PO Number</th><th>Item</th><th>Ordered</th><th>Received</th><th>Pending</th><th>Status</th></tr></thead>
-            <tbody>
-            {% for r in shortage_rows %}
-            <tr>
-                <td><span class="badge badge-blue">{{ r.company }}</span></td>
-                <td>{{ r.po_number }}</td>
-                <td>{{ r.item_name }}</td>
-                <td>{{ r.ordered }}</td>
-                <td>{{ r.received }}</td>
-                <td>{{ r.pending }}</td>
-                <td>
-                    {% if r.fulfilled %}<span class="badge badge-green">✅ PO Fulfilled</span>
-                    {% else %}<span class="badge badge-amber">⏳ Pending: {{ r.pending }}</span>
-                    {% endif %}
-                </td>
-            </tr>
-            {% endfor %}
-            </tbody>
-        </table>
-        {% else %}
-        <div class="empty-state">No PO items yet — add POs first, then log GRN receipts against them here.</div>
-        {% endif %}
-    </div>
-
-    <div class="card">
-        <div class="card-header"><h2>📤 Bulk Import GRN from CSV / Excel</h2><a href="/grn/ai_import" class="btn btn-outline btn-sm">🤖 AI Import from PDF/Photo</a></div>
-        <form method="POST" action="/grn/import_csv" enctype="multipart/form-data">
-            <label>Company / Client</label>
-            <select name="company" required>
-                <option value="" disabled selected>Select company</option>
-                {% for c in companies %}
-                <option value="{{ c }}">{{ c }}</option>
-                {% endfor %}
-            </select>
-            <label>Choose CSV or Excel File</label>
-            <input type="file" name="grn_file" accept=".csv,.xlsx" required style="padding:10px;">
-            <button type="submit" class="btn" style="margin-top:10px;">Upload &amp; Import</button>
-        </form>
-        <div style="color:var(--text-muted); font-size:12.5px; margin-top:12px; line-height:1.6;">
-            Required columns: <span style="font-family:monospace; color:var(--text);">po_number, item_name, received_qty</span> (grn_number and grn_date are optional).
-        </div>
-    </div>
-
-    <div class="card">
-        <div class="card-header"><h2>➕ Log a GRN Receipt</h2></div>
-        <form method="POST" action="/grn/add">
+        <div class="card-header"><h2>📇 Company Email Master</h2></div>
+        <form method="POST" action="/email/contacts/add">
             <div class="form-grid">
-                <div>
-                    <label>Company / Client</label>
-                    <select name="company" required>
-                        <option value="" disabled selected>Select company</option>
-                        {% for c in companies %}
-                        <option value="{{ c }}">{{ c }}</option>
-                        {% endfor %}
-                    </select>
+                <div><label>Company</label>
+                    <select name="company_name" required><option value="" disabled selected>Select company</option>
+                    {% for c in companies %}<option value="{{ c }}">{{ c }}</option>{% endfor %}</select>
                 </div>
-                <div>
-                    <label>PO Number</label>
-                    <input type="text" name="po_number" placeholder="e.g. PO-2026-014" required>
-                </div>
-                <div>
-                    <label>Item Name (must match the PO item exactly)</label>
-                    <input type="text" name="item_name" placeholder="e.g. Instant Noodles" required>
-                </div>
-                <div>
-                    <label>GRN Number — optional</label>
-                    <input type="text" name="grn_number" placeholder="e.g. GRN-1002">
-                </div>
-                <div>
-                    <label>GRN Date — optional</label>
-                    <input type="date" name="grn_date">
-                </div>
-                <div>
-                    <label>Received Quantity</label>
-                    <input type="number" name="received_qty" placeholder="e.g. 20000" required>
-                </div>
+                <div><label>To Email</label><input type="email" name="to_email" required></div>
+                <div><label>CC Email(s)</label><input type="text" name="cc_email" placeholder="comma-separated"></div>
+                <div><label>Contact Person</label><input type="text" name="contact_person"></div>
             </div>
-            <button type="submit" class="btn" style="margin-top:14px;">Log GRN Receipt</button>
+            <button type="submit" class="btn" style="margin-top:14px;">Save Contact</button>
         </form>
-        {% if companies|length == 0 %}
-        <div style="color:var(--text-muted); font-size:12.5px; margin-top:10px;">No companies yet — <a href="/companies" style="color:var(--primary);">add one first</a>.</div>
-        {% endif %}
     </div>
-
     <div class="card">
-        <div class="card-header"><h2>📋 GRN Entries Logged</h2></div>
-        {% if grn_entries|length > 0 %}
-        <table>
-            <thead><tr><th>Company</th><th>PO Number</th><th>Item</th><th>GRN #</th><th>GRN Date</th><th>Received Qty</th><th></th></tr></thead>
-            <tbody>
-            {% for g in grn_entries %}
-            <tr>
-                <td><span class="badge badge-blue">{{ g[1] }}</span></td>
-                <td>{{ g[2] }}</td>
-                <td>{{ g[3] }}</td>
-                <td>{{ g[4] or '—' }}</td>
-                <td>{{ g[5] or '—' }}</td>
-                <td>{{ g[6] }}</td>
-                <td>
-                    <form method="POST" action="/grn/delete/{{ g[0] }}" onsubmit="return confirm('Delete this GRN entry?');">
-                        <button type="submit" class="btn btn-danger btn-sm">Delete</button>
-                    </form>
-                </td>
-            </tr>
+        <div class="card-header"><h2>📋 Saved Contacts</h2></div>
+        <table class="table">
+            <tr><th>Company</th><th>To</th><th>CC</th><th>Contact Person</th><th></th></tr>
+            {% for c in contacts %}
+            <tr><td>{{ c[1] }}</td><td>{{ c[2] }}</td><td>{{ c[3] or '—' }}</td><td>{{ c[4] or '—' }}</td>
+                <td><form method="POST" action="/email/contacts/delete/{{ c[0] }}"><button class="btn btn-danger btn-sm">Delete</button></form></td></tr>
             {% endfor %}
-            </tbody>
+            {% if not contacts %}<tr><td colspan="5" style="text-align:center; color:var(--text-dim);">No contacts saved yet.</td></tr>{% endif %}
         </table>
-        {% else %}
-        <div class="empty-state">No GRN entries logged yet.</div>
-        {% endif %}
     </div>
-
     <footer>{{ factory_display_name }} &middot; {{ platform_name }}</footer>
 </div>
+</body>
+</html>
+"""
+
+EMAIL_HISTORY_HTML = STYLE_BLOCK + """
+<title>Email History | {{ factory_display_name }}</title>
+</head>
+<body>
+<div class="container">
+""" + TOPBAR_TEMPLATE.replace("__NAV__", nav_html('email')) + """
+    <div class="card">
+        <div class="card-header"><h2>📜 Email Delivery History</h2></div>
+        <table class="table">
+            <tr><th>Type</th><th>PO</th><th>To</th><th>Subject</th><th>Sent By</th><th>When</th><th>Status</th></tr>
+            {% for e in entries %}
+            <tr><td>{{ e[0] }}</td><td>{{ e[1] or '—' }}</td><td>{{ e[2] }}</td><td>{{ e[4] }}</td><td>{{ e[5] or '—' }}</td>
+                <td style="color:var(--text-muted); font-size:12px;">{{ e[6][:16] if e[6] else '—' }}</td>
+                <td>{% if e[7] == 'sent' %}<span class="badge badge-green">Sent</span>{% else %}<span class="badge badge-red" title="{{ e[8] }}">Failed</span>{% endif %}</td></tr>
+            {% endfor %}
+            {% if not entries %}<tr><td colspan="7" style="text-align:center; color:var(--text-dim);">No emails sent yet.</td></tr>{% endif %}
+        </table>
+    </div>
+    <footer>{{ factory_display_name }} &middot; {{ platform_name }}</footer>
+</div>
+</body>
+</html>
+"""
+
+RETENTION_DASHBOARD_HTML = STYLE_BLOCK + """
+<title>Data Retention / Cleanup | {{ factory_display_name }}</title>
+</head>
+<body>
+<div class="container">
+""" + TOPBAR_TEMPLATE.replace("__NAV__", nav_html('users')) + """
+    <div class="card">
+        <div class="card-header"><h2>🗄️ Data Retention / Cleanup (Dry Run)</h2></div>
+        <div style="color:var(--text-muted); font-size:12.5px; margin-bottom:14px; line-height:1.6;">
+            This page ONLY reports what a cleanup run would do — it never deletes or archives anything.
+            Scope: <strong style="color:var(--text);">location_history (GPS pings) only</strong> — every other table
+            (audit log, QC history, dispatch log, PO revisions, email history, master data) is permanently protected
+            and never touched by this cleanup, per the confirmed retention policy.<br>
+            Retention window: <strong style="color:var(--text);">{{ retention_days }} days</strong> &middot;
+            Cleanup enabled in production: <strong style="color:var(--text);">{{ 'YES' if cleanup_enabled else 'NO (fail-safe default)' }}</strong> &middot;
+            Dry-run mode: <strong style="color:var(--text);">{{ 'YES' if dry_run_mode else 'NO' }}</strong>
+        </div>
+        <div class="stats-grid">
+            <div class="stat-card"><div class="label">Examined</div><div class="value">{{ report.examined }}</div></div>
+            <div class="stat-card"><div class="label">Eligible for Archive</div><div class="value">{{ report.eligible }}</div></div>
+            <div class="stat-card"><div class="label">Protected (active/suspicious)</div><div class="value">{{ report.protected }}</div></div>
+        </div>
+        {% if report.oldest %}<div style="font-size:12.5px; color:var(--text-muted);">Oldest eligible: {{ report.oldest[:16] }} &middot; Newest eligible: {{ report.newest[:16] }}</div>{% endif %}
+    </div>
+    <div class="card">
+        <div class="card-header"><h2>📋 Recent Cleanup Runs</h2></div>
+        <table class="table">
+            <tr><th>Run ID</th><th>When</th><th>Mode</th><th>Examined</th><th>Archived</th><th>Deleted</th><th>Protected</th><th>Skipped</th><th>Errors</th></tr>
+            {% for h in history %}
+            <tr><td style="font-size:11px;">{{ h[0] }}</td><td style="font-size:12px; color:var(--text-muted);">{{ h[1][:16] }}</td>
+                <td>{{ h[2] }}</td><td>{{ h[3] }}</td><td>{{ h[4] }}</td><td>{{ h[5] }}</td><td>{{ h[6] }}</td><td>{{ h[7] }}</td>
+                <td style="color:#f87171;">{{ h[8] or '—' }}</td></tr>
+            {% endfor %}
+            {% if not history %}<tr><td colspan="9" style="text-align:center; color:var(--text-dim);">No cleanup runs yet.</td></tr>{% endif %}
+        </table>
+    </div>
+    <footer>{{ factory_display_name }} &middot; {{ platform_name }}</footer>
+</div>
+</body>
+</html>
+"""
+
+FACTORY_LOADING_LOCATION_HTML = STYLE_BLOCK + """
+<title>Factory Loading Location | {{ factory_display_name }}</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css">
+</head>
+<body>
+<div class="container">
+""" + TOPBAR_TEMPLATE.replace("__NAV__", nav_html('users')) + """
+    {% if error_msg %}<div class="badge badge-amber" style="display:block; padding:10px 14px; margin-bottom:14px;">{{ error_msg }}</div>{% endif %}
+    {% if ok %}<div class="badge badge-green" style="display:block; padding:10px 14px; margin-bottom:14px;">Factory Loading Location saved.</div>{% endif %}
+    <div class="card">
+        <div class="card-header"><h2>🏭 Factory Loading Location</h2></div>
+        <div style="color:var(--text-muted); font-size:12.5px; margin-bottom:14px;">
+            This is the fixed loading-point shown at Start Loading — normal users cannot change it there.
+            {% if current %}Currently set: {{ current.name or 'Unnamed' }} ({{ '%.5f'|format(current.lat) }}, {{ '%.5f'|format(current.lng) }}){% else %}Not set yet.{% endif %}
+        </div>
+        <form method="POST" action="/settings/loading_location">
+            <input type="text" name="loading_location_name" placeholder="Location name (optional)" value="{{ current.name if current else '' }}">
+            <div id="flMap" style="height:280px; border-radius:12px; margin:10px 0;"></div>
+            <input type="hidden" name="loading_location_lat" id="flLat" value="{{ current.lat if current else '' }}">
+            <input type="hidden" name="loading_location_lng" id="flLng" value="{{ current.lng if current else '' }}">
+            <button type="submit" class="btn">Save Location</button>
+        </form>
+    </div>
+    <footer>{{ factory_display_name }} &middot; {{ platform_name }}</footer>
+</div>
+<script>
+const flMap = L.map('flMap').setView([{{ current.lat if current else 20.5937 }}, {{ current.lng if current else 78.9629 }}], {{ '13' if current else '5' }});
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '&copy; OpenStreetMap' }).addTo(flMap);
+let flMarker = {% if current %}L.marker([{{ current.lat }}, {{ current.lng }}]).addTo(flMap){% else %}null{% endif %};
+flMap.on('click', (e) => {
+    document.getElementById('flLat').value = e.latlng.lat;
+    document.getElementById('flLng').value = e.latlng.lng;
+    if (flMarker) flMarker.setLatLng(e.latlng); else flMarker = L.marker(e.latlng).addTo(flMap);
+});
+</script>
 </body>
 </html>
 """
@@ -2443,11 +2734,13 @@ PRODUCTION_HTML = STYLE_BLOCK + """
 
         {% if companies|length == 0 %}
         <div class="empty-state">No companies yet — <a href="/companies" style="color:var(--primary);">add one first</a>.</div>
-        {% elif quality_checkers|length == 0 %}
-        <div class="empty-state">No Quality Checkers registered yet — go to the <a href="/production?tab=admin" style="color:var(--primary);">Admin tab</a> to register one first.</div>
         {% else %}
         <form method="POST" action="/production/add" id="prodForm">
             <div class="form-grid">
+                <div>
+                    <label>Worker Name</label>
+                    <input type="text" name="worker_name" placeholder="Your name" required>
+                </div>
                 <div>
                     <label>Company</label>
                     <select name="company" id="prodCompany" required onchange="updateSubBrands()">
@@ -2467,35 +2760,6 @@ PRODUCTION_HTML = STYLE_BLOCK + """
                     <label>Item Being Packed</label>
                     <input type="text" name="item_name_entered" placeholder="e.g. Raw Peanut 500g" required>
                 </div>
-            </div>
-
-            <div style="margin-top:18px; padding:16px; background:rgba(255,255,255,0.03); border-radius:12px;">
-                <label style="margin-top:0;">Quality Checker Check-in</label>
-                {% if available_qcs|length == 0 %}
-                <div class="badge badge-amber" style="display:block; padding:10px 14px; margin-bottom:10px;">No Quality Checker is Available right now (all On Leave / Unavailable). This entry will be saved as <strong>QC Pending</strong> — any QC can inspect it once available, from the Pending QC tab.</div>
-                <input type="hidden" name="save_as_pending" value="1">
-                {% else %}
-                <label style="font-size:12px; display:flex; align-items:center; gap:6px; margin-bottom:8px; font-weight:400;">
-                    <input type="checkbox" id="pendingToggle" onchange="togglePendingQc()" style="width:auto; margin:0;"> No QC available for me right now — save as QC Pending instead
-                </label>
-                <input type="hidden" name="save_as_pending" id="savePendingField" value="0">
-                <div id="qcCheckinFields">
-                <select name="qc_name" id="qcSelect" required onchange="showQcPhoto()">
-                    <option value="" disabled selected>Select your name</option>
-                    {% for qc in available_qcs %}
-                    <option value="{{ qc.name }}">{{ qc.name }}</option>
-                    {% endfor %}
-                </select>
-                <div id="qcRefPhotoWrap" style="display:none; margin:10px 0; align-items:center; gap:10px;">
-                    <span style="font-size:12px; color:var(--text-muted);">Registered photo:</span>
-                    <img id="qcRefPhoto" style="width:52px; height:52px; border-radius:8px; object-fit:cover; vertical-align:middle; margin-left:8px; border:1px solid var(--border);">
-                </div>
-                <label>Take a check-in selfie to confirm it's you</label>
-                <input type="file" accept="image/*" capture="user" id="qcPhotoFile" onchange="compressImage(this, 'qcPhotoData', 'qcPhotoPreview')">
-                <input type="hidden" name="qc_photo" id="qcPhotoData" required>
-                <img id="qcPhotoPreview" style="display:none; width:64px; height:64px; border-radius:8px; object-fit:cover; margin-top:8px; border:2px solid var(--primary);">
-                </div>
-                {% endif %}
             </div>
 
             <div style="margin-top:18px; padding:16px; background:rgba(255,255,255,0.03); border-radius:12px;">
@@ -2534,7 +2798,7 @@ PRODUCTION_HTML = STYLE_BLOCK + """
                 </div>
             </div>
 
-            <button type="submit" class="btn" style="margin-top:18px;">Log Production Entry</button>
+            <button type="submit" class="btn" style="margin-top:18px;">✅ Submit for QC</button>
         </form>
         {% endif %}
     </div>
@@ -2549,12 +2813,13 @@ PRODUCTION_HTML = STYLE_BLOCK + """
         </div>
         <table>
             <thead><tr>
-                <th>Time</th><th>Company</th><th>Sub-brand</th><th>Item</th><th>Batch</th><th>Qty</th><th>QC</th><th>QC Status</th><th></th>
+                <th>Time</th><th>Worker</th><th>Company</th><th>Sub-brand</th><th>Item</th><th>Batch</th><th>Qty</th><th>QC</th><th>QC Status</th><th></th>
             </tr></thead>
             <tbody>
             {% for e in group.entries %}
             <tr>
                 <td style="color:var(--text-muted);">{{ e.prod_time }}</td>
+                <td>{{ e.worker_name or '—' }}</td>
                 <td>{{ e.company }}</td>
                 <td><span class="badge badge-blue">{{ e.sub_brand }}</span></td>
                 <td>{{ e.item_name }}</td>
@@ -2563,11 +2828,16 @@ PRODUCTION_HTML = STYLE_BLOCK + """
                 <td>{{ e.qc_name or '—' }}</td>
                 <td>
                     {% if e.qc_status == 'QC Pending' %}<span class="badge badge-amber">🔔 Pending</span>
-                    {% elif e.qc_status == 'Rejected' %}<span class="badge badge-red">❌ Rejected</span>
+                    {% elif e.qc_status == 'Rejected' %}<span class="badge badge-red" title="{{ e.rejection_reason }}">❌ Rejected: {{ e.rejection_reason }}</span>
                     {% else %}<span class="badge badge-green">✅ Approved</span>
                     {% endif %}
                 </td>
                 <td style="white-space:nowrap;">
+                    {% if e.qc_status == 'Rejected' %}
+                    <form method="POST" action="/production/resubmit/{{ e.id }}" style="display:inline;">
+                        <button type="submit" class="btn btn-outline btn-sm">🔁 Resubmit for QC</button>
+                    </form>
+                    {% endif %}
                     {% if e.editable %}
                     <button class="btn btn-outline btn-sm" onclick="openEditProd('{{ e.id }}', '{{ e.packing_date }}', '{{ e.use_by_date }}', '{{ e.batch_number }}', '{{ e.quantity }}')">Edit</button>
                     <form method="POST" action="/production/delete/{{ e.id }}" style="display:inline;" onsubmit="return confirm('Delete this entry?');">
@@ -2607,9 +2877,9 @@ PRODUCTION_HTML = STYLE_BLOCK + """
 
     {% elif tab == 'pending_qc' %}
     <div class="card">
-        <div class="card-header"><h2>🔔 Production Entries Awaiting QC Inspection</h2></div>
+        <div class="card-header"><h2>🔔 Production Entries Awaiting QC Verification</h2></div>
         <div style="color:var(--text-muted); font-size:12.5px; margin-bottom:14px;">
-            These entries were logged when no Quality Checker was Available. Any QC who is currently Available can inspect and approve/reject one below.
+            Every submitted entry lands here first. Any Available QC must re-verify the actual quantity, full barcode, packing date, use-by date and batch number before approving or rejecting.
         </div>
         {% if available_qcs|length == 0 %}
         <div class="badge badge-amber" style="display:block; padding:10px 14px;">No QC is currently marked Available — go to the Admin tab to mark someone Available before inspecting.</div>
@@ -2621,7 +2891,7 @@ PRODUCTION_HTML = STYLE_BLOCK + """
                 <div>
                     <span class="badge badge-blue">{{ e.company }}</span>
                     <strong style="margin-left:6px;">{{ e.item_name }}</strong>
-                    <span style="color:var(--text-muted); font-size:12px;"> &middot; Batch {{ e.batch_number }} &middot; Qty {{ e.quantity }} &middot; Packed {{ e.prod_date }} {{ e.prod_time }}</span>
+                    <span style="color:var(--text-muted); font-size:12px;"> &middot; Logged by {{ e.worker_name or '—' }} &middot; Batch {{ e.batch_number }} &middot; Qty {{ e.quantity }} &middot; {{ e.prod_date }} {{ e.prod_time }}</span>
                 </div>
             </div>
             {% if available_qcs|length > 0 %}
@@ -2644,6 +2914,12 @@ PRODUCTION_HTML = STYLE_BLOCK + """
                     <input type="hidden" name="qc_photo" id="inspectPhotoData{{ e.id }}" required>
                 </div>
                 <img id="inspectPhotoPreview{{ e.id }}" style="display:none; width:40px; height:40px; border-radius:6px; object-fit:cover;">
+                <div><label style="font-size:11px;">Verified Qty</label><input type="number" name="verified_quantity" value="{{ e.quantity }}" required style="margin:0; width:90px;"></div>
+                <div><label style="font-size:11px;">Full Barcode Scan</label><input type="text" name="verified_barcode" value="{{ e.barcode }}" required style="margin:0; width:140px;"></div>
+                <div><label style="font-size:11px;">Packing Date</label><input type="date" name="verified_packing_date" value="{{ e.packing_date }}" required style="margin:0;"></div>
+                <div><label style="font-size:11px;">Use By Date</label><input type="date" name="verified_use_by_date" value="{{ e.use_by_date }}" required style="margin:0;"></div>
+                <div><label style="font-size:11px;">Batch Number</label><input type="text" name="verified_batch_number" value="{{ e.batch_number }}" required style="margin:0; width:120px;"></div>
+                <div><label style="font-size:11px;">Rejection Reason (if rejecting)</label><input type="text" name="rejection_reason" style="margin:0; width:180px;"></div>
                 <button type="submit" name="verdict" value="Approved" class="btn btn-sm">✅ Approve</button>
                 <button type="submit" name="verdict" value="Rejected" class="btn btn-danger btn-sm">❌ Reject</button>
             </form>
@@ -2651,7 +2927,7 @@ PRODUCTION_HTML = STYLE_BLOCK + """
         </div>
         {% endfor %}
         {% else %}
-        <div class="empty-state">No entries pending QC inspection right now. 🎉</div>
+        <div class="empty-state">No entries pending QC verification right now. 🎉</div>
         {% endif %}
     </div>
 
@@ -2824,18 +3100,6 @@ PRODUCTION_HTML = STYLE_BLOCK + """
             subs.map(s => `<option value="${s}">${s}</option>`).join('');
     }
 
-    function showQcPhoto() {
-        const name = document.getElementById('qcSelect').value;
-        const wrap = document.getElementById('qcRefPhotoWrap');
-        const img = document.getElementById('qcRefPhoto');
-        if (qcPhotos[name]) {
-            img.src = qcPhotos[name];
-            wrap.style.display = 'flex';
-        } else {
-            wrap.style.display = 'none';
-        }
-    }
-
     function showInspectPhoto(entryId) {
         const name = document.getElementById('inspectQcSelect' + entryId).value;
         const wrap = document.getElementById('inspectRefWrap' + entryId);
@@ -2845,22 +3109,6 @@ PRODUCTION_HTML = STYLE_BLOCK + """
             wrap.style.display = 'flex';
         } else {
             wrap.style.display = 'none';
-        }
-    }
-
-    function togglePendingQc() {
-        const checked = document.getElementById('pendingToggle').checked;
-        document.getElementById('savePendingField').value = checked ? '1' : '0';
-        const fields = document.getElementById('qcCheckinFields');
-        fields.style.display = checked ? 'none' : 'block';
-        const qcSelect = document.getElementById('qcSelect');
-        const qcPhotoData = document.getElementById('qcPhotoData');
-        if (checked) {
-            qcSelect.required = false;
-            qcPhotoData.required = false;
-        } else {
-            qcSelect.required = true;
-            qcPhotoData.required = true;
         }
     }
 
@@ -3124,284 +3372,173 @@ def home():
         cur_location=active['cur_location']
     )
 
-@app.route('/grn')
-def grn_page():
+
+@app.route('/email/config', methods=['GET', 'POST'])
+def email_config_page():
+    """P1: tenant-scoped SMTP configuration. Only Factory Admin can view/edit (matches Users/Audit
+    pattern — sensitive credentials warrant the same restriction). Password is never rendered back
+    to the browser once saved (only a masked indicator), and is stored encrypted, never in plaintext."""
     if not session.get('logged_in'): return redirect('/login')
-    fid = current_factory_id()
-    msg = request.args.get('msg')
-    msg_ok = request.args.get('ok') == '1'
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute('SELECT name FROM companies WHERE factory_id = %s ORDER BY name', (fid,))
-    companies = [r[0] for r in cursor.fetchall()]
-
-    shortage_map = get_po_shortage_map(cursor, fid)
-    shortage_rows = [
-        {'company': c, 'po_number': po, 'item_name': item, **info}
-        for (c, po, item), info in sorted(shortage_map.items(), key=lambda x: (x[0][0], x[0][1], x[0][2]))
-    ]
-
-    cursor.execute('SELECT id, company, po_number, item_name, grn_number, grn_date, received_qty FROM grn_log WHERE factory_id = %s ORDER BY id DESC LIMIT 300', (fid,))
-    grn_entries = cursor.fetchall()
-    conn.close()
-    return render_template_string(GRN_HTML, companies=companies, shortage_rows=shortage_rows, grn_entries=grn_entries, msg=msg, msg_ok=msg_ok)
-
-@app.route('/grn/add', methods=['POST'])
-def grn_add():
-    if not session.get('logged_in'): return redirect('/login')
-    fid = current_factory_id()
-    company = request.form.get('company', '').strip()
-    po_number = request.form.get('po_number', '').strip()
-    item_name = request.form.get('item_name', '').strip()
-    grn_number = request.form.get('grn_number', '').strip()
-    grn_date = request.form.get('grn_date', '').strip()
-    qty_raw = request.form.get('received_qty', '').strip()
-    if not company or not po_number or not item_name or not qty_raw:
-        return redirect('/grn?ok=0&msg=' + quote('Company, PO number, item name and received quantity are all required.'))
-    try:
-        received_qty = int(float(qty_raw))
-    except ValueError:
-        return redirect('/grn?ok=0&msg=' + quote('Received quantity must be a number.'))
-    if received_qty <= 0:
-        return redirect('/grn?ok=0&msg=' + quote('Received quantity must be greater than zero.'))
-    conn = get_conn()
-    cursor = conn.cursor()
-    # I1: server-side over-receiving protection, race-condition-safe via row lock (see docstring).
-    ok, err, _ = check_grn_capacity(cursor, fid, company, po_number, item_name, received_qty)
-    if not ok:
-        conn.close()
-        return redirect('/grn?ok=0&msg=' + quote(err))
-    cursor.execute('''INSERT INTO grn_log (factory_id, company, po_number, item_name, grn_number, grn_date, received_qty, created_at, created_by)
-                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)''',
-                   (fid, company, po_number, item_name, grn_number or None, grn_date or None, received_qty, now_ist().isoformat(), session.get('user_name')))
-    # Check whether this receipt fulfills the PO item, for a clearer audit trail
-    shortage_map = get_po_shortage_map(cursor, fid, company=company, po_number=po_number)
-    info = shortage_map.get((company, po_number, item_name))
-    status_note = ' — PO Fulfilled' if info and info['fulfilled'] else (f" — Pending: {info['pending']}" if info else '')
-    log_audit(cursor, 'GRN Received', 'GRN', po_number, f'{company}: {item_name} +{received_qty}{status_note}')
-    conn.commit()
-    conn.close()
-    return redirect('/grn?ok=1&msg=' + quote(f'GRN receipt of {received_qty} logged against PO {po_number}.'))
-
-@app.route('/grn/ai_import', methods=['GET', 'POST'])
-def grn_ai_import():
-    if not session.get('logged_in'): return redirect('/login')
+    if session.get('role') != 'Factory Admin':
+        return "Access denied — only a Factory Admin can manage email configuration.", 403
     fid = current_factory_id()
     conn = get_conn()
     cursor = conn.cursor()
-    if request.method == 'GET':
-        cursor.execute('SELECT name FROM companies WHERE factory_id = %s ORDER BY name', (fid,))
-        companies = [r[0] for r in cursor.fetchall()]
-        conn.close()
-        api_key_set = bool(os.environ.get('ANTHROPIC_API_KEY'))
-        return render_template_string(AI_IMPORT_GRN_HTML, companies=companies, api_key_set=api_key_set,
-                                       import_type='grn', action_url='/grn/ai_import')
-
-    company = request.form.get('company', '').strip()
-    file = request.files.get('doc_file')
-    if not company or not file or file.filename == '':
-        conn.close()
-        return redirect('/grn/ai_import?error=' + quote('Please select a company and a file.'))
-
-    filename_lower = file.filename.lower()
-    if filename_lower.endswith('.pdf'):
-        mimetype = 'application/pdf'
-    elif filename_lower.endswith(('.jpg', '.jpeg')):
-        mimetype = 'image/jpeg'
-    elif filename_lower.endswith('.png'):
-        mimetype = 'image/png'
-    else:
-        conn.close()
-        return redirect('/grn/ai_import?error=' + quote('Please upload a PDF, JPG or PNG file.'))
-
-    file_bytes = file.read()
-    parsed, error = call_ai_extraction(file_bytes, mimetype, 'grn')
-    ts = now_ist().isoformat()
-    if error:
-        cursor.execute('''INSERT INTO ai_import_staging (factory_id, import_type, company, source_filename, extracted_json, status, error_message, created_at, created_by)
-                           VALUES (%s,'GRN',%s,%s,NULL,'failed',%s,%s,%s)''', (fid, company, file.filename, error, ts, session.get('user_name')))
+    if request.method == 'POST':
+        smtp_host = request.form.get('smtp_host', '').strip()
+        smtp_port_raw = request.form.get('smtp_port', '').strip()
+        smtp_username = request.form.get('smtp_username', '').strip()
+        smtp_password = request.form.get('smtp_password', '')
+        from_email = request.form.get('from_email', '').strip()
+        from_name = request.form.get('from_name', '').strip()
+        use_tls = request.form.get('use_tls') == 'on'
+        if not (smtp_host and smtp_port_raw and smtp_username and from_email):
+            conn.close()
+            return redirect('/email/config?error=' + quote('SMTP Host, Port, Username and From Email are all required.'))
+        try:
+            smtp_port = int(smtp_port_raw)
+        except ValueError:
+            conn.close()
+            return redirect('/email/config?error=' + quote('SMTP Port must be a number.'))
+        ts = now_ist().isoformat()
+        cursor.execute('SELECT smtp_password_encrypted FROM email_config WHERE factory_id = %s', (fid,))
+        existing = cursor.fetchone()
+        # Only re-encrypt/overwrite the password if a new one was actually typed — leaving the field
+        # blank on an edit keeps the existing stored credential (never forces a re-entry every time).
+        password_encrypted = encrypt_smtp_password(smtp_password) if smtp_password else (existing[0] if existing else None)
+        if smtp_password and password_encrypted is None:
+            conn.close()
+            return redirect('/email/config?error=' + quote('EMAIL_CRYPT_KEY is not configured on the server — cannot securely store the password. Contact your administrator.'))
+        cursor.execute('''INSERT INTO email_config (factory_id, smtp_host, smtp_port, smtp_username, smtp_password_encrypted,
+                           from_email, from_name, use_tls, is_configured, updated_at, updated_by)
+                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,TRUE,%s,%s)
+                           ON CONFLICT (factory_id) DO UPDATE SET smtp_host=EXCLUDED.smtp_host, smtp_port=EXCLUDED.smtp_port,
+                           smtp_username=EXCLUDED.smtp_username, smtp_password_encrypted=EXCLUDED.smtp_password_encrypted,
+                           from_email=EXCLUDED.from_email, from_name=EXCLUDED.from_name, use_tls=EXCLUDED.use_tls,
+                           is_configured=TRUE, updated_at=EXCLUDED.updated_at, updated_by=EXCLUDED.updated_by''',
+                       (fid, smtp_host, smtp_port, smtp_username, password_encrypted, from_email, from_name, use_tls, ts, session.get('user_name')))
+        log_audit(cursor, 'Email Configuration Updated', 'Email', '', f'SMTP host set to {smtp_host}, from {from_email}')
         conn.commit()
         conn.close()
-        return redirect('/grn/ai_import?error=' + quote(error))
+        return redirect('/email/config?ok=1&msg=' + quote('Email configuration saved.'))
+    cfg = get_email_config(cursor, fid)
+    conn.close()
+    return render_template_string(EMAIL_CONFIG_HTML, cfg=cfg, error_msg=request.args.get('error'),
+                                   ok_msg=request.args.get('msg') if request.args.get('ok') else None)
 
-    cursor.execute('''INSERT INTO ai_import_staging (factory_id, import_type, company, source_filename, extracted_json, status, created_at, created_by)
-                       VALUES (%s,'GRN',%s,%s,%s,'pending_review',%s,%s) RETURNING id''',
-                   (fid, company, file.filename, json.dumps(parsed), ts, session.get('user_name')))
-    staging_id = cursor.fetchone()[0]
+@app.route('/email/config/test', methods=['POST'])
+def email_config_test():
+    if not session.get('logged_in'): return redirect('/login')
+    if session.get('role') != 'Factory Admin':
+        return "Access denied — only a Factory Admin can manage email configuration.", 403
+    fid = current_factory_id()
+    test_to = request.form.get('test_to', '').strip()
+    if not test_to:
+        return redirect('/email/config?error=' + quote('Enter an email address to send the test to.'))
+    conn = get_conn()
+    cursor = conn.cursor()
+    ok, result = send_tenant_email(cursor, fid, test_to, None,
+                                    'Test Email — Email Configuration Verified',
+                                    'This is a test email confirming your SMTP email configuration is working correctly.',
+                                    session.get('user_name'), email_type='test')
     conn.commit()
     conn.close()
-    return redirect(f'/grn/ai_import/review/{staging_id}')
+    if ok:
+        return redirect('/email/config?ok=1&msg=' + quote(f'Test email sent successfully to {test_to}.'))
+    return redirect('/email/config?error=' + quote(result))
 
-@app.route('/grn/ai_import/review/<int:staging_id>')
-def grn_ai_import_review(staging_id):
+@app.route('/email/contacts')
+def email_contacts_page():
     if not session.get('logged_in'): return redirect('/login')
     fid = current_factory_id()
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute('SELECT company, source_filename, extracted_json, status FROM ai_import_staging WHERE id = %s AND factory_id = %s AND import_type = %s',
-                   (staging_id, fid, 'GRN'))
-    row = cursor.fetchone()
+    cursor.execute('SELECT id, company_name, to_email, cc_email, contact_person, is_active FROM email_contacts WHERE factory_id = %s ORDER BY company_name', (fid,))
+    contacts = cursor.fetchall()
+    cursor.execute('SELECT name FROM companies WHERE factory_id = %s ORDER BY name', (fid,))
+    companies = [r[0] for r in cursor.fetchall()]
     conn.close()
-    if not row:
-        return "Import not found. <a href='/grn/ai_import'>Back</a>", 404
-    company, filename, extracted_json, status = row
-    extracted = json.loads(extracted_json) if extracted_json else {'items': []}
-    return render_template_string(AI_IMPORT_REVIEW_GRN_HTML, staging_id=staging_id, company=company,
-                                   filename=filename, extracted=extracted, status=status)
+    return render_template_string(EMAIL_CONTACTS_HTML, contacts=contacts, companies=companies,
+                                   error_msg=request.args.get('error'), ok_msg=request.args.get('ok'))
 
-@app.route('/grn/ai_import/review/<int:staging_id>/commit', methods=['POST'])
-def grn_ai_import_commit(staging_id):
+@app.route('/email/contacts/add', methods=['POST'])
+def email_contacts_add():
+    if not session.get('logged_in'): return redirect('/login')
+    fid = current_factory_id()
+    company_name = request.form.get('company_name', '').strip()
+    to_email = request.form.get('to_email', '').strip()
+    cc_email = request.form.get('cc_email', '').strip()
+    contact_person = request.form.get('contact_person', '').strip()
+    if not (company_name and to_email):
+        return redirect('/email/contacts?error=' + quote('Company and To Email are required.'))
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute('''INSERT INTO email_contacts (factory_id, company_name, to_email, cc_email, contact_person, is_active, created_at)
+                       VALUES (%s,%s,%s,%s,%s,TRUE,%s)
+                       ON CONFLICT (factory_id, company_name) DO UPDATE SET to_email=EXCLUDED.to_email, cc_email=EXCLUDED.cc_email,
+                       contact_person=EXCLUDED.contact_person''',
+                   (fid, company_name, to_email, cc_email, contact_person, now_ist().isoformat()))
+    conn.commit()
+    conn.close()
+    return redirect('/email/contacts?ok=1')
+
+@app.route('/email/contacts/delete/<int:contact_id>', methods=['POST'])
+def email_contacts_delete(contact_id):
     if not session.get('logged_in'): return redirect('/login')
     fid = current_factory_id()
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute('SELECT company, status FROM ai_import_staging WHERE id = %s AND factory_id = %s AND import_type = %s', (staging_id, fid, 'GRN'))
-    row = cursor.fetchone()
-    if not row or row[1] == 'committed':
-        conn.close()
-        return redirect('/grn/ai_import')
-    company = row[0]
-    po_number = request.form.get('po_number', '').strip()
-    grn_number = request.form.get('grn_number', '').strip() or None
-    grn_date = request.form.get('grn_date', '').strip() or None
-    item_names = request.form.getlist('item_name')
-    qtys = request.form.getlist('received_qty')
-    includes = request.form.getlist('include')
+    cursor.execute('DELETE FROM email_contacts WHERE id = %s AND factory_id = %s', (contact_id, fid))
+    conn.commit()
+    conn.close()
+    return redirect('/email/contacts')
 
-    if not po_number or not item_names:
-        conn.close()
-        return redirect(f'/grn/ai_import/review/{staging_id}?error=' + quote('PO number and at least one item are required.'))
+@app.route('/email/history')
+def email_history_page():
+    if not session.get('logged_in'): return redirect('/login')
+    fid = current_factory_id()
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute('''SELECT email_type, po_number, to_email, cc_email, subject, sent_by, sent_at, status, failure_reason
+                       FROM email_log WHERE factory_id = %s ORDER BY id DESC LIMIT 300''', (fid,))
+    entries = cursor.fetchall()
+    conn.close()
+    return render_template_string(EMAIL_HISTORY_HTML, entries=entries)
 
-    ts = now_ist().isoformat()
-    inserted = 0
-    over_capacity = 0
-    for i in range(len(item_names)):
-        if str(i) not in includes:
-            continue
-        item_name = item_names[i].strip()
-        if not item_name:
-            continue
+@app.route('/settings/loading_location', methods=['GET', 'POST'])
+def factory_loading_location_page():
+    """P9/X: Factory Loading Location — fixed/controlled, settable ONLY by a Factory Admin (not
+    freely changeable at Start Loading by any normal user). Uses the same map-based picker pattern
+    already used for DC location selection."""
+    if not session.get('logged_in'): return redirect('/login')
+    if session.get('role') != 'Factory Admin':
+        return "Access denied — only a Factory Admin can configure the Factory Loading Location.", 403
+    fid = current_factory_id()
+    conn = get_conn()
+    cursor = conn.cursor()
+    if request.method == 'POST':
+        name = request.form.get('loading_location_name', '').strip()
+        lat_raw = request.form.get('loading_location_lat', '').strip()
+        lng_raw = request.form.get('loading_location_lng', '').strip()
+        if not (lat_raw and lng_raw):
+            conn.close()
+            return redirect('/settings/loading_location?error=' + quote('Please pick a location on the map.'))
         try:
-            received_qty = int(float(qtys[i])) if i < len(qtys) and qtys[i].strip() else 0
+            lat, lng = float(lat_raw), float(lng_raw)
         except ValueError:
-            received_qty = 0
-        if received_qty <= 0:
-            continue
-        ok, err, _ = check_grn_capacity(cursor, fid, company, po_number, item_name, received_qty)
-        if not ok:
-            over_capacity += 1
-            continue
-        cursor.execute('''INSERT INTO grn_log (factory_id, company, po_number, item_name, grn_number, grn_date, received_qty, created_at, created_by)
-                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)''',
-                       (fid, company, po_number, item_name, grn_number, grn_date, received_qty, ts, session.get('user_name')))
-        inserted += 1
-
-    cursor.execute("UPDATE ai_import_staging SET status = 'committed' WHERE id = %s", (staging_id,))
-    log_audit(cursor, 'AI GRN Import Committed', 'GRN', po_number, f'{company}: {inserted} item(s) logged from AI-scanned document')
-    conn.commit()
-    conn.close()
-    msg = f'{inserted} GRN item(s) logged against PO {po_number}.'
-    if over_capacity:
-        msg += f' {over_capacity} item(s) rejected (would exceed PO ordered quantity).'
-    return redirect('/grn?ok=1&msg=' + quote(msg))
-
-@app.route('/grn/ai_import/review/<int:staging_id>/discard', methods=['POST'])
-def grn_ai_import_discard(staging_id):
-    if not session.get('logged_in'): return redirect('/login')
-    fid = current_factory_id()
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute("UPDATE ai_import_staging SET status = 'discarded' WHERE id = %s AND factory_id = %s AND import_type = 'GRN'", (staging_id, fid))
-    conn.commit()
-    conn.close()
-    return redirect('/grn/ai_import')
-
-@app.route('/grn/import_csv', methods=['POST'])
-def grn_import_csv():
-    if not session.get('logged_in'): return redirect('/login')
-    fid = current_factory_id()
-    company = request.form.get('company', '').strip()
-    if not company:
-        return redirect('/grn?ok=0&msg=' + quote('Please select a company for this import.'))
-    file = request.files.get('grn_file')
-    if not file or file.filename == '':
-        return redirect('/grn?ok=0&msg=' + quote('No file selected.'))
-    filename_lower = file.filename.lower()
-    if not (filename_lower.endswith('.csv') or filename_lower.endswith('.xlsx')):
-        return redirect('/grn?ok=0&msg=' + quote('Please upload a .csv or .xlsx file.'))
-
-    fieldnames, rows = _read_spreadsheet_rows(file)
-    if fieldnames is None:
-        return redirect('/grn?ok=0&msg=' + quote('Could not read the file — check it has a header row and try again.'))
-
-    colmap = _map_csv_headers(fieldnames)
-    received_alias = {'received_qty': ['received_qty', 'received qty', 'received quantity', 'grn_qty', 'grn qty', 'qty received']}
-    normalized = {f.strip().lower(): f for f in fieldnames if f}
-    received_col = None
-    for alias in received_alias['received_qty']:
-        if alias in normalized:
-            received_col = normalized[alias]
-            break
-    if 'po_number' not in colmap or 'item_name' not in colmap or not received_col:
-        return redirect('/grn?ok=0&msg=' + quote('File must have po_number, item_name and received_qty columns.'))
-
-    grn_num_col = normalized.get('grn_number') or normalized.get('grn no') or normalized.get('grn_no')
-    grn_date_col = normalized.get('grn_date') or normalized.get('grn date')
-
-    conn = get_conn()
-    cursor = conn.cursor()
-    inserted, skipped, over_capacity = 0, 0, 0
-    ts = now_ist().isoformat()
-    for row in rows:
-        po_number = (row.get(colmap['po_number']) or '').strip()
-        item_name = (row.get(colmap['item_name']) or '').strip()
-        qty_raw = (row.get(received_col) or '').strip()
-        grn_number = (row.get(grn_num_col) or '').strip() if grn_num_col else ''
-        grn_date = (row.get(grn_date_col) or '').strip() if grn_date_col else ''
-        if not po_number or not item_name or not qty_raw:
-            skipped += 1
-            continue
-        try:
-            received_qty = int(float(qty_raw))
-        except ValueError:
-            skipped += 1
-            continue
-        if received_qty <= 0:
-            skipped += 1
-            continue
-        # I1: same server-side, race-condition-safe check as the single-entry GRN form.
-        ok, err, _ = check_grn_capacity(cursor, fid, company, po_number, item_name, received_qty)
-        if not ok:
-            over_capacity += 1
-            continue
-        cursor.execute('''INSERT INTO grn_log (factory_id, company, po_number, item_name, grn_number, grn_date, received_qty, created_at, created_by)
-                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)''',
-                       (fid, company, po_number, item_name, grn_number or None, grn_date or None, received_qty, ts, session.get('user_name')))
-        inserted += 1
-    log_audit(cursor, 'GRN Bulk Imported', 'GRN', '', f'{company}: {inserted} GRN rows imported')
-    conn.commit()
-    conn.close()
-    msg = f'{inserted} GRN entries imported for {company}.'
-    if skipped:
-        msg += f' {skipped} rows skipped (incomplete data).'
-    if over_capacity:
-        msg += f' {over_capacity} row(s) rejected (would exceed PO ordered quantity).'
-    return redirect('/grn?ok=1&msg=' + quote(msg))
-
-@app.route('/grn/delete/<int:grn_id>', methods=['POST'])
-def grn_delete(grn_id):
-    if not session.get('logged_in'): return redirect('/login')
-    fid = current_factory_id()
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute('SELECT po_number, item_name, received_qty FROM grn_log WHERE id = %s AND factory_id = %s', (grn_id, fid))
+            conn.close()
+            return redirect('/settings/loading_location?error=' + quote('Invalid coordinates.'))
+        cursor.execute('UPDATE factories SET loading_location_name = %s, loading_location_lat = %s, loading_location_lng = %s, updated_at = %s WHERE id = %s',
+                       (name or None, lat, lng, now_ist().isoformat(), fid))
+        log_audit(cursor, 'Factory Loading Location Updated', 'Vehicle', '', f'Set to {name or "(unnamed)"} ({lat:.5f}, {lng:.5f})')
+        conn.commit()
+        conn.close()
+        return redirect('/settings/loading_location?ok=1')
+    cursor.execute('SELECT loading_location_name, loading_location_lat, loading_location_lng FROM factories WHERE id = %s', (fid,))
     row = cursor.fetchone()
-    cursor.execute('DELETE FROM grn_log WHERE id = %s AND factory_id = %s', (grn_id, fid))
-    if row:
-        log_audit(cursor, 'GRN Entry Deleted', 'GRN', row[0], f'{row[1]}: removed receipt of {row[2]}')
-    conn.commit()
     conn.close()
-    return redirect('/grn')
+    current = {'name': row[0], 'lat': row[1], 'lng': row[2]} if row and row[1] is not None else None
+    return render_template_string(FACTORY_LOADING_LOCATION_HTML, current=current, error_msg=request.args.get('error'), ok=request.args.get('ok'))
 
 @app.route('/companies')
 def companies_page():
@@ -3545,7 +3682,7 @@ def production_page():
 
     if tab == 'history':
         cursor.execute('''SELECT id, company, sub_brand, item_name, batch_number, quantity, qc_name,
-                           packing_date, use_by_date, prod_date, prod_time, created_at, qc_status
+                           packing_date, use_by_date, prod_date, prod_time, created_at, qc_status, worker_name, rejection_reason
                            FROM daily_production WHERE factory_id = %s ORDER BY id DESC LIMIT 500''', (fid,))
         rows = cursor.fetchall()
         now = now_ist()
@@ -3553,7 +3690,7 @@ def production_page():
         order = []
         for r in rows:
             (pid, company, sub_brand, item_name, batch_number, quantity, qc_name,
-             packing_date, use_by_date, prod_date, prod_time, created_at, qc_status) = r
+             packing_date, use_by_date, prod_date, prod_time, created_at, qc_status, worker_name, rejection_reason) = r
             try:
                 created_dt = datetime.fromisoformat(created_at)
             except Exception:
@@ -3561,8 +3698,8 @@ def production_page():
             editable = (now - created_dt) <= timedelta(hours=12)
             entry = {
                 'id': pid, 'company': company, 'sub_brand': sub_brand, 'item_name': item_name,
-                'batch_number': batch_number, 'quantity': quantity, 'qc_name': qc_name,
-                'packing_date': packing_date, 'use_by_date': use_by_date,
+                'batch_number': batch_number, 'quantity': quantity, 'qc_name': qc_name, 'worker_name': worker_name,
+                'packing_date': packing_date, 'use_by_date': use_by_date, 'rejection_reason': rejection_reason,
                 'prod_time': prod_time, 'editable': editable, 'qc_status': qc_status or 'Approved'
             }
             if prod_date not in groups:
@@ -3574,10 +3711,11 @@ def production_page():
 
     elif tab == 'pending_qc':
         cursor.execute('''SELECT id, company, sub_brand, item_name, batch_number, quantity,
-                           packing_date, use_by_date, prod_date, prod_time
+                           packing_date, use_by_date, prod_date, prod_time, worker_name, barcode
                            FROM daily_production WHERE factory_id = %s AND qc_status = 'QC Pending' ORDER BY id ASC''', (fid,))
         pending_qc_entries = [{'id': r[0], 'company': r[1], 'sub_brand': r[2], 'item_name': r[3], 'batch_number': r[4],
-                                'quantity': r[5], 'packing_date': r[6], 'use_by_date': r[7], 'prod_date': r[8], 'prod_time': r[9]}
+                                'quantity': r[5], 'packing_date': r[6], 'use_by_date': r[7], 'prod_date': r[8], 'prod_time': r[9],
+                                'worker_name': r[10], 'barcode': r[11]}
                                for r in cursor.fetchall()]
 
     elif tab == 'summary':
@@ -3639,6 +3777,10 @@ def validate_production_input(cursor, fid, company, sub_brand, barcode, item_nam
 
 @app.route('/production/add', methods=['POST'])
 def production_add():
+    """P7/M: Daily Production Log Entry — 'Submit for QC'. ALWAYS lands as QC Pending; there is no
+    longer an inline same-transaction QC check-in shortcut — verification is a strictly separate
+    step performed later by a QC person (see production_qc_inspect below). Worker name is required
+    so every entry is traceable to who submitted it."""
     if not session.get('logged_in'): return redirect('/login')
     fid = current_factory_id()
     company = request.form.get('company', '').strip()
@@ -3650,14 +3792,12 @@ def production_add():
     use_by_date = request.form.get('use_by_date', '').strip()
     batch_number = request.form.get('batch_number', '').strip()
     quantity_raw = request.form.get('quantity', '').strip()
-    qc_name = request.form.get('qc_name', '').strip()
-    qc_photo = request.form.get('qc_photo', '').strip()
-    save_as_pending = request.form.get('save_as_pending', '').strip() == '1'
+    worker_name = request.form.get('worker_name', '').strip()
 
+    if not worker_name:
+        return redirect('/production?tab=log&ok=0&msg=' + quote('Worker name is required.'))
     if not barcode or not item_name:
         return redirect('/production?tab=log&ok=0&msg=' + quote('Please scan and confirm a barcode before submitting.'))
-    if not save_as_pending and (not qc_name or not qc_photo):
-        return redirect('/production?tab=log&ok=0&msg=' + quote('Quality Checker check-in (name + photo) is required.'))
     try:
         quantity = int(float(quantity_raw))
     except ValueError:
@@ -3674,23 +3814,34 @@ def production_add():
         conn.close()
         return redirect('/production?tab=log&ok=0&msg=' + quote(err))
 
-    qc_status = 'QC Pending' if save_as_pending else 'Approved'
-    if save_as_pending:
-        qc_name, qc_photo = None, None
+    # P7/AK: prevent accidental duplicate submission — same batch+barcode can't have two entries
+    # simultaneously sitting in QC Pending (a genuine re-submission after rejection is handled by
+    # the dedicated resubmit route below, which first clears the rejected entry's pending state).
+    if batch_number:
+        cursor.execute("SELECT id FROM daily_production WHERE factory_id=%s AND barcode=%s AND batch_number=%s AND qc_status='QC Pending'",
+                       (fid, barcode, batch_number))
+        if cursor.fetchone():
+            conn.close()
+            return redirect('/production?tab=log&ok=0&msg=' + quote(f'Batch {batch_number} for this barcode is already QC Pending — avoid duplicate submission.'))
 
     now = now_ist()
     cursor.execute('''INSERT INTO daily_production
         (factory_id, company, sub_brand, item_name_entered, item_name, barcode, packing_date, use_by_date,
-         batch_number, quantity, qc_name, qc_photo, qc_status, prod_date, prod_time, created_at)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
+         batch_number, quantity, worker_name, qc_status, prod_date, prod_time, created_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'QC Pending', %s, %s, %s) RETURNING id''',
         (fid, company, sub_brand, item_name_entered, item_name, barcode, packing_date, use_by_date,
-         batch_number, quantity, qc_name, qc_photo, qc_status, now.strftime('%d %b %Y'), now.strftime('%I:%M %p'), now.isoformat()))
-    log_audit(cursor, 'Production Entry Created', 'Production', '', f'{company}: {item_name} x{quantity} (batch {batch_number or "—"})')
+         batch_number, quantity, worker_name, now.strftime('%d %b %Y'), now.strftime('%I:%M %p'), now.isoformat()))
+    prod_id = cursor.fetchone()[0]
+    # P7/N: "notification" = this entry becoming visible in every Available QC's Pending QC tab —
+    # already tenant-scoped (filtered by factory_id), so Company A's QC never sees Company B's queue.
+    cursor.execute('''INSERT INTO qc_history (factory_id, production_id, event_type, quantity, barcode,
+                       packing_date, use_by_date, batch_number, performed_by, performed_at)
+                       VALUES (%s,%s,'submitted',%s,%s,%s,%s,%s,%s,%s)''',
+                   (fid, prod_id, quantity, barcode, packing_date, use_by_date, batch_number, worker_name, now.isoformat()))
+    log_audit(cursor, 'Production Entry Created', 'Production', prod_id, f'{company}: {item_name} x{quantity} by {worker_name} — QC Pending')
     conn.commit()
     conn.close()
-    if save_as_pending:
-        return redirect('/production?tab=history&ok=1&msg=' + quote('No QC was available — entry saved as QC Pending. Any available QC can inspect it later.'))
-    return redirect('/production?tab=history&ok=1&msg=' + quote('Production entry logged successfully.'))
+    return redirect('/production?tab=history&ok=1&msg=' + quote('Submitted for QC — entry is now QC Pending.'))
 
 @app.route('/production/edit/<int:entry_id>', methods=['POST'])
 def production_edit(entry_id):
@@ -3778,13 +3929,34 @@ def production_qc_add():
 
 @app.route('/production/qc/inspect/<int:entry_id>', methods=['POST'])
 def production_qc_inspect(entry_id):
+    """P7/O: QC Verification. QC re-verifies the actual figures (they may differ from what the
+    worker originally logged) — quantity, full barcode scan, packing date, use-by date, batch
+    number — then submits a verdict. Rejected entries require a mandatory reason and can be
+    resubmitted by the worker (see production_resubmit below); every step is appended to
+    qc_history so rejection history is never lost, even across resubmissions."""
     if not session.get('logged_in'): return redirect('/login')
     fid = current_factory_id()
     qc_name = request.form.get('qc_name', '').strip()
     qc_photo = request.form.get('qc_photo', '').strip()
     verdict = request.form.get('verdict', '').strip()
+    verified_quantity_raw = request.form.get('verified_quantity', '').strip()
+    verified_barcode = request.form.get('verified_barcode', '').strip()
+    verified_packing_date = request.form.get('verified_packing_date', '').strip()
+    verified_use_by_date = request.form.get('verified_use_by_date', '').strip()
+    verified_batch_number = request.form.get('verified_batch_number', '').strip()
+    rejection_reason = request.form.get('rejection_reason', '').strip()
     if verdict not in ('Approved', 'Rejected') or not qc_name or not qc_photo:
         return redirect('/production?tab=pending_qc&ok=0&msg=' + quote('QC name, selfie and a decision (Approve/Reject) are all required.'))
+    if not (verified_quantity_raw and verified_barcode and verified_packing_date and verified_use_by_date and verified_batch_number):
+        return redirect('/production?tab=pending_qc&ok=0&msg=' + quote('QC must verify actual quantity, full barcode, packing date, use-by date and batch number.'))
+    if verdict == 'Rejected' and not rejection_reason:
+        return redirect('/production?tab=pending_qc&ok=0&msg=' + quote('A rejection reason is required.'))
+    try:
+        verified_quantity = int(float(verified_quantity_raw))
+    except ValueError:
+        return redirect('/production?tab=pending_qc&ok=0&msg=' + quote('Verified quantity must be a number.'))
+    if verified_quantity <= 0:
+        return redirect('/production?tab=pending_qc&ok=0&msg=' + quote('Verified quantity must be greater than zero.'))
     conn = get_conn()
     cursor = conn.cursor()
     # Only a currently-Available QC belonging to this factory may inspect — prevents someone
@@ -3793,12 +3965,51 @@ def production_qc_inspect(entry_id):
     if not cursor.fetchone():
         conn.close()
         return redirect('/production?tab=pending_qc&ok=0&msg=' + quote(f'{qc_name} is not currently marked Available.'))
-    cursor.execute("UPDATE daily_production SET qc_name = %s, qc_photo = %s, qc_status = %s WHERE id = %s AND factory_id = %s AND qc_status = 'QC Pending'",
-                   (qc_name, qc_photo, verdict, entry_id, fid))
-    log_audit(cursor, f'QC {verdict}', 'QC', entry_id, f'by {qc_name}')
+    # Prevents a second/duplicate QC approval on the same entry (spec AK) — only a currently
+    # 'QC Pending' row can be transitioned, so a second concurrent submit on an already-decided
+    # entry simply affects zero rows.
+    cursor.execute("""UPDATE daily_production SET qc_name=%s, qc_photo=%s, qc_status=%s,
+                       verified_quantity=%s, verified_barcode=%s, verified_packing_date=%s,
+                       verified_use_by_date=%s, verified_batch_number=%s, rejection_reason=%s
+                       WHERE id=%s AND factory_id=%s AND qc_status='QC Pending' """,
+                   (qc_name, qc_photo, verdict, verified_quantity, verified_barcode, verified_packing_date,
+                    verified_use_by_date, verified_batch_number, rejection_reason if verdict == 'Rejected' else None, entry_id, fid))
+    if cursor.rowcount == 0:
+        conn.close()
+        return redirect('/production?tab=pending_qc&ok=0&msg=' + quote('This entry was already decided (duplicate QC approval prevented).'))
+    ts = now_ist().isoformat()
+    cursor.execute('''INSERT INTO qc_history (factory_id, production_id, event_type, quantity, barcode,
+                       packing_date, use_by_date, batch_number, qc_name, verdict, reason, performed_by, performed_at)
+                       VALUES (%s,%s,'verified',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)''',
+                   (fid, entry_id, verified_quantity, verified_barcode, verified_packing_date, verified_use_by_date,
+                    verified_batch_number, qc_name, verdict, rejection_reason or None, qc_name, ts))
+    log_audit(cursor, f'QC {verdict}', 'QC', entry_id, f'by {qc_name}' + (f' — reason: {rejection_reason}' if verdict == 'Rejected' else ''))
     conn.commit()
     conn.close()
     return redirect('/production?tab=pending_qc&ok=1&msg=' + quote(f'Entry {verdict.lower()} by {qc_name}.'))
+
+@app.route('/production/resubmit/<int:entry_id>', methods=['POST'])
+def production_resubmit(entry_id):
+    """P7/P: resubmit a Rejected entry back to QC Pending. Previous rejection reason/history is
+    NEVER erased — it stays in qc_history permanently; only the live row's qc_status changes so it
+    reappears in the Pending QC queue."""
+    if not session.get('logged_in'): return redirect('/login')
+    fid = current_factory_id()
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT qc_status FROM daily_production WHERE id = %s AND factory_id = %s", (entry_id, fid))
+    row = cursor.fetchone()
+    if not row or row[0] != 'Rejected':
+        conn.close()
+        return redirect('/production?tab=history&ok=0&msg=' + quote('Only a Rejected entry can be resubmitted.'))
+    cursor.execute("UPDATE daily_production SET qc_status='QC Pending', qc_name=NULL, qc_photo=NULL WHERE id=%s AND factory_id=%s", (entry_id, fid))
+    ts = now_ist().isoformat()
+    cursor.execute('''INSERT INTO qc_history (factory_id, production_id, event_type, performed_by, performed_at)
+                       VALUES (%s,%s,'resubmitted',%s,%s)''', (fid, entry_id, session.get('user_name'), ts))
+    log_audit(cursor, 'Production Resubmitted for QC', 'QC', entry_id, f'by {session.get("user_name")}')
+    conn.commit()
+    conn.close()
+    return redirect('/production?tab=pending_qc&ok=1&msg=' + quote('Entry resubmitted for QC.'))
 
 @app.route('/production/qc/availability/<int:qc_id>', methods=['POST'])
 def production_qc_availability(qc_id):
@@ -3965,23 +4176,19 @@ def pos_page():
     # Group items by (company, po_number) so a whole wrongly-uploaded PO can be deleted in one go
     groups_map = {}
     order = []
-    shortage_map = get_po_shortage_map(cursor, fid)
     for it in rows:
         key = (it[6] or '', it[1])
         if key not in groups_map:
             groups_map[key] = {'company': it[6] or '', 'po_number': it[1], 'rows': [], 'total_ordered': 0,
-                                'has_rate_diff': False, 'has_draft': False, 'po_date': it[9], 'delivery_date': it[10],
-                                'fully_received': True}
+                                'has_rate_diff': False, 'has_draft': False, 'po_date': it[9], 'delivery_date': it[10]}
             order.append(key)
         rate_info = get_rate_status(cursor, fid, it[6], it[2], it[7])
+        cost_variation = get_cost_variation(cursor, fid, it[6], it[2], it[7], it[4])
         if rate_info['status'] == 'diff':
             groups_map[key]['has_rate_diff'] = True
         if (it[8] or 'Draft') == 'Draft':
             groups_map[key]['has_draft'] = True
-        shortage_info = shortage_map.get((it[6] or '', it[1], it[2]), {'ordered': it[4] or 0, 'received': 0, 'pending': it[4] or 0, 'fulfilled': False})
-        if not shortage_info['fulfilled']:
-            groups_map[key]['fully_received'] = False
-        groups_map[key]['rows'].append(it + (rate_info, shortage_info))
+        groups_map[key]['rows'].append(it + (rate_info, cost_variation))
         groups_map[key]['total_ordered'] += it[4] or 0
     po_groups = [groups_map[k] for k in order]
     conn.close()
@@ -4364,6 +4571,192 @@ def pos_import_csv():
         msg += f' {skipped} rows skipped (incomplete data).'
     return redirect('/pos?company=' + quote(company) + '&ok=1&msg=' + quote(msg))
 
+@app.route('/cost_variation/<int:item_id>/send_revised_po_email', methods=['POST'])
+def cost_variation_select_company(item_id):
+    """P3 STEP 1: shows ONLY the company selector — does not send anything yet."""
+    if not session.get('logged_in'): return redirect('/login')
+    fid = current_factory_id()
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute('SELECT po_number, item_name, company, ordered_qty, rate FROM po_items WHERE id = %s AND factory_id = %s', (item_id, fid))
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        return redirect('/pos')
+    cursor.execute('SELECT name FROM companies WHERE factory_id = %s ORDER BY name', (fid,))
+    companies = [r[0] for r in cursor.fetchall()]
+    conn.close()
+    return render_template_string(SELECT_COMPANY_HTML, item_id=item_id, po_number=row[0], item_name=row[1], companies=companies)
+
+@app.route('/cost_variation/<int:item_id>/preview_email', methods=['POST'])
+def cost_variation_preview_email(item_id):
+    """P3 STEP 2: after company selection, builds the FULL email preview automatically — never
+    sends yet. STEP 3 (Edit) is simply this same page's editable Subject/Body fields."""
+    if not session.get('logged_in'): return redirect('/login')
+    fid = current_factory_id()
+    selected_company = request.form.get('company', '').strip()
+    if not selected_company:
+        return redirect(f'/cost_variation/{item_id}/send_revised_po_email')
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute('SELECT po_number, item_name, company, ordered_qty, rate FROM po_items WHERE id = %s AND factory_id = %s', (item_id, fid))
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        return redirect('/pos')
+    po_number, item_name, po_company, qty, po_rate = row
+    cv = get_cost_variation(cursor, fid, po_company, item_name, po_rate, qty)
+    cursor.execute('SELECT to_email, cc_email FROM email_contacts WHERE factory_id = %s AND company_name = %s AND is_active = TRUE', (fid, selected_company))
+    contact = cursor.fetchone()
+    conn.close()
+    if not contact:
+        return redirect(f'/cost_variation/{item_id}/send_revised_po_email?error=' + quote(f'No active email contact saved for {selected_company}. Add one in Company Email Master first.'))
+    to_email, cc_email = contact
+    subject = 'PO Revision Required – Cost Variation Above Approved Limit'
+    body = (f"Dear {selected_company} Team,\n\n"
+            f"During review of the following Purchase Order, we found a cost variation above our approved limit:\n\n"
+            f"PO Number: {po_number}\n"
+            f"Item: {item_name}\n"
+            f"Quantity: {qty}\n"
+            f"PO Rate: ₹{po_rate}\n"
+            f"Applicable Approved Cost: ₹{cv['approved_rate']}\n"
+            f"Total Variance: ₹{cv['variance']:.2f}\n"
+            f"Status: RED — Revision Required\n\n"
+            f"Kindly review this PO and send us a revised PO with the corrected rate.\n\n"
+            f"Regards")
+    return render_template_string(EMAIL_PREVIEW_HTML, item_id=item_id, company=selected_company, to_email=to_email,
+                                   cc_email=cc_email or '', subject=subject, body=body, po_number=po_number)
+
+@app.route('/cost_variation/<int:item_id>/send_email', methods=['POST'])
+def cost_variation_send_email(item_id):
+    """P3 STEP 4: actual send, using the (possibly edited) preview content. From address is always
+    the CURRENT tenant's own configured sender — never hardcoded, never another tenant's."""
+    if not session.get('logged_in'): return redirect('/login')
+    fid = current_factory_id()
+    to_email = request.form.get('to_email', '').strip()
+    cc_email = request.form.get('cc_email', '').strip()
+    subject = request.form.get('subject', '').strip()
+    body = request.form.get('body', '').strip()
+    if not (to_email and subject and body):
+        return redirect('/pos?ok=0&msg=' + quote('Email preview is incomplete — cannot send.'))
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute('SELECT po_number FROM po_items WHERE id = %s AND factory_id = %s', (item_id, fid))
+    row = cursor.fetchone()
+    po_number = row[0] if row else ''
+    ok, result = send_tenant_email(cursor, fid, to_email, cc_email or None, subject, body,
+                                    session.get('user_name'), po_number=po_number, email_type='revised_po')
+    if ok:
+        log_audit(cursor, 'Revised PO Email Sent', 'Rate Master', po_number, f'To {to_email}, variance revision requested')
+    conn.commit()
+    conn.close()
+    if ok:
+        return redirect('/pos?ok=1&msg=' + quote('Revised PO email sent successfully.'))
+    return redirect('/pos?ok=0&msg=' + quote(result))
+
+@app.route('/cost_variation/<int:item_id>/upload_revised_po', methods=['GET', 'POST'])
+def cost_variation_upload_revised_po(item_id):
+    """P4: uploads a revised PO document, NEVER touching/overwriting the original po_items row.
+    Recalculates variance (P/I) and stores this as a new versioned row in po_revisions."""
+    if not session.get('logged_in'): return redirect('/login')
+    fid = current_factory_id()
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute('SELECT po_number, item_name, company, ordered_qty, rate FROM po_items WHERE id = %s AND factory_id = %s', (item_id, fid))
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        return redirect('/pos')
+    po_number, item_name, company, orig_qty, orig_rate = row
+    if request.method == 'GET':
+        cursor.execute('SELECT MAX(version) FROM po_revisions WHERE po_item_id = %s AND factory_id = %s', (item_id, fid))
+        last_version = cursor.fetchone()[0] or 0
+        cv_orig = get_cost_variation(cursor, fid, company, item_name, orig_rate, orig_qty)
+        conn.close()
+        return render_template_string(UPLOAD_REVISED_PO_HTML, item_id=item_id, po_number=po_number, item_name=item_name,
+                                       next_version=last_version + 1, current_variance=cv_orig)
+    revised_rate_raw = request.form.get('revised_rate', '').strip()
+    revised_qty_raw = request.form.get('revised_qty', '').strip()
+    revision_reason = request.form.get('revision_reason', '').strip()
+    file_obj = request.files.get('revised_po_file')
+    try:
+        revised_rate = float(revised_rate_raw)
+        revised_qty = int(float(revised_qty_raw)) if revised_qty_raw else orig_qty
+    except ValueError:
+        conn.close()
+        return redirect(f'/cost_variation/{item_id}/upload_revised_po?error=' + quote('Revised rate/quantity must be numbers.'))
+    cursor.execute('SELECT MAX(version) FROM po_revisions WHERE po_item_id = %s AND factory_id = %s', (item_id, fid))
+    last_version = cursor.fetchone()[0] or 0
+    new_version = last_version + 1
+    # Previous variance = the LAST known variance (original PO's, or the prior revision's if this is V2+)
+    if new_version == 1:
+        prev_variance = get_cost_variation(cursor, fid, company, item_name, orig_rate, orig_qty)['variance']
+    else:
+        cursor.execute('SELECT new_variance FROM po_revisions WHERE po_item_id = %s AND factory_id = %s AND version = %s', (item_id, fid, last_version))
+        pv_row = cursor.fetchone()
+        prev_variance = pv_row[0] if pv_row else None
+    new_cv = get_cost_variation(cursor, fid, company, item_name, revised_rate, revised_qty)
+    file_name, file_data = None, None
+    if file_obj and file_obj.filename:
+        file_name = file_obj.filename
+        file_data = base64.b64encode(file_obj.read()).decode('ascii')
+    ts = now_ist().isoformat()
+    cursor.execute('''INSERT INTO po_revisions (factory_id, po_item_id, version, revised_rate, revised_qty,
+                       previous_rate, previous_variance, new_variance, variance_status, revision_reason,
+                       file_name, file_data, uploaded_by, uploaded_at)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)''',
+                   (fid, item_id, new_version, revised_rate, revised_qty, orig_rate, prev_variance,
+                    new_cv['variance'], new_cv['status'], revision_reason, file_name, file_data, session.get('user_name'), ts))
+    log_audit(cursor, 'Revised PO Uploaded', 'Rate Master', po_number, f'V{new_version}: rate {orig_rate}->{revised_rate}, variance status {new_cv["status"]}')
+    conn.commit()
+    conn.close()
+    return redirect(f'/cost_variation/{item_id}/history?ok=1&msg=' + quote(f'Revised PO V{new_version} uploaded — variance is now {new_cv["status"]}.'))
+
+@app.route('/cost_variation/<int:item_id>/decision', methods=['POST'])
+def cost_variation_decision(item_id):
+    """P5: final authorized decision. RED never auto-rejects — a human must explicitly choose."""
+    if not session.get('logged_in'): return redirect('/login')
+    fid = current_factory_id()
+    decision = request.form.get('decision', '').strip()
+    if decision not in ('Approved', 'Revision Required', 'Rejected'):
+        return redirect(f'/cost_variation/{item_id}/history')
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute('SELECT id FROM po_revisions WHERE po_item_id = %s AND factory_id = %s ORDER BY version DESC LIMIT 1', (item_id, fid))
+    row = cursor.fetchone()
+    if row:
+        cursor.execute('UPDATE po_revisions SET final_decision = %s, decided_by = %s, decided_at = %s WHERE id = %s',
+                       (decision, session.get('user_name'), now_ist().isoformat(), row[0]))
+        cursor.execute('SELECT po_number FROM po_items WHERE id = %s AND factory_id = %s', (item_id, fid))
+        prow = cursor.fetchone()
+        log_audit(cursor, 'Cost Variation Decision', 'Rate Master', prow[0] if prow else item_id, f'Decision: {decision}')
+    conn.commit()
+    conn.close()
+    return redirect(f'/cost_variation/{item_id}/history')
+
+@app.route('/cost_variation/<int:item_id>/history')
+def cost_variation_history(item_id):
+    """P5/K: full PO revision history — never overwritten, every version preserved."""
+    if not session.get('logged_in'): return redirect('/login')
+    fid = current_factory_id()
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute('SELECT po_number, item_name, company, ordered_qty, rate FROM po_items WHERE id = %s AND factory_id = %s', (item_id, fid))
+    po_row = cursor.fetchone()
+    if not po_row:
+        conn.close()
+        return redirect('/pos')
+    cursor.execute('''SELECT version, revised_rate, revised_qty, previous_rate, previous_variance, new_variance,
+                       variance_status, revision_reason, file_name, uploaded_by, uploaded_at, final_decision, decided_by, decided_at
+                       FROM po_revisions WHERE po_item_id = %s AND factory_id = %s ORDER BY version''', (item_id, fid))
+    revisions = cursor.fetchall()
+    cursor.execute('''SELECT to_email, subject, sent_at, status FROM email_log WHERE factory_id = %s AND po_number = %s
+                       AND email_type = 'revised_po' ORDER BY id DESC''', (fid, po_row[0]))
+    emails = cursor.fetchall()
+    conn.close()
+    return render_template_string(PO_REVISION_HISTORY_HTML, item_id=item_id, po=po_row, revisions=revisions, emails=emails,
+                                   ok_msg=request.args.get('msg'))
+
 @app.route('/pos/delete/<int:item_id>', methods=['POST'])
 def pos_delete(item_id):
     if not session.get('logged_in'): return redirect('/login')
@@ -4426,6 +4819,15 @@ def process_scan():
     location = active['cur_location'] or 'Unknown'
     conn = get_conn()
     cursor = conn.cursor()
+    # P12/AJ/AK: backend-enforced — if the active session's vehicle has an associated trip that has
+    # already ended (dispatched/at DC/delivered/cancelled), scanning must be rejected server-side,
+    # not just hidden behind a disabled button in the UI.
+    if vehicle_no and vehicle_no != 'Unknown':
+        cursor.execute("SELECT trip_status FROM trips WHERE factory_id = %s AND vehicle_number = %s ORDER BY id DESC LIMIT 1", (fid, vehicle_no))
+        trow = cursor.fetchone()
+        if trow and trow[0] in ('In Transit', 'In DC', 'Delivered', 'Cancelled'):
+            conn.close()
+            return {'ok': False, 'error': f'This vehicle\'s session has ended (status: {trow[0]}) — scanning is disabled.'}, 403
     cursor.execute('SELECT item_name, weight FROM po_items WHERE factory_id = %s AND barcode = %s', (fid, barcode))
     item = cursor.fetchone()
     if item:
@@ -4608,7 +5010,7 @@ TRIP_STATUS_BADGE = {'Loading':'badge-blue', 'Ready to Dispatch':'badge-green', 
                       'In DC':'badge-amber'}
 
 # --- DC Arrival & Return Automation config (configurable thresholds, per the master workflow spec) ---
-DC_ARRIVAL_RADIUS_KM = 2        # vehicle must stay within this distance of the DC location to count as "at DC"
+DC_ARRIVAL_RADIUS_KM = 10       # P9: confirmed spec change — was 2km, now matches the return radius (10km)
 DC_ARRIVAL_WINDOW_MINUTES = 30  # ...continuously for this long before arrival is auto-confirmed
 DC_RETURN_RADIUS_KM = 10        # once "In DC", vehicle must move at least this far from DC to auto-mark Available
 
@@ -5015,9 +5417,234 @@ def maybe_auto_remove_outside_vehicle(cursor, fid, vehicle_id):
     log_audit(cursor, 'Outside Vehicle Automatically Removed', 'Vehicles', vehicle_id,
                f'{vehicle_number}: auto-removed from active Vehicle Master after trip delivered (no other active trips)')
 
+# ===========================================================================
+# RETENTION / CLEANUP — location_history ONLY (per confirmed retention matrix). Fail-safe defaults:
+# cleanup is DISABLED unless explicitly turned on, and even when enabled defaults to dry-run.
+# ===========================================================================
+def _cleanup_retention_days():
+    """Invalid/missing config must never produce aggressive cleanup — falls back to the safe 15-day
+    default, and a non-positive value is rejected (never '0 days retention' by accident)."""
+    raw = os.environ.get('RETENTION_DAYS', '15')
+    try:
+        days = int(raw)
+    except ValueError:
+        return 15
+    return days if days > 0 else 15
+
+RETENTION_DAYS = _cleanup_retention_days()
+CLEANUP_BATCH_SIZE = max(1, int(os.environ.get('CLEANUP_BATCH_SIZE', '500') or '500'))
+CLEANUP_ENABLED = os.environ.get('CLEANUP_ENABLED', 'false').strip().lower() == 'true'  # fail-safe: off by default
+CLEANUP_DRY_RUN = os.environ.get('CLEANUP_DRY_RUN', 'true').strip().lower() != 'false'  # fail-safe: dry-run by default even when enabled
+CLEANUP_CRON_SECRET = os.environ.get('CLEANUP_CRON_SECRET')
+
+def run_location_history_cleanup(fid, mode, triggered_by, batch_size=None):
+    """Tenant-scoped, idempotent, batch-safe cleanup for location_history ONLY.
+    mode: 'dry_run' or 'archive' — hard 'delete' is intentionally NOT implemented in this pass (see
+    final report: archiving is the only enabled destructive-adjacent action; a genuine hard-delete
+    tier was left out pending explicit further confirmation, per the 'when uncertain, preserve and
+    report' principle).
+    Eligibility (ALL must hold — active/pending data is never touched regardless of age):
+      - factory_id = the exact tenant passed in (never any other tenant's rows)
+      - recorded_at older than RETENTION_DAYS (based on the ping's own timestamp, not row id)
+      - the ping's trip is in a TERMINAL state ('Delivered' or 'Cancelled') — an active trip's GPS
+        history is never touched no matter how old the trip started
+      - is_suspicious = FALSE — flagged/anomalous pings are preserved for investigation
+    Idempotent: archiving uses ON CONFLICT (original_id) DO NOTHING, and a row is only ever deleted
+    from location_history once it is CONFIRMED present in archived_location_history — so re-running
+    this after a partial failure can never lose or duplicate a row.
+
+    SCHEDULER-OVERLAP LOCK (additional safety layer, on top of — not instead of — the idempotency
+    above): reuses the exact same PostgreSQL advisory-lock mechanism already used to serialize
+    init_db() across gunicorn workers, via the non-blocking pg_try_advisory_lock(classid, objid)
+    two-argument form (a fixed classid distinct from init_db()'s single-argument lock, so the two
+    locks can never collide with each other; objid = this tenant's factory_id, so two DIFFERENT
+    tenants' cleanups are never blocked by each other — only two overlapping runs for the SAME
+    tenant are prevented). The lock is acquired BEFORE any query — including dry-run's own counting
+    queries, so a dry-run report is never taken from a mid-flight archive's inconsistent state. If
+    the lock cannot be acquired, this returns immediately with mode='already_running' and performs
+    absolutely no reads/writes beyond the lock check itself. The lock is released in a `finally`
+    block that runs on every exit path — success, an internal exception, or a batch failure — so it
+    can never be left stuck held after a crash."""
+    ADVISORY_LOCK_CLASSID = 918273700  # distinct from init_db()'s single-arg lock (918273645)
+    lock_conn = get_conn()
+    lock_cursor = lock_conn.cursor()
+    lock_cursor.execute('SELECT pg_try_advisory_lock(%s, %s)', (ADVISORY_LOCK_CLASSID, fid))
+    lock_acquired = bool(lock_cursor.fetchone()[0])
+    if not lock_acquired:
+        lock_conn.close()
+        return {'run_id': None, 'mode': 'already_running', 'factory_id': fid, 'examined': 0,
+                'eligible': 0, 'protected': 0, 'archived': 0, 'deleted': 0, 'skipped': 0,
+                'errors': ['Another cleanup run is already in progress for this tenant — skipped safely, nothing examined or changed.']}
+
+    run_id = f'{fid}-{mode}-{secrets.token_hex(6)}'
+    started = now_ist()
+    conn = lock_conn
+    cursor = lock_cursor
+    cutoff = (started - timedelta(days=RETENTION_DAYS)).isoformat()
+    examined = archived = deleted = protected = skipped = 0
+    errors = []
+    result = None
+    try:
+        cursor.execute('''SELECT COUNT(*) FROM location_history lh JOIN trips t ON t.id = lh.trip_id
+                           WHERE lh.factory_id = %s AND lh.recorded_at < %s''', (fid, cutoff))
+        examined = cursor.fetchone()[0] or 0
+        cursor.execute('''SELECT COUNT(*) FROM location_history lh JOIN trips t ON t.id = lh.trip_id
+                           WHERE lh.factory_id = %s AND lh.recorded_at < %s
+                           AND (t.trip_status NOT IN ('Delivered','Cancelled') OR lh.is_suspicious = TRUE)''', (fid, cutoff))
+        protected = cursor.fetchone()[0] or 0
+
+        if mode == 'dry_run':
+            cursor.execute('''SELECT MIN(lh.recorded_at), MAX(lh.recorded_at) FROM location_history lh JOIN trips t ON t.id = lh.trip_id
+                               WHERE lh.factory_id = %s AND lh.recorded_at < %s
+                               AND t.trip_status IN ('Delivered','Cancelled') AND lh.is_suspicious = FALSE''', (fid, cutoff))
+            oldest, newest = cursor.fetchone()
+            eligible = examined - protected
+            result = {'run_id': run_id, 'mode': mode, 'factory_id': fid, 'examined': examined,
+                    'eligible': eligible, 'protected': protected, 'archived': 0, 'deleted': 0,
+                    'oldest': oldest, 'newest': newest, 'errors': []}
+        else:
+            # ARCHIVE mode — bounded batches, never one giant transaction
+            bsize = batch_size or CLEANUP_BATCH_SIZE
+            while True:
+                cursor.execute('''SELECT lh.id FROM location_history lh JOIN trips t ON t.id = lh.trip_id
+                                   WHERE lh.factory_id = %s AND lh.recorded_at < %s
+                                   AND t.trip_status IN ('Delivered','Cancelled') AND lh.is_suspicious = FALSE
+                                   ORDER BY lh.id LIMIT %s''', (fid, cutoff, bsize))
+                batch_ids = [r[0] for r in cursor.fetchall()]
+                if not batch_ids:
+                    break
+                try:
+                    placeholders = ','.join(['%s'] * len(batch_ids))
+                    cursor.execute(f'''INSERT INTO archived_location_history
+                                       (original_id, factory_id, vehicle_id, trip_id, latitude, longitude, accuracy,
+                                        recorded_at, is_suspicious, anomaly_reason, calculated_speed_kmph, archived_at)
+                                       SELECT id, factory_id, vehicle_id, trip_id, latitude, longitude, accuracy,
+                                              recorded_at, is_suspicious, anomaly_reason, calculated_speed_kmph, %s
+                                       FROM location_history WHERE id IN ({placeholders})
+                                       ON CONFLICT (original_id) DO NOTHING''', tuple([now_ist().isoformat()] + batch_ids))
+                    # Only delete rows CONFIRMED present in the archive — never delete an unarchived row.
+                    cursor.execute(f'''DELETE FROM location_history WHERE id IN ({placeholders})
+                                       AND id IN (SELECT original_id FROM archived_location_history WHERE original_id IN ({placeholders}))''',
+                                   tuple(batch_ids + batch_ids))
+                    archived += len(batch_ids)
+                    deleted += cursor.rowcount if cursor.rowcount is not None else len(batch_ids)
+                    conn.commit()
+                except Exception as batch_err:
+                    conn.rollback()
+                    errors.append(f'batch starting id {batch_ids[0]}: {type(batch_err).__name__}')
+                    skipped += len(batch_ids)
+                    break  # stop this run on a batch failure; safe to retry later — already-committed batches remain archived
+    except Exception as e:
+        errors.append(f'{type(e).__name__}: {e}')
+    finally:
+        # Lock release happens on EVERY exit path — success, an internal exception, or a batch
+        # failure above — so it can never be left stuck held after a crash.
+        try:
+            cursor.execute('SELECT pg_advisory_unlock(%s, %s)', (ADVISORY_LOCK_CLASSID, fid))
+            conn.commit()
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    finished = now_ist()
+    conn2 = get_conn(); cur2 = conn2.cursor()
+    cur2.execute('''INSERT INTO cleanup_runs (run_id, started_at, finished_at, mode, factory_id, table_name,
+                     examined, archived, deleted, protected, skipped, errors, duration_seconds, triggered_by)
+                     VALUES (%s,%s,%s,%s,%s,'location_history',%s,%s,%s,%s,%s,%s,%s,%s)''',
+                (run_id, started.isoformat(), finished.isoformat(), mode, fid, examined, archived, deleted,
+                 protected, skipped, '; '.join(errors) if errors else None, (finished - started).total_seconds(), triggered_by))
+    conn2.commit(); conn2.close()
+    if result is not None:
+        return result
+    return {'run_id': run_id, 'mode': mode, 'factory_id': fid, 'examined': examined, 'archived': archived,
+            'deleted': deleted, 'protected': protected, 'skipped': skipped, 'errors': errors}
+
 # ---------------------------------------------------------------------------
 # Templates
 # ---------------------------------------------------------------------------
+
+LOADING_DASHBOARD_HTML = STYLE_BLOCK + """
+<title>Loading Dashboard | {{ factory_display_name }}</title>
+</head>
+<body>
+<div class="container">
+""" + TOPBAR_TEMPLATE.replace("__NAV__", nav_html('vehicles')) + """
+    <div class="card-header" style="margin-bottom:14px;">
+        <h2>📦 Loading Dashboard</h2>
+        <a href="/vehicles" class="btn btn-outline btn-sm">← All Vehicles</a>
+    </div>
+    <div class="stats-grid">
+        <div class="stat-card"><div class="icon">🚛</div><div class="label">Vehicles Currently Loading</div><div class="value">{{ loading_vehicles|length }}</div></div>
+    </div>
+    {% for v in loading_vehicles %}
+    <div class="card">
+        <div class="card-header">
+            <h2>🚚 {{ v.vehicle_number }} <span class="badge badge-blue">Loading — {{ v.percent }}%</span></h2>
+            <a href="/trips/{{ v.trip_id }}" class="btn btn-outline btn-sm">Open Full Detail</a>
+        </div>
+        <div class="form-grid">
+            <div>
+                {% if v.driver_photo %}<img src="{{ v.driver_photo }}" style="width:44px; height:44px; border-radius:8px; object-fit:cover; vertical-align:middle; margin-right:8px;">{% endif %}
+                <strong>Driver:</strong> {{ v.driver_name }} ({{ v.driver_mobile }})
+            </div>
+            <div><strong>Factory Loading Location:</strong> {{ v.factory_location }}</div>
+            <div><strong>DC Location:</strong> {{ v.dc_location_name }}</div>
+            <div><strong>PO Count:</strong> {{ v.po_count }} ({{ v.po_numbers }})</div>
+            <div><strong>Loaded / Pending:</strong> {{ v.loaded }} / {{ v.pending }}</div>
+        </div>
+        <div class="progress-track" style="margin-top:10px;"><div class="progress-fill" style="width:{{ v.percent }}%;"></div></div>
+    </div>
+    {% endfor %}
+    {% if not loading_vehicles %}<div class="card"><div class="empty-state">No vehicles are currently loading.</div></div>{% endif %}
+</div>
+</body></html>
+"""
+
+DC_DASHBOARD_HTML = STYLE_BLOCK + """
+<title>DC Dashboard | {{ factory_display_name }}</title>
+</head>
+<body>
+<div class="container">
+""" + TOPBAR_TEMPLATE.replace("__NAV__", nav_html('vehicles')) + """
+    <div class="card-header" style="margin-bottom:14px;">
+        <h2>🏭 DC Dashboard</h2>
+        <a href="/vehicles" class="btn btn-outline btn-sm">← All Vehicles</a>
+    </div>
+    <div class="stats-grid">
+        <div class="stat-card"><div class="icon">🚛</div><div class="label">Total at DC</div><div class="value">{{ counts.total }}</div></div>
+        <div class="stat-card"><div class="icon">⏳</div><div class="label">Unloading Pending</div><div class="value">{{ counts.pending }}</div></div>
+        <div class="stat-card"><div class="icon">🔄</div><div class="label">Unloading In Progress</div><div class="value">{{ counts.in_progress }}</div></div>
+        <div class="stat-card"><div class="icon">✅</div><div class="label">Unloading Completed</div><div class="value">{{ counts.completed }}</div></div>
+    </div>
+    <div class="card">
+        <div class="card-header"><h2>📋 Vehicles Currently at DC</h2></div>
+        <table class="table">
+            <tr><th>DC Name</th><th>Vehicle Number</th><th>Driver</th><th>Arrival Time</th><th>Last Seen</th><th>Unloading Status</th><th></th></tr>
+            {% for v in dc_vehicles %}
+            <tr>
+                <td>{{ v.dc_name }}</td>
+                <td>{{ v.vehicle_number }}</td>
+                <td>{{ v.driver_name }} ({{ v.driver_mobile }})</td>
+                <td style="font-size:12px; color:var(--text-muted);">{{ v.arrived_at[:16] if v.arrived_at else '—' }}</td>
+                <td><span style="color:{{ v.freshness_color }};">●</span> {{ v.last_seen }}</td>
+                <td>
+                    {% if v.unloading_status == 'Unloading Completed' %}<span class="badge badge-green">✅ Completed</span>
+                    {% elif v.unloading_status == 'Unloading In Progress' %}<span class="badge badge-blue">🔄 In Progress</span>
+                    {% else %}<span class="badge badge-amber">⏳ Pending</span>
+                    {% endif %}
+                </td>
+                <td><a href="/trips/{{ v.trip_id }}" class="btn btn-outline btn-sm">Open Trip</a></td>
+            </tr>
+            {% endfor %}
+            {% if not dc_vehicles %}<tr><td colspan="7" style="text-align:center; color:var(--text-dim); padding:20px;">No vehicles currently at DC.</td></tr>{% endif %}
+        </table>
+    </div>
+</div>
+</body></html>
+"""
 
 VEHICLES_LIST_HTML = STYLE_BLOCK + """
 <title>Vehicles | {{ factory_display_name }}</title>
@@ -5039,17 +5666,26 @@ VEHICLES_LIST_HTML = STYLE_BLOCK + """
         <div class="modal-content">
             <h3>Add New Vehicle</h3>
             {% if add_vehicle_error %}<div style="color:#fca5a5; font-size:12.5px; margin-bottom:8px;">{{ add_vehicle_error }}</div>{% endif %}
-            <form method="POST" action="/vehicles/add">
+            <form method="POST" action="/vehicles/add" enctype="multipart/form-data" id="addVehicleForm">
                 <input type="text" name="vehicle_number" placeholder="Vehicle Number (e.g. RJ14GA1234)" required autofocus>
 
                 <label style="margin-top:12px; margin-bottom:4px; display:block; font-size:12.5px; font-weight:600;">Vehicle Type — required</label>
                 <div style="display:flex; gap:14px; font-size:13px; margin-bottom:10px;">
                     <label style="display:flex; align-items:center; gap:6px; font-weight:400; margin:0;">
-                        <input type="radio" name="vehicle_type" value="Company Vehicle" required style="width:auto; margin:0;"> Company Vehicle
+                        <input type="radio" name="vehicle_type" value="Company Vehicle" id="addVehTypeCompany" required style="width:auto; margin:0;" onchange="toggleAddVehDriverFields()"> Company Vehicle
                     </label>
                     <label style="display:flex; align-items:center; gap:6px; font-weight:400; margin:0;">
-                        <input type="radio" name="vehicle_type" value="Outside Vehicle" required style="width:auto; margin:0;"> Outside Vehicle
+                        <input type="radio" name="vehicle_type" value="Outside Vehicle" required style="width:auto; margin:0;" onchange="toggleAddVehDriverFields()"> Outside Vehicle
                     </label>
+                </div>
+
+                <div id="addVehDriverFields" style="display:none; padding:10px; background:rgba(255,255,255,0.03); border-radius:10px; margin-bottom:10px;">
+                    <label style="font-size:11.5px; font-weight:600; display:block; margin-bottom:6px;">Company Vehicle — Driver Details (Photo required)</label>
+                    <input type="text" name="driver_name" id="addVehDriverName" placeholder="Driver Name">
+                    <input type="text" name="driver_mobile" id="addVehDriverMobile" placeholder="Driver Mobile" style="margin-top:6px;">
+                    <input type="file" accept="image/*" onchange="compressImage(this, 'addVehDriverPhotoData', 'addVehDriverPhotoPreview')" style="margin-top:6px; padding:6px;">
+                    <input type="hidden" name="driver_photo" id="addVehDriverPhotoData">
+                    <img id="addVehDriverPhotoPreview" style="display:none; width:40px; height:40px; border-radius:8px; object-fit:cover; margin-top:6px;">
                 </div>
 
                 <label style="margin-bottom:4px; display:block; font-size:12.5px; font-weight:600;">Tracking Source</label>
@@ -5068,6 +5704,37 @@ VEHICLES_LIST_HTML = STYLE_BLOCK + """
             <button class="btn btn-outline btn-block" style="margin-top:8px;" onclick="document.getElementById('addVehicleModal').style.display='none'">Close</button>
         </div>
     </div>
+    <script>
+    function compressImage(inputEl, hiddenFieldId, previewId) {
+        const file = inputEl.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = function(e) {
+            const img = new Image();
+            img.onload = function() {
+                const maxDim = 220;
+                let w = img.width, h = img.height;
+                if (w > h && w > maxDim) { h = h * (maxDim / w); w = maxDim; }
+                else if (h > maxDim) { w = w * (maxDim / h); h = maxDim; }
+                const canvas = document.createElement('canvas');
+                canvas.width = w; canvas.height = h;
+                canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+                const dataUrl = canvas.toDataURL('image/jpeg', 0.6);
+                document.getElementById(hiddenFieldId).value = dataUrl;
+                if (previewId) {
+                    const prev = document.getElementById(previewId);
+                    prev.src = dataUrl;
+                    prev.style.display = 'inline-block';
+                }
+            };
+            img.src = e.target.result;
+        };
+        reader.readAsDataURL(file);
+    }
+    function toggleAddVehDriverFields() {
+        document.getElementById('addVehDriverFields').style.display = document.getElementById('addVehTypeCompany').checked ? 'block' : 'none';
+    }
+    </script>
 
 
     <div class="stats-grid">
@@ -5085,6 +5752,12 @@ VEHICLES_LIST_HTML = STYLE_BLOCK + """
         </a>
         <a href="/vehicles?status=Offline{% if q %}&q={{ q }}{% endif %}" style="text-decoration:none; color:inherit;">
         <div class="stat-card" style="cursor:pointer; {% if status_filter == 'Offline' %}border-color:var(--primary);{% endif %}"><div class="icon">📴</div><div class="label">Location Offline</div><div class="value">{{ summary.offline }}</div></div>
+        </a>
+        <a href="/vehicles/dc" style="text-decoration:none; color:inherit;">
+        <div class="stat-card" style="cursor:pointer;"><div class="icon">🏭</div><div class="label">At DC</div><div class="value">{{ summary.dc }}</div></div>
+        </a>
+        <a href="/vehicles/loading" style="text-decoration:none; color:inherit;">
+        <div class="stat-card" style="cursor:pointer;"><div class="icon">📦</div><div class="label">Loading Dashboard</div><div class="value">{{ summary.loading }}</div></div>
         </a>
     </div>
 
@@ -5115,7 +5788,7 @@ VEHICLES_LIST_HTML = STYLE_BLOCK + """
                 <td><span style="color:{{ veh.freshness_color }};">●</span> {{ veh.freshness_label }}</td>
                 <td style="display:flex; gap:6px;">
                     <a href="/vehicles/{{ veh.id }}" class="btn btn-outline btn-sm">Open</a>
-                    {% if not veh.has_active_trip %}
+                    {% if not veh.has_active_trip and veh.vehicle_type != 'Company Vehicle' %}
                     <form method="POST" action="/vehicles/{{ veh.id }}/delete" onsubmit="return confirm('Remove {{ veh.vehicle_number }} from Vehicle Master? Its trip history stays intact.');" style="margin:0;">
                         <button type="submit" class="btn btn-danger btn-sm">Remove</button>
                     </form>
@@ -5160,12 +5833,13 @@ START_LOADING_HTML = STYLE_BLOCK + """
                 <select id="vehicleSelect" name="vehicle_choice" onchange="onVehicleChange()" required>
                     <option value="">Select vehicle...</option>
                     {% for veh in existing_vehicles %}
-                    <option value="{{ veh.vehicle_number }}" data-driver="{{ veh.driver_name or '' }}" data-mobile="{{ veh.driver_mobile or '' }}" data-status="{{ veh.status }}">
+                    <option value="{{ veh.vehicle_number }}" data-driver="{{ veh.driver_name or '' }}" data-mobile="{{ veh.driver_mobile or '' }}" data-status="{{ veh.status }}" data-photo="{{ veh.driver_photo or '' }}">
                         {{ veh.vehicle_number }} ({{ veh.status }})
                     </option>
                     {% endfor %}
                     <option value="__new__">+ Add New Vehicle</option>
                 </select>
+                <img id="selectedVehDriverPhoto" style="display:none; width:44px; height:44px; border-radius:8px; object-fit:cover; margin-top:8px;">
             </div>
             <div id="newVehicleRow" style="display:none;">
                 <label>New Vehicle Number *</label>
@@ -5174,7 +5848,16 @@ START_LOADING_HTML = STYLE_BLOCK + """
             <div class="form-grid" style="margin-top:6px;">
                 <div><label>Driver Name *</label><input type="text" name="driver_name" id="driverName" required></div>
                 <div><label>Driver Mobile Number *</label><input type="tel" name="driver_mobile" id="driverMobile" required pattern="[0-9]{10}" maxlength="10" placeholder="10 digit mobile"></div>
-                <div><label>Starting Location *</label><input type="text" name="start_location" required></div>
+                <div>
+                    <label>🏭 Factory Loading Location *</label>
+                    {% if factory_loading_location %}
+                    <input type="text" name="start_location" value="{{ factory_loading_location.name or ('%.5f, %.5f'|format(factory_loading_location.lat, factory_loading_location.lng)) }}" readonly required style="background:rgba(255,255,255,0.02); cursor:not-allowed;">
+                    <div style="font-size:11px; color:var(--text-muted); margin-top:2px;">Fixed by your Factory Admin — <a href="/settings/loading_location" style="color:var(--primary);">change in Settings</a>.</div>
+                    {% else %}
+                    <input type="text" name="start_location" required placeholder="Not configured yet — type manually">
+                    <div style="font-size:11px; color:var(--text-muted); margin-top:2px;">No fixed Factory Loading Location set — <a href="/settings/loading_location" style="color:var(--primary);">configure one</a> to lock this field.</div>
+                    {% endif %}
+                </div>
             </div>
             <div style="margin-top:6px;">
                 <label>Attach PO(s) *</label>
@@ -5238,16 +5921,20 @@ addPoRow();
 function onVehicleChange() {
     const sel = document.getElementById('vehicleSelect');
     const opt = sel.options[sel.selectedIndex];
+    const photoImg = document.getElementById('selectedVehDriverPhoto');
     if (sel.value === '__new__') {
         document.getElementById('newVehicleRow').style.display = 'block';
         document.getElementById('newVehicleNumber').required = true;
         document.getElementById('driverName').value = '';
         document.getElementById('driverMobile').value = '';
+        photoImg.style.display = 'none';
     } else {
         document.getElementById('newVehicleRow').style.display = 'none';
         document.getElementById('newVehicleNumber').required = false;
         document.getElementById('driverName').value = opt.dataset.driver || '';
         document.getElementById('driverMobile').value = opt.dataset.mobile || '';
+        if (opt.dataset.photo) { photoImg.src = opt.dataset.photo; photoImg.style.display = 'inline-block'; }
+        else { photoImg.style.display = 'none'; }
     }
 }
 {% if preselect_vehicle %}
@@ -5285,18 +5972,26 @@ VEHICLE_MASTER_DETAIL_HTML = STYLE_BLOCK + """
         </div>
         {% if error_msg %}<div class="badge badge-amber" style="display:block; padding:10px 14px; margin-bottom:14px; font-size:13px;">{{ error_msg }}</div>{% endif %}
         <div class="form-grid">
-            <div><strong>Driver (current/last trip):</strong> {{ veh.driver_name or '—' }}</div>
-            <div><strong>Mobile:</strong> {{ veh.driver_mobile or '—' }}</div>
+            <div><strong>Current/Last Trip Driver:</strong> {{ veh.driver_name or '—' }} ({{ veh.driver_mobile or '—' }})</div>
             <div><strong>GPS Status:</strong> {{ veh.mode }}</div>
             <div><strong>Vehicle Type:</strong> <span class="badge {% if veh.vehicle_type == 'Outside Vehicle' %}badge-amber{% else %}badge-blue{% endif %}">{{ veh.vehicle_type }}</span></div>
             <div><strong>Tracking Source:</strong> {{ veh.tracking_mode }}{% if veh.gps_device_id %} ({{ veh.gps_device_id }}){% endif %}</div>
         </div>
+        <div class="form-grid" style="margin-top:10px;">
+            <div><strong>Assigned Driver Name:</strong> {{ veh.master_driver_name or '—' }}</div>
+            <div><strong>Assigned Driver Mobile:</strong> {{ veh.master_driver_mobile or '—' }}</div>
+            <div><strong>Driver Photo:</strong>
+                {% if veh.master_driver_photo %}<img src="{{ veh.master_driver_photo }}" style="width:40px; height:40px; border-radius:8px; object-fit:cover; vertical-align:middle;">
+                {% elif veh.vehicle_type == 'Company Vehicle' %}<span class="badge badge-red">⚠ Required, missing</span>
+                {% else %}—{% endif %}
+            </div>
+        </div>
         <details style="margin-top:12px;">
-            <summary style="cursor:pointer; color:var(--primary); font-size:13px;">✏️ Edit Vehicle Type / Tracking Source</summary>
-            <form method="POST" action="/vehicles/{{ veh.id }}/edit" style="margin-top:10px; display:flex; gap:14px; flex-wrap:wrap; align-items:flex-end;">
+            <summary style="cursor:pointer; color:var(--primary); font-size:13px;">✏️ Edit Vehicle Type / Tracking Source / Driver</summary>
+            <form method="POST" action="/vehicles/{{ veh.id }}/edit" enctype="multipart/form-data" style="margin-top:10px; display:flex; gap:14px; flex-wrap:wrap; align-items:flex-end;" id="vehEditForm">
                 <div>
                     <label style="font-size:11px;">Vehicle Type</label>
-                    <select name="vehicle_type" style="margin:0;">
+                    <select name="vehicle_type" id="vehEditType" style="margin:0;">
                         <option value="Company Vehicle" {% if veh.vehicle_type == 'Company Vehicle' %}selected{% endif %}>Company Vehicle</option>
                         <option value="Outside Vehicle" {% if veh.vehicle_type == 'Outside Vehicle' %}selected{% endif %}>Outside Vehicle</option>
                     </select>
@@ -5312,10 +6007,30 @@ VEHICLE_MASTER_DETAIL_HTML = STYLE_BLOCK + """
                     <label style="font-size:11px;">GPS Device ID</label>
                     <input type="text" name="gps_device_id" value="{{ veh.gps_device_id or '' }}" style="margin:0;">
                 </div>
+                <div>
+                    <label style="font-size:11px;">Driver Name</label>
+                    <input type="text" name="driver_name" value="{{ veh.master_driver_name or '' }}" style="margin:0;">
+                </div>
+                <div>
+                    <label style="font-size:11px;">Driver Mobile</label>
+                    <input type="text" name="driver_mobile" value="{{ veh.master_driver_mobile or '' }}" style="margin:0;">
+                </div>
+                <div>
+                    <label style="font-size:11px;">Driver Photo <span id="photoRequiredMark" style="color:#f87171;">{% if veh.vehicle_type == 'Company Vehicle' %}*{% endif %}</span></label>
+                    <input type="file" accept="image/*" id="vehDriverPhotoFile" onchange="compressImage(this, 'vehDriverPhotoData', 'vehDriverPhotoPreview')" style="padding:6px;">
+                    <input type="hidden" name="driver_photo" id="vehDriverPhotoData">
+                    <img id="vehDriverPhotoPreview" src="{{ veh.master_driver_photo or '' }}" style="{% if not veh.master_driver_photo %}display:none;{% endif %} width:40px; height:40px; border-radius:8px; object-fit:cover; margin-top:4px;">
+                </div>
                 <button type="submit" class="btn btn-sm">Save</button>
             </form>
+            <script>
+            function toggleVehPhotoRequired() {
+                document.getElementById('photoRequiredMark').style.display = document.getElementById('vehEditType').value === 'Company Vehicle' ? 'inline' : 'none';
+            }
+            document.getElementById('vehEditType').addEventListener('change', toggleVehPhotoRequired);
+            </script>
         </details>
-        {% if not veh.has_active_trip %}
+        {% if not veh.has_active_trip and veh.vehicle_type != 'Company Vehicle' %}
         <form method="POST" action="/vehicles/{{ veh.id }}/delete" onsubmit="return confirm('Remove {{ veh.vehicle_number }} from Vehicle Master? Its trip history stays intact.');" style="margin-top:10px;">
             <button type="submit" class="btn btn-danger btn-sm">🗑 Remove Vehicle</button>
         </form>
@@ -5380,6 +6095,32 @@ VEHICLE_MASTER_DETAIL_HTML = STYLE_BLOCK + """
     </div>
 </div>
 <script>
+function compressImage(inputEl, hiddenFieldId, previewId) {
+    const file = inputEl.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = function(e) {
+        const img = new Image();
+        img.onload = function() {
+            const maxDim = 220;
+            let w = img.width, h = img.height;
+            if (w > h && w > maxDim) { h = h * (maxDim / w); w = maxDim; }
+            else if (h > maxDim) { w = w * (maxDim / h); h = maxDim; }
+            const canvas = document.createElement('canvas');
+            canvas.width = w; canvas.height = h;
+            canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+            const dataUrl = canvas.toDataURL('image/jpeg', 0.6);
+            document.getElementById(hiddenFieldId).value = dataUrl;
+            if (previewId) {
+                const prev = document.getElementById(previewId);
+                prev.src = dataUrl;
+                prev.style.display = 'inline-block';
+            }
+        };
+        img.src = e.target.result;
+    };
+    reader.readAsDataURL(file);
+}
 {% if veh.has_location %}
 const map = L.map('curMap').setView([{{ veh.lat_display }}, {{ veh.lng_display }}], 13);
 L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '&copy; OpenStreetMap' }).addTo(map);
@@ -5489,9 +6230,10 @@ TRIP_DETAIL_HTML = STYLE_BLOCK + """
         </div>
         <div class="progress-track" style="margin-bottom:14px;"><div class="progress-fill" style="width:{{ t.percent }}%;"></div></div>
         <table class="table">
-            <tr><th>PO Number</th><th>Ordered</th><th>Loaded</th><th>Pending</th><th>Status</th><th></th></tr>
+            <tr><th></th><th>PO Number</th><th>Ordered</th><th>Loaded</th><th>Pending</th><th>Status</th><th></th></tr>
             {% for p in pos %}
             <tr>
+                <td style="cursor:pointer; width:24px;" onclick="document.getElementById('poItems-{{ loop.index0 }}').classList.toggle('show')">▼</td>
                 <td>{{ p.po_number }} <span style="color:var(--text-dim); font-size:11px;">({{ p.company }})</span></td>
                 <td>{{ p.ordered }}</td><td>{{ p.loaded }}</td><td>{{ p.pending }}</td>
                 <td><span class="badge {{ p.status_class }}">{{ p.status }}</span></td>
@@ -5513,6 +6255,18 @@ TRIP_DETAIL_HTML = STYLE_BLOCK + """
                     {% endif %}
                 </td>
             </tr>
+            <tr id="poItems-{{ loop.index0 }}" class="po-items-row" style="display:none;">
+                <td></td>
+                <td colspan="6" style="background:rgba(255,255,255,0.02); padding:10px 14px;">
+                    <table style="margin:0;">
+                        <tr><th style="font-size:10.5px;">Item</th><th style="font-size:10.5px;">Ordered</th><th style="font-size:10.5px;">Loaded</th><th style="font-size:10.5px;">Pending</th></tr>
+                        {% for it in p.line_items %}
+                        <tr><td>{{ it.item_name }}</td><td>{{ it.ordered }}</td><td>{{ it.loaded }}</td><td>{{ it.pending }}</td></tr>
+                        {% endfor %}
+                        {% if not p.line_items %}<tr><td colspan="4" style="color:var(--text-dim); text-align:center;">No items found for this PO.</td></tr>{% endif %}
+                    </table>
+                </td>
+            </tr>
             {% endfor %}
         </table>
         {% if t.trip_status not in ['In Transit','In DC','Delivered','Cancelled'] %}
@@ -5526,6 +6280,9 @@ TRIP_DETAIL_HTML = STYLE_BLOCK + """
         {% endif %}
     </div>
 </div>
+<style>
+.po-items-row.show { display: table-row !important; }
+</style>
 <script>
 {% if t.current_latitude %}
 const map = L.map('routeMap').setView([{{ t.current_latitude }}, {{ t.current_longitude }}], 13);
@@ -5598,7 +6355,7 @@ def vehicles_page():
                        FROM vehicle_master WHERE factory_id = %s AND is_active = TRUE ORDER BY vehicle_number''', (fid,))
     rows = cursor.fetchall()
     vehicles, map_markers = [], []
-    summary = {'total': 0, 'loading': 0, 'transit': 0, 'available': 0, 'offline': 0}
+    summary = {'total': 0, 'loading': 0, 'transit': 0, 'available': 0, 'offline': 0, 'dc': 0}
     for vid, vnum, lat, lng, last_loc, vehicle_type, tracking_mode in rows:
         status, active_trip_id = vehicle_master_status(cursor, vid)
         driver_name, driver_mobile, tracking_status, po_count = None, None, 'stopped', 0
@@ -5624,6 +6381,7 @@ def vehicles_page():
         if status == 'Loading': summary['loading'] += 1
         elif status == 'In Transit': summary['transit'] += 1
         elif status == 'Available': summary['available'] += 1
+        elif status == 'In DC': summary['dc'] += 1
         if gps_offline: summary['offline'] += 1
 
         # Clicking a dashboard card filters this same list by the identical categorization used for its count above
@@ -5650,6 +6408,82 @@ def vehicles_page():
                                    q=request.args.get('q', ''), add_vehicle_error=request.args.get('add_error', ''),
                                    status_filter=status_filter)
 
+@app.route('/vehicles/loading')
+def vehicles_loading_dashboard():
+    """P11/AE: dedicated Loading Dashboard — every vehicle currently in a Loading session, with
+    driver photo, factory/DC locations, PO count/numbers, and loaded/pending quantities inline
+    (click-through to the full trip detail page for everything else, per AF)."""
+    if not session.get('logged_in'): return redirect('/login')
+    fid = current_factory_id()
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute('SELECT loading_location_name, loading_location_lat, loading_location_lng FROM factories WHERE id = %s', (fid,))
+    frow = cursor.fetchone()
+    factory_location_name = frow[0] if frow and frow[1] is not None else None
+    cursor.execute('''SELECT t.id, t.vehicle_id, t.vehicle_number, t.driver_name, t.driver_mobile,
+                       t.dc_location_name, t.start_location, vm.driver_photo
+                       FROM trips t LEFT JOIN vehicle_master vm ON vm.id = t.vehicle_id
+                       WHERE t.factory_id = %s AND t.trip_status = 'Loading' ORDER BY t.id DESC''', (fid,))
+    rows = cursor.fetchall()
+    loading_vehicles = []
+    for tid, vid, vnum, dname, dmobile, dc_name, start_loc, driver_photo in rows:
+        cursor.execute('SELECT po_number FROM vehicle_po_map WHERE trip_id = %s AND is_cancelled = FALSE ORDER BY id', (tid,))
+        po_numbers = [r[0] for r in cursor.fetchall()]
+        total_ordered, total_loaded = 0, 0
+        for po in po_numbers:
+            ordered, loaded = po_progress(cursor, po, vnum)
+            total_ordered += ordered
+            total_loaded += min(loaded, ordered) if ordered else loaded
+        percent = min(100, round((total_loaded / total_ordered) * 100)) if total_ordered else 0
+        loading_vehicles.append({'trip_id': tid, 'vehicle_number': vnum, 'driver_name': dname, 'driver_mobile': dmobile,
+                                  'driver_photo': driver_photo, 'dc_location_name': dc_name or '—',
+                                  'factory_location': factory_location_name or start_loc,
+                                  'po_count': len(po_numbers), 'po_numbers': ', '.join(po_numbers),
+                                  'loaded': total_loaded, 'pending': max(total_ordered - total_loaded, 0), 'percent': percent})
+    conn.close()
+    return render_template_string(LOADING_DASHBOARD_HTML, loading_vehicles=loading_vehicles)
+
+@app.route('/vehicles/dc')
+def vehicles_dc_dashboard():
+    """P10/AA/AB: dedicated DC section — vehicles currently confirmed 'In DC', plus the DC-wide
+    unloading-status breakdown (Pending/In Progress/Completed), derived from N1's driver_followups
+    response state so there's no second/independent unloading-tracking system."""
+    if not session.get('logged_in'): return redirect('/login')
+    fid = current_factory_id()
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute('''SELECT t.id, t.vehicle_id, t.vehicle_number, t.driver_name, t.driver_mobile,
+                       t.dc_location_name, t.dc_arrived_at, vm.last_location_at
+                       FROM trips t LEFT JOIN vehicle_master vm ON vm.id = t.vehicle_id
+                       WHERE t.factory_id = %s AND t.trip_status = 'In DC' ORDER BY t.dc_arrived_at''', (fid,))
+    rows = cursor.fetchall()
+    dc_vehicles = []
+    counts = {'total': len(rows), 'pending': 0, 'in_progress': 0, 'completed': 0}
+    for tid, vid, vnum, dname, dmobile, dc_name, arrived_at, last_loc in rows:
+        cursor.execute('''SELECT status, first_call_response, second_call_response FROM driver_followups
+                           WHERE trip_id = %s AND factory_id = %s''', (tid, fid))
+        frow = cursor.fetchone()
+        # Unloading status: whichever response (second call takes precedence if present) reflects
+        # the driver's LATEST reported state; if no response yet at all, it's Pending.
+        unloading_status = 'Unloading Pending'
+        if frow:
+            latest_response = frow[2] or frow[1]
+            if latest_response == 'UNLOADING_COMPLETED':
+                unloading_status = 'Unloading Completed'
+            elif latest_response == 'UNLOADING_IN_PROGRESS':
+                unloading_status = 'Unloading In Progress'
+            elif latest_response in ('UNLOADING_STARTED', 'WAITING', 'NOT_STARTED'):
+                unloading_status = 'Unloading Pending'
+        label, color, secs = freshness_info(last_loc)
+        if unloading_status == 'Unloading Completed': counts['completed'] += 1
+        elif unloading_status == 'Unloading In Progress': counts['in_progress'] += 1
+        else: counts['pending'] += 1
+        dc_vehicles.append({'trip_id': tid, 'vehicle_number': vnum, 'driver_name': dname, 'driver_mobile': dmobile,
+                             'dc_name': dc_name or '—', 'arrived_at': arrived_at, 'last_seen': label,
+                             'freshness_color': color, 'unloading_status': unloading_status})
+    conn.close()
+    return render_template_string(DC_DASHBOARD_HTML, dc_vehicles=dc_vehicles, counts=counts)
+
 @app.route('/vehicles/add', methods=['POST'])
 def vehicles_add():
     if not session.get('logged_in'): return redirect('/login')
@@ -5658,6 +6492,9 @@ def vehicles_add():
     vehicle_type = request.form.get('vehicle_type', '').strip()
     tracking_mode = request.form.get('tracking_mode', '').strip() or 'Driver Mobile'
     gps_device_id = request.form.get('gps_device_id', '').strip() or None
+    driver_name = request.form.get('driver_name', '').strip()
+    driver_mobile = request.form.get('driver_mobile', '').strip()
+    driver_photo = request.form.get('driver_photo', '').strip()
     if not vehicle_number:
         return redirect('/vehicles?add_error=' + quote('Vehicle number zaroori hai.'))
     # No silent default: the person must explicitly pick one of the two options.
@@ -5665,6 +6502,10 @@ def vehicles_add():
         return redirect('/vehicles?add_error=' + quote('Please select a Vehicle Type — Company Vehicle or Outside Vehicle.'))
     if tracking_mode not in ('Driver Mobile', 'GPS Device'):
         tracking_mode = 'Driver Mobile'
+    # P8/S: Driver Photo is REQUIRED for every Company Vehicle — setup cannot complete without it.
+    # Outside Vehicles have no such requirement (their driver details are optional/per-engagement).
+    if vehicle_type == 'Company Vehicle' and not (driver_name and driver_mobile and driver_photo):
+        return redirect('/vehicles?add_error=' + quote('Company Vehicles require Driver Name, Mobile and a Driver Photo before setup can be completed.'))
     conn = get_conn()
     cursor = conn.cursor()
     cursor.execute('SELECT id, is_active FROM vehicle_master WHERE factory_id = %s AND vehicle_number = %s', (fid, vehicle_number))
@@ -5682,12 +6523,14 @@ def vehicles_add():
         # let this submission set its type/tracking fresh.
         vehicle_id = existing[0]
         cursor.execute('''UPDATE vehicle_master SET is_active = TRUE, vehicle_type = %s, tracking_mode = %s,
-                           gps_device_id = %s, updated_at = %s WHERE id = %s''',
-                       (vehicle_type, tracking_mode, gps_device_id, ts, vehicle_id))
+                           gps_device_id = %s, driver_name = %s, driver_mobile = %s, driver_photo = %s, updated_at = %s WHERE id = %s''',
+                       (vehicle_type, tracking_mode, gps_device_id, driver_name or None, driver_mobile or None, driver_photo or None, ts, vehicle_id))
     else:
-        cursor.execute('''INSERT INTO vehicle_master (factory_id, vehicle_number, vehicle_type, tracking_mode, gps_device_id, created_at, updated_at)
-                           VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id''',
-                       (fid, vehicle_number, vehicle_type, tracking_mode, gps_device_id, ts, ts))
+        cursor.execute('''INSERT INTO vehicle_master (factory_id, vehicle_number, vehicle_type, tracking_mode, gps_device_id,
+                           driver_name, driver_mobile, driver_photo, created_at, updated_at)
+                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id''',
+                       (fid, vehicle_number, vehicle_type, tracking_mode, gps_device_id,
+                        driver_name or None, driver_mobile or None, driver_photo or None, ts, ts))
         vehicle_id = cursor.fetchone()[0]
     log_audit(cursor, 'Vehicle Created', 'Vehicles', vehicle_id, f'Added vehicle {vehicle_number} ({vehicle_type}, tracking: {tracking_mode})')
     conn.commit()
@@ -5696,30 +6539,43 @@ def vehicles_add():
 
 @app.route('/vehicles/<int:vehicle_id>/edit', methods=['POST'])
 def vehicles_edit(vehicle_id):
-    """Lets an authorized user update a vehicle's Type/Tracking configuration after creation
-    (e.g. correcting a mis-selected Vehicle Type, or switching GPS Device <-> Driver Mobile)."""
+    """Lets an authorized user update a vehicle's Type/Tracking configuration and driver details
+    after creation. P8/R: Company Vehicle driver info (name/mobile/photo) is fully editable here;
+    P8/S: switching a vehicle INTO 'Company Vehicle' (or editing one that already is) still enforces
+    the driver photo requirement — it can never be saved without one once it's a Company Vehicle."""
     if not session.get('logged_in'): return redirect('/login')
     fid = current_factory_id()
     vehicle_type = request.form.get('vehicle_type', '').strip()
     tracking_mode = request.form.get('tracking_mode', '').strip()
     gps_device_id = request.form.get('gps_device_id', '').strip() or None
+    driver_name = request.form.get('driver_name', '').strip()
+    driver_mobile = request.form.get('driver_mobile', '').strip()
+    driver_photo = request.form.get('driver_photo', '').strip()
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute('SELECT vehicle_number, vehicle_type, tracking_mode FROM vehicle_master WHERE id = %s AND factory_id = %s', (vehicle_id, fid))
+    cursor.execute('SELECT vehicle_number, vehicle_type, tracking_mode, driver_photo FROM vehicle_master WHERE id = %s AND factory_id = %s', (vehicle_id, fid))
     row = cursor.fetchone()
     if not row:
         conn.close()
         return redirect('/vehicles')
-    vehicle_number, old_type, old_mode = row
+    vehicle_number, old_type, old_mode, old_photo = row
     if vehicle_type not in ('Company Vehicle', 'Outside Vehicle'):
         vehicle_type = old_type
     if tracking_mode not in ('Driver Mobile', 'GPS Device'):
         tracking_mode = old_mode
-    cursor.execute('UPDATE vehicle_master SET vehicle_type = %s, tracking_mode = %s, gps_device_id = %s, updated_at = %s WHERE id = %s',
-                   (vehicle_type, tracking_mode, gps_device_id, now_ist().isoformat(), vehicle_id))
+    # Keep the existing photo if the form didn't resubmit a new one (e.g. the person only changed
+    # the tracking mode, not the driver) — but a Company Vehicle must end up with SOME photo.
+    final_photo = driver_photo or old_photo
+    if vehicle_type == 'Company Vehicle' and not final_photo:
+        conn.close()
+        return redirect(f'/vehicles/{vehicle_id}?error=' + quote('Company Vehicles require a Driver Photo — please upload one before saving.'))
+    cursor.execute('''UPDATE vehicle_master SET vehicle_type = %s, tracking_mode = %s, gps_device_id = %s,
+                       driver_name = %s, driver_mobile = %s, driver_photo = %s, updated_at = %s WHERE id = %s''',
+                   (vehicle_type, tracking_mode, gps_device_id, driver_name or None, driver_mobile or None, final_photo, now_ist().isoformat(), vehicle_id))
     changes = []
     if vehicle_type != old_type: changes.append(f'type {old_type} -> {vehicle_type}')
     if tracking_mode != old_mode: changes.append(f'tracking {old_mode} -> {tracking_mode}')
+    if driver_name: changes.append(f'driver updated to {driver_name}')
     log_audit(cursor, 'Vehicle Updated', 'Vehicles', vehicle_id, f'{vehicle_number}: ' + ('; '.join(changes) if changes else 'no field changes'))
     conn.commit()
     conn.close()
@@ -5727,19 +6583,24 @@ def vehicles_edit(vehicle_id):
 
 @app.route('/vehicles/<int:vehicle_id>/delete', methods=['POST'])
 def vehicles_delete(vehicle_id):
-    """Manual removal — always blocked while the vehicle has any active/incomplete trip, for both
-    Company and Outside vehicles alike. Soft-removes (is_active=False); never deletes the row or
-    touches its trips/audit/location history."""
+    """P8/R: Company-owned vehicles must PERMANENTLY remain in the Vehicle Master — no normal
+    Delete option at all, regardless of trip state. Only Outside Vehicles can ever be manually
+    removed here (still blocked while they have any active/incomplete trip). Soft-removes
+    (is_active=False) for Outside Vehicles; never deletes the row or touches its trips/audit/
+    location history — matches the existing Outside Vehicle auto-removal behavior (U)."""
     if not session.get('logged_in'): return redirect('/login')
     fid = current_factory_id()
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute('SELECT vehicle_number FROM vehicle_master WHERE id = %s AND factory_id = %s', (vehicle_id, fid))
+    cursor.execute('SELECT vehicle_number, vehicle_type FROM vehicle_master WHERE id = %s AND factory_id = %s', (vehicle_id, fid))
     row = cursor.fetchone()
     if not row:
         conn.close()
         return redirect('/vehicles')
-    vehicle_number = row[0]
+    vehicle_number, vehicle_type = row
+    if vehicle_type == 'Company Vehicle':
+        conn.close()
+        return redirect(f'/vehicles/{vehicle_id}?error=' + quote('Company Vehicles cannot be deleted — they permanently remain in the Vehicle Master. Edit its details instead.'))
     cursor.execute("SELECT COUNT(*) FROM trips WHERE vehicle_id = %s AND factory_id = %s AND trip_status NOT IN ('Delivered','Cancelled')",
                    (vehicle_id, fid))
     if cursor.fetchone()[0] > 0:
@@ -5759,21 +6620,26 @@ def vehicles_start_loading():
     cursor = conn.cursor()
 
     if request.method == 'GET':
-        cursor.execute('SELECT id, vehicle_number FROM vehicle_master WHERE factory_id = %s ORDER BY vehicle_number', (fid,))
+        cursor.execute('SELECT id, vehicle_number, driver_photo FROM vehicle_master WHERE factory_id = %s ORDER BY vehicle_number', (fid,))
         existing_vehicles = []
-        for vid, vnum in cursor.fetchall():
+        for vid, vnum, master_photo in cursor.fetchall():
             status, _ = vehicle_master_status(cursor, vid)
             cursor.execute('SELECT driver_name, driver_mobile FROM trips WHERE vehicle_id = %s AND factory_id = %s ORDER BY id DESC LIMIT 1', (vid, fid))
             last = cursor.fetchone()
             existing_vehicles.append({'vehicle_number': vnum, 'status': status,
-                                       'driver_name': last[0] if last else '', 'driver_mobile': last[1] if last else ''})
+                                       'driver_name': last[0] if last else '', 'driver_mobile': last[1] if last else '',
+                                       'driver_photo': master_photo or ''})
         cursor.execute('SELECT DISTINCT po_number FROM po_items WHERE factory_id = %s ORDER BY po_number', (fid,))
         all_po_numbers = [r[0] for r in cursor.fetchall()]
+        cursor.execute('SELECT loading_location_name, loading_location_lat, loading_location_lng FROM factories WHERE id = %s', (fid,))
+        floc = cursor.fetchone()
+        factory_loading_location = {'name': floc[0], 'lat': floc[1], 'lng': floc[2]} if floc and floc[1] is not None else None
         conn.close()
         preselect = request.args.get('vehicle', '')
         return render_template_string(START_LOADING_HTML, existing_vehicles=existing_vehicles,
                                        all_po_numbers=all_po_numbers, preselect_vehicle=preselect,
-                                       dc_arrival_window_minutes=DC_ARRIVAL_WINDOW_MINUTES, dc_return_radius_km=DC_RETURN_RADIUS_KM)
+                                       dc_arrival_window_minutes=DC_ARRIVAL_WINDOW_MINUTES, dc_return_radius_km=DC_RETURN_RADIUS_KM,
+                                       dc_arrival_radius_km=DC_ARRIVAL_RADIUS_KM, factory_loading_location=factory_loading_location)
 
     # POST — create the trip
     vehicle_choice = request.form.get('vehicle_choice', '').strip()
@@ -5844,12 +6710,12 @@ def vehicle_master_detail(vehicle_id):
     fid = current_factory_id()
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute('SELECT id, vehicle_number, current_latitude, current_longitude, last_location_at, vehicle_type, tracking_mode, gps_device_id, is_active FROM vehicle_master WHERE id = %s AND factory_id = %s', (vehicle_id, fid))
+    cursor.execute('SELECT id, vehicle_number, current_latitude, current_longitude, last_location_at, vehicle_type, tracking_mode, gps_device_id, is_active, driver_name, driver_mobile, driver_photo FROM vehicle_master WHERE id = %s AND factory_id = %s', (vehicle_id, fid))
     row = cursor.fetchone()
     if not row:
         conn.close()
         return "Vehicle not found. <a href='/vehicles'>Back</a>", 404
-    vid, vnum, lat, lng, last_loc, vehicle_type, tracking_mode, gps_device_id, is_active = row
+    vid, vnum, lat, lng, last_loc, vehicle_type, tracking_mode, gps_device_id, is_active, master_driver_name, master_driver_mobile, master_driver_photo = row
     status, active_trip_id = vehicle_master_status(cursor, vid)
     driver_name, driver_mobile, tracking_status = None, None, 'stopped'
     if active_trip_id:
@@ -5864,6 +6730,7 @@ def vehicle_master_detail(vehicle_id):
     is_live = tracking_status == 'active' and status in ('Loading', 'Ready to Dispatch', 'In Transit')
     mode = 'LIVE' if (is_live and secs <= 600) else 'LAST KNOWN'
     veh = {'id': vid, 'vehicle_number': vnum, 'driver_name': driver_name, 'driver_mobile': driver_mobile,
+           'master_driver_name': master_driver_name, 'master_driver_mobile': master_driver_mobile, 'master_driver_photo': master_driver_photo,
            'status': status, 'status_class': TRIP_STATUS_BADGE.get(status, 'badge-amber'),
            'has_location': lat is not None, 'lat_display': lat, 'lng_display': lng,
            'freshness_label': label, 'freshness_color': color if lat is not None else 'grey', 'mode': mode if lat is not None else 'NO DATA',
@@ -5951,8 +6818,19 @@ def trip_detail(trip_id):
         ordered, loaded = po_progress(cursor, po_number, t['vehicle_number'])
         pending = max(ordered - loaded, 0)
         status, status_class = po_status_label(ordered, loaded, is_hold, is_cancelled)
+        # P12/AH: per-item breakdown within this PO (Vehicle -> PO -> Items hierarchy) — each PO's
+        # items are queried strictly scoped to that PO's own barcodes, so PO-1's items never mix
+        # with PO-2's, satisfying "PO-1 items MUST NOT mix with PO-2 items."
+        cursor.execute('SELECT item_name, barcode, ordered_qty FROM po_items WHERE factory_id = %s AND po_number = %s', (fid, po_number))
+        items = []
+        for item_name, barcode, item_ordered in cursor.fetchall():
+            cursor.execute('SELECT COALESCE(SUM(loaded_qty),0) FROM dispatch_log WHERE factory_id = %s AND po_number = %s AND vehicle_no = %s AND barcode = %s',
+                           (fid, po_number, t['vehicle_number'], barcode))
+            item_loaded = cursor.fetchone()[0] or 0
+            items.append({'item_name': item_name, 'ordered': item_ordered, 'loaded': item_loaded,
+                           'pending': max((item_ordered or 0) - item_loaded, 0)})
         pos.append({'po_number': po_number, 'company': company, 'ordered': ordered, 'loaded': loaded,
-                    'pending': pending, 'status': status, 'status_class': status_class, 'is_hold': is_hold})
+                    'pending': pending, 'status': status, 'status_class': status_class, 'is_hold': is_hold, 'line_items': items})
 
     attached = {p['po_number'] for p in pos}
     cursor.execute('SELECT DISTINCT po_number FROM po_items WHERE factory_id = %s ORDER BY po_number', (fid,))
@@ -5985,10 +6863,15 @@ def trip_add_po(trip_id):
     if not po: return redirect(f'/trips/{trip_id}')
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute('SELECT vehicle_number FROM trips WHERE id = %s AND factory_id = %s', (trip_id, fid))
+    cursor.execute('SELECT vehicle_number, trip_status FROM trips WHERE id = %s AND factory_id = %s', (trip_id, fid))
     trow = cursor.fetchone()
     if not trow:
         conn.close(); return redirect('/vehicles')
+    # P12/AJ/AK: backend-enforced — a hidden/removed UI button is not enough; direct POST after
+    # End Dispatch (In Transit/In DC/Delivered/Cancelled) must also be rejected server-side.
+    if trow[1] in ('In Transit', 'In DC', 'Delivered', 'Cancelled'):
+        conn.close()
+        return f"This session has ended (status: {trow[1]}) — new POs can no longer be added. <a href='/trips/{trip_id}'>Back</a>", 400
     cursor.execute('''SELECT tr.vehicle_number FROM vehicle_po_map m JOIN trips tr ON tr.id = m.trip_id
                        WHERE tr.factory_id = %s AND m.po_number = %s AND m.is_cancelled = FALSE AND tr.trip_status NOT IN ('Delivered','Cancelled')''', (fid, po))
     clash = cursor.fetchone()
@@ -6013,10 +6896,13 @@ def trip_remove_po(trip_id):
     po = request.form.get('po_number', '').strip()
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute('SELECT vehicle_number FROM trips WHERE id = %s AND factory_id = %s', (trip_id, fid))
+    cursor.execute('SELECT vehicle_number, trip_status FROM trips WHERE id = %s AND factory_id = %s', (trip_id, fid))
     trow = cursor.fetchone()
     if not trow:
         conn.close(); return redirect('/vehicles')
+    if trow[1] in ('In Transit', 'In DC', 'Delivered', 'Cancelled'):
+        conn.close()
+        return f"This session has ended (status: {trow[1]}) — POs can no longer be removed. <a href='/trips/{trip_id}'>Back</a>", 400
     cursor.execute('DELETE FROM vehicle_po_map WHERE trip_id = %s AND po_number = %s', (trip_id, po))
     recompute_trip_status(cursor, trip_id)
     log_audit(cursor, 'PO Removed from Vehicle', 'Vehicles', trip_id, f'{trow[0]}: PO {po} removed')
@@ -6032,10 +6918,13 @@ def trip_po_status(trip_id):
     action = request.form.get('action', '')
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute('SELECT vehicle_number FROM trips WHERE id = %s AND factory_id = %s', (trip_id, fid))
+    cursor.execute('SELECT vehicle_number, trip_status FROM trips WHERE id = %s AND factory_id = %s', (trip_id, fid))
     trow = cursor.fetchone()
     if not trow:
         conn.close(); return redirect('/vehicles')
+    if trow[1] in ('In Transit', 'In DC', 'Delivered', 'Cancelled'):
+        conn.close()
+        return f"This session has ended (status: {trow[1]}) — PO hold/resume is no longer available. <a href='/trips/{trip_id}'>Back</a>", 400
     if action == 'hold':
         cursor.execute('UPDATE vehicle_po_map SET is_hold = TRUE WHERE trip_id = %s AND po_number = %s', (trip_id, po))
         log_audit(cursor, 'PO Held', 'Vehicles', trip_id, f'{trow[0]}: PO {po} held')
@@ -6392,6 +7281,52 @@ def n1_process_due_endpoint():
         return jsonify({'ok': False, 'error': 'unauthorized'}), 403
     results = process_due_driver_followups()
     return jsonify({'ok': True, 'processed': len(results)})
+
+@app.route('/settings/retention', methods=['GET'])
+def retention_dry_run_page():
+    """Factory-Admin-only DRY RUN report — makes NO changes ever, regardless of CLEANUP_ENABLED/
+    CLEANUP_DRY_RUN config. Lets an admin see exactly what a real cleanup run would do before it's
+    ever enabled in production."""
+    if not session.get('logged_in'): return redirect('/login')
+    if session.get('role') != 'Factory Admin':
+        return "Access denied — only a Factory Admin can view retention/cleanup reports.", 403
+    fid = current_factory_id()
+    report = run_location_history_cleanup(fid, mode='dry_run', triggered_by=session.get('user_name'))
+    conn = get_conn(); cursor = conn.cursor()
+    cursor.execute('''SELECT run_id, started_at, mode, examined, archived, deleted, protected, skipped, errors
+                       FROM cleanup_runs WHERE factory_id = %s ORDER BY id DESC LIMIT 20''', (fid,))
+    history = cursor.fetchall()
+    conn.close()
+    return render_template_string(RETENTION_DASHBOARD_HTML, report=report, history=history,
+                                   retention_days=RETENTION_DAYS, cleanup_enabled=CLEANUP_ENABLED, dry_run_mode=CLEANUP_DRY_RUN)
+
+@app.route('/internal/cleanup/run', methods=['POST'])
+def cleanup_run_endpoint():
+    """Scheduler trigger (Render Cron Job pattern, identical to N1's) for the location_history
+    retention cleanup. FAIL-SAFE at every layer:
+      - CLEANUP_CRON_SECRET missing -> 503, cannot be triggered at all
+      - wrong/missing secret -> 403
+      - CLEANUP_ENABLED=false (the default) -> runs in dry-run and reports so, never deletes
+      - CLEANUP_DRY_RUN=true (the default even when enabled) -> also never deletes
+      - Runs ONE tenant at a time via ?factory_id=; with none given, dry-run-reports across ALL
+        tenants without ever mixing one tenant's rows into another's calculation (each factory_id is
+        queried and archived completely separately, never in one combined cross-tenant statement)."""
+    if not CLEANUP_CRON_SECRET:
+        return jsonify({'ok': False, 'error': 'CLEANUP_CRON_SECRET not configured'}), 503
+    provided = request.headers.get('X-Cleanup-Cron-Secret', '')
+    if not secrets.compare_digest(provided, CLEANUP_CRON_SECRET):
+        return jsonify({'ok': False, 'error': 'unauthorized'}), 403
+    effective_mode = 'archive' if (CLEANUP_ENABLED and not CLEANUP_DRY_RUN) else 'dry_run'
+    requested_fid = request.args.get('factory_id', type=int)
+    conn = get_conn(); cursor = conn.cursor()
+    if requested_fid:
+        factory_ids = [requested_fid]
+    else:
+        cursor.execute('SELECT id FROM factories')
+        factory_ids = [r[0] for r in cursor.fetchall()]
+    conn.close()
+    results = [run_location_history_cleanup(f, mode=effective_mode, triggered_by='cron') for f in factory_ids]
+    return jsonify({'ok': True, 'mode': effective_mode, 'cleanup_enabled': CLEANUP_ENABLED, 'results': results})
 
 
 REGISTER_HTML = STYLE_BLOCK + """
