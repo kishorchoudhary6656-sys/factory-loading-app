@@ -497,13 +497,6 @@ def init_db():
     cursor.execute('ALTER TABLE po_items ADD COLUMN IF NOT EXISTS tax_percent DOUBLE PRECISION')
     cursor.execute('ALTER TABLE po_items ADD COLUMN IF NOT EXISTS approved_by TEXT')
     cursor.execute('ALTER TABLE po_items ADD COLUMN IF NOT EXISTS approved_at TEXT')
-    # --- PO Cost Variance Control: additive matching-key fields on po_items. Existing old PO rows
-    # simply stay NULL here — nothing about their existing display/behavior changes. New uploads can
-    # populate these for accurate PVID+Pack Size+Location matching against the Approved Cost Master.
-    cursor.execute('ALTER TABLE po_items ADD COLUMN IF NOT EXISTS pvid TEXT')
-    cursor.execute('ALTER TABLE po_items ADD COLUMN IF NOT EXISTS pack_size TEXT')
-    cursor.execute('ALTER TABLE po_items ADD COLUMN IF NOT EXISTS cost_location TEXT')
-    cursor.execute("ALTER TABLE po_items ADD COLUMN IF NOT EXISTS cost_status TEXT DEFAULT 'not_evaluated'")
     cursor.execute('ALTER TABLE companies ADD COLUMN IF NOT EXISTS sub_brands TEXT')
 
     # --- Barcode Catalog: company/sub-brand/PIN code/packing size, per the master workflow spec ---
@@ -527,20 +520,6 @@ def init_db():
         updated_at TEXT, updated_by TEXT
     )''')
     cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS uq_rate_master_factory_company_product ON rate_master(factory_id, company, product_name)')
-    # --- Approved Cost Master expansion (PO Cost Variance Control workflow) ---
-    # Additive only. The OLD unique index above is left completely untouched (still enforces the
-    # legacy company+product_name uniqueness for any record that only has those fields). This new
-    # business key (PVID + Pack Size + Location) is the PRIMARY matching key for new/complete
-    # records; legacy rows simply have NULL in the new columns, and Postgres unique indexes treat
-    # NULL as distinct from every other NULL — so any number of legacy rows can coexist safely
-    # without ever colliding against this new index. No backfill, no destructive migration needed.
-    for col, ddl in [('pvid', 'TEXT'), ('pack_size', 'TEXT'), ('location', 'TEXT'),
-                      ('effective_date', 'TEXT'), ('remarks', 'TEXT'),
-                      ('pvid_norm', 'TEXT'), ('pack_size_norm', 'TEXT'), ('location_norm', 'TEXT')]:
-        cursor.execute(f'ALTER TABLE rate_master ADD COLUMN IF NOT EXISTS {col} {ddl}')
-    cursor.execute('''CREATE UNIQUE INDEX IF NOT EXISTS uq_rate_master_factory_company_pvid_pack_loc
-                       ON rate_master(factory_id, company, pvid_norm, pack_size_norm, location_norm)''')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_rate_master_match ON rate_master(factory_id, company, pvid_norm, pack_size_norm, location_norm)')
 
     # --- AI-based PDF/Photo import staging: extracted data always lands here for human review first ---
     cursor.execute('''CREATE TABLE IF NOT EXISTS ai_import_staging (
@@ -748,17 +727,6 @@ def get_rate_status(cursor, fid, company, item_name, po_rate):
 # P2: Cost Variation threshold — ₹1,000 inclusive counts as GREEN, per exact confirmed spec.
 COST_VARIATION_THRESHOLD = float(os.environ.get('COST_VARIATION_THRESHOLD', '1000'))
 
-def _variance_result(approved_rate, po_rate, po_qty):
-    """Single shared implementation of 'Total Variance Impact = ABS(PO Rate - Approved Cost) x Qty'
-    and the GREEN/RED threshold check. Both the legacy product-name-keyed get_cost_variation() and
-    the new PVID+Pack+Location-keyed get_cost_match() call this SAME function — the ₹1,000 rule is
-    defined exactly once, never duplicated."""
-    if approved_rate is None or po_rate is None or po_qty is None:
-        return {'status': 'none', 'variance': None, 'approved_rate': approved_rate}
-    variance = round(abs(po_rate - approved_rate) * po_qty, 2)
-    status = 'GREEN' if variance <= COST_VARIATION_THRESHOLD else 'RED'
-    return {'status': status, 'variance': variance, 'approved_rate': approved_rate}
-
 def get_cost_variation(cursor, fid, company, item_name, po_rate, po_qty):
     """P2: Cost Variation = ABS(PO Unit Rate - Applicable Approved Cost) x PO Quantity.
     GREEN if <= COST_VARIATION_THRESHOLD (inclusive), RED if strictly greater. Reuses the SAME
@@ -769,47 +737,11 @@ def get_cost_variation(cursor, fid, company, item_name, po_rate, po_qty):
                    (fid, company or '', item_name or ''))
     row = cursor.fetchone()
     approved_rate = row[0] if row else None
-    return _variance_result(approved_rate, po_rate, po_qty)
-
-def _norm_key(value):
-    """Whitespace-trimmed, lowercased normalization for PVID/Pack Size/Location matching — never
-    changes the originally displayed value (that stays in pvid/pack_size/location); this is only
-    used for the comparison/index columns (pvid_norm/pack_size_norm/location_norm)."""
-    if value is None:
-        return None
-    v = str(value).strip().lower()
-    return v if v else None
-
-def get_cost_match(cursor, fid, company, pvid, pack_size, location, po_rate, po_qty):
-    """PO Cost Variance Control workflow: matches the Approved Cost Master using
-    factory_id + company + PVID + Pack Size + Location (normalized), NOT product name. Never
-    fuzzy-matches. Returns one of:
-      - {'status': 'unmatched', ...}      — one or more of PVID/Pack Size/Location missing on the PO line
-      - {'status': 'not_found', ...}      — all keys present, but no Approved Cost Master row matches
-      - {'status': 'ambiguous', ...}      — more than one exact match found (should be prevented by the
-                                             unique index, but checked defensively for any pre-existing
-                                             legacy duplicates) — NEVER guesses, requires human correction
-      - {'status': 'GREEN'/'RED', 'variance':..., 'approved_rate':...} — a clean single match, using
-        the exact same _variance_result() threshold logic as the legacy function above."""
-    pvid_n, pack_n, loc_n = _norm_key(pvid), _norm_key(pack_size), _norm_key(location)
-    if not (pvid_n and pack_n and loc_n):
-        missing = [name for name, v in [('PVID', pvid_n), ('Pack Size', pack_n), ('Location', loc_n)] if not v]
-        return {'status': 'unmatched', 'variance': None, 'approved_rate': None,
-                'label': f'Approved Cost Not Matched — {" / ".join(missing)} required'}
-    cursor.execute('''SELECT id, approved_rate FROM rate_master WHERE factory_id = %s AND company = %s
-                       AND pvid_norm = %s AND pack_size_norm = %s AND location_norm = %s''',
-                   (fid, company or '', pvid_n, pack_n, loc_n))
-    rows = cursor.fetchall()
-    if not rows:
-        return {'status': 'not_found', 'variance': None, 'approved_rate': None, 'label': 'Approved Cost Not Matched — no record for this PVID/Pack Size/Location'}
-    if len(rows) > 1:
-        return {'status': 'ambiguous', 'variance': None, 'approved_rate': None, 'label': 'Ambiguous Approved Cost — multiple matching records, human correction required'}
-    approved_rate = rows[0][1]
-    result = _variance_result(approved_rate, po_rate, po_qty)
-    result['label'] = 'PO Rate Missing' if po_rate is None else None
-    return result
-
-
+    if approved_rate is None or po_rate is None or po_qty is None:
+        return {'status': 'none', 'variance': None, 'approved_rate': approved_rate}
+    variance = round(abs(po_rate - approved_rate) * po_qty, 2)
+    status = 'GREEN' if variance <= COST_VARIATION_THRESHOLD else 'RED'
+    return {'status': status, 'variance': variance, 'approved_rate': approved_rate}
 
 
 # ===========================================================================
@@ -923,11 +855,10 @@ Return ONLY valid JSON, nothing else — no markdown fences, no explanation. Mat
   "delivery_date": string in YYYY-MM-DD format or null,
   "tax_percent": number or null,
   "items": [
-    {"item_name": string, "weight": string or null, "ordered_qty": integer, "rate": number or null, "barcode": string or null,
-     "pvid": string or null, "pack_size": string or null, "location": string or null}
+    {"item_name": string, "weight": string or null, "ordered_qty": integer, "rate": number or null, "barcode": string or null}
   ]
 }
-If a field isn't clearly present in the document, use null — never invent or guess data. "items" must include every line item found. "pvid", "pack_size" and "location" are optional cost-matching fields — only fill them if clearly present as their own labeled fields in the document (e.g. "PVID:", "Pack Size:", "Location:"/"Plant:"/"Branch:"); do not guess these from the product description.'''
+If a field isn't clearly present in the document, use null — never invent or guess data. "items" must include every line item found.'''
     else:
         schema_prompt = '''You are extracting structured data from a GRN (Goods Receipt Note) document image or PDF.
 Return ONLY valid JSON, nothing else — no markdown fences, no explanation. Match this exact schema:
@@ -1085,8 +1016,7 @@ ROUTE_MODULE_MAP = {
     'trip_dispatch': 'Vehicle', 'trip_deliver': 'Vehicle', 'n1_call_now': 'Vehicle',
     # Rate Master
     'rate_master_page': 'Rate Master', 'rate_master_add': 'Rate Master', 'rate_master_delete': 'Rate Master',
-    'rate_master_bulk_template': 'Rate Master', 'rate_master_bulk_preview': 'Rate Master',
-    'rate_master_bulk_review': 'Rate Master', 'rate_master_bulk_confirm': 'Rate Master',
+    'rate_master_po_checker': 'Rate Master', 'rate_master_po_checker_whatsapp': 'Rate Master', 'rate_master_po_checker_email': 'Rate Master',
     # Users
     'users_page': 'Users', 'users_add': 'Users', 'users_toggle': 'Users', 'user_permissions_page': 'Users',
     # Dashboard/Reports
@@ -1165,8 +1095,7 @@ ROUTE_ACTION_MAP = {
     'trip_dispatch': 'manage', 'trip_deliver': 'manage', 'n1_call_now': 'manage',
     # Rate Master
     'rate_master_page': 'view', 'rate_master_add': 'create', 'rate_master_delete': 'delete',
-    'rate_master_bulk_template': 'view', 'rate_master_bulk_preview': 'import',
-    'rate_master_bulk_review': 'view', 'rate_master_bulk_confirm': 'import',
+    'rate_master_po_checker': 'view', 'rate_master_po_checker_whatsapp': 'view', 'rate_master_po_checker_email': 'manage',
     # Users
     'users_page': 'view', 'users_add': 'create', 'users_toggle': 'manage', 'user_permissions_page': 'manage',
     # Dashboard/Reports
@@ -1698,6 +1627,7 @@ def nav_html(active):
         <a href="/companies" class="{cls('companies')}">Companies</a>
         <a href="/pos" class="{cls('pos')}">Manage POs</a>
         <a href="/rate_master" class="{cls('rate_master')}">Rate Master</a>
+        <a href="/rate_master/po_checker" class="{cls('rate_master_po_checker')}">&#x1F50D; PO Checker</a>
         <a href="/production" class="{cls('production')}">Daily Production</a>
         <a href="/vehicles" class="{cls('vehicles')}">Vehicles</a>
         <a href="/history" class="{cls('history')}">History</a>
@@ -2092,18 +2022,6 @@ POS_HTML = STYLE_BLOCK + """
                     <label>Tax / GST % — optional</label>
                     <input type="number" step="0.01" name="tax_percent" placeholder="e.g. 5">
                 </div>
-                <div>
-                    <label>PVID — optional (for Cost Validation)</label>
-                    <input type="text" name="pvid" placeholder="e.g. PV1001">
-                </div>
-                <div>
-                    <label>Pack Size — optional</label>
-                    <input type="text" name="pack_size" placeholder="e.g. 500g">
-                </div>
-                <div>
-                    <label>Location — optional</label>
-                    <input type="text" name="cost_location" placeholder="e.g. Bangalore">
-                </div>
             </div>
             <button type="submit" class="btn" style="margin-top:14px;">Add PO Item (as Draft)</button>
         </form>
@@ -2128,11 +2046,6 @@ POS_HTML = STYLE_BLOCK + """
                     <span style="color:var(--text-muted); font-size:12.5px;">{{ g.rows|length }} item(s) &middot; {{ g.total_ordered }} total ordered</span>
                     {% if g.has_rate_diff %}<span class="badge badge-red">🔴 Rate Difference in this PO</span>{% endif %}
                     {% if g.has_draft %}<span class="badge badge-amber">🟡 Draft — Pending Approval</span>{% else %}<span class="badge badge-green">🟢 Approved</span>{% endif %}
-                    {% if g.cost_status_overall == 'GREEN' %}<span class="badge badge-green">✅ COST VALIDATED</span>
-                    {% elif g.cost_status_overall == 'RED' %}<span class="badge badge-red">🔴 {{ g.cv_red }} item(s) REVIEW REQUIRED &middot; ₹{{ "%.2f"|format(g.cv_total_red_variance) }} total impact</span>
-                    {% else %}<span class="badge badge-amber">🟡 {{ g.cv_unmatched }} item(s) unmatched</span>
-                    {% endif %}
-                    <span style="color:var(--text-muted); font-size:11.5px;">({{ g.cv_green }} green / {{ g.cv_red }} red / {{ g.cv_unmatched }} unmatched of {{ g.cv_total }})</span>
                 </div>
                 <div style="display:flex; gap:8px; flex-wrap:wrap;">
                     {% if g.has_draft %}
@@ -2157,21 +2070,18 @@ POS_HTML = STYLE_BLOCK + """
             </div>
             <table>
                 <thead><tr>
-                    <th>Item</th><th>PVID</th><th>Pack Size</th><th>Location</th><th>Weight</th><th>Ordered Qty</th><th>Barcode</th><th>PO Rate</th><th>Rate Check</th><th>Cost Variation</th><th>Cost Status</th><th>Status</th><th></th>
+                    <th>Item</th><th>Weight</th><th>Ordered Qty</th><th>Barcode</th><th>PO Rate</th><th>Rate Check</th><th>Cost Variation</th><th>Status</th><th></th>
                 </tr></thead>
                 <tbody>
                 {% for it in g.rows %}
                 <tr id="row-{{ it[0] }}">
                     <td>{{ it[2] }}</td>
-                    <td>{{ it[14] or '—' }}</td>
-                    <td>{{ it[15] or '—' }}</td>
-                    <td>{{ it[16] or '—' }}</td>
                     <td>{{ it[3] }}</td>
                     <td>{{ it[4] }}</td>
                     <td style="color:var(--text-muted); font-family:monospace;">{{ it[5] }}</td>
                     <td>{% if it[7] is not none %}₹{{ "%.2f"|format(it[7]) }}{% else %}—{% endif %}</td>
                     <td>
-                        {% set rc = it[17] %}
+                        {% set rc = it[14] %}
                         {% if rc.status == 'match' %}<span class="badge badge-green">🟢 Rate Matched</span>
                         {% elif rc.status == 'diff' %}<span class="badge badge-red">🔴 Diff: ₹{{ "%.2f"|format(rc.diff) }} ({{ rc.diff_pct }}%) &middot; Approved ₹{{ "%.2f"|format(rc.approved_rate) }}</span>
                         {% elif rc.status == 'unknown' %}<span class="badge badge-amber">PO Rate Missing</span>
@@ -2179,24 +2089,15 @@ POS_HTML = STYLE_BLOCK + """
                         {% endif %}
                     </td>
                     <td>
-                        {% set cv = it[18] %}
-                        {% if cv.status == 'GREEN' %}<span class="badge badge-green">🟢 COST ACCEPTED &middot; ₹{{ "%.2f"|format(cv.variance) }}</span>
+                        {% set cv = it[15] %}
+                        {% if cv.status == 'GREEN' %}<span class="badge badge-green">🟢 GREEN &middot; ₹{{ "%.2f"|format(cv.variance) }}</span>
                         {% elif cv.status == 'RED' %}
-                            <span class="badge badge-red">🔴 REVIEW REQUIRED &middot; ₹{{ "%.2f"|format(cv.variance) }}</span>
+                            <span class="badge badge-red">🔴 RED &middot; ₹{{ "%.2f"|format(cv.variance) }}</span>
                             <form method="POST" action="/cost_variation/{{ it[0] }}/send_revised_po_email" style="display:inline; margin-left:4px;">
                                 <button type="submit" class="btn btn-outline btn-sm">📧 Send Revised PO Email</button>
                             </form>
                             <a href="/cost_variation/{{ it[0] }}/history" class="btn btn-outline btn-sm">History</a>
-                        {% elif cv.status == 'ambiguous' %}<span class="badge badge-amber" title="{{ cv.label }}">🟡 AMBIGUOUS — needs correction</span>
-                        {% elif cv.status in ['unmatched', 'not_found'] %}<span class="badge badge-amber" title="{{ cv.label }}">🟡 APPROVED COST NOT MATCHED</span>
                         {% else %}<span style="color:var(--text-muted); font-size:12px;">—</span>
-                        {% endif %}
-                    </td>
-                    <td>
-                        {% if it[7] is none %}<span class="badge badge-amber">🟠 PO RATE MISSING</span>
-                        {% elif cv.status == 'GREEN' %}<span class="badge badge-green">🟢 COST ACCEPTED</span>
-                        {% elif cv.status == 'RED' %}<span class="badge badge-red">🔴 REVIEW REQUIRED</span>
-                        {% else %}<span class="badge badge-amber">🟡 NOT MATCHED</span>
                         {% endif %}
                     </td>
                     <td>
@@ -2215,16 +2116,13 @@ POS_HTML = STYLE_BLOCK + """
                 </tr>
                 {% if it[8] == 'Draft' %}
                 <tr id="edit-{{ it[0] }}" style="display:none; background:rgba(255,255,255,0.03);">
-                    <td colspan="13">
+                    <td colspan="9">
                         <form method="POST" action="/pos/edit/{{ it[0] }}" style="display:flex; gap:8px; flex-wrap:wrap; align-items:flex-end; padding:8px 0;">
                             <div><label style="font-size:11px;">Item</label><input type="text" name="item_name" value="{{ it[2] }}" style="margin:0; min-width:140px;" required></div>
                             <div><label style="font-size:11px;">Weight</label><input type="text" name="weight" value="{{ it[3] }}" style="margin:0; min-width:90px;" required></div>
                             <div><label style="font-size:11px;">Qty</label><input type="number" name="ordered_qty" value="{{ it[4] }}" style="margin:0; min-width:80px;" required></div>
                             <div><label style="font-size:11px;">Barcode</label><input type="text" name="barcode" value="{{ it[5] }}" style="margin:0; min-width:120px;" required></div>
                             <div><label style="font-size:11px;">Rate (₹)</label><input type="number" step="0.01" name="rate" value="{{ it[7] if it[7] is not none else '' }}" style="margin:0; min-width:90px;"></div>
-                            <div><label style="font-size:11px;">PVID</label><input type="text" name="pvid" value="{{ it[14] or '' }}" style="margin:0; min-width:90px;"></div>
-                            <div><label style="font-size:11px;">Pack Size</label><input type="text" name="pack_size" value="{{ it[15] or '' }}" style="margin:0; min-width:90px;"></div>
-                            <div><label style="font-size:11px;">Location</label><input type="text" name="cost_location" value="{{ it[16] or '' }}" style="margin:0; min-width:110px;"></div>
                             <button type="submit" class="btn btn-sm">Save</button>
                             <button type="button" class="btn btn-outline btn-sm" onclick="document.getElementById('edit-{{ it[0] }}').style.display='none';">Cancel</button>
                         </form>
@@ -2247,57 +2145,6 @@ POS_HTML = STYLE_BLOCK + """
 </html>
 """
 
-RATE_MASTER_BULK_REVIEW_HTML = STYLE_BLOCK + """
-<title>Review Bulk Cost Import | {{ factory_display_name }}</title>
-</head>
-<body>
-<div class="container">
-""" + TOPBAR_TEMPLATE.replace("__NAV__", nav_html('rate_master')) + """
-    <div class="card">
-        <div class="card-header"><h2>🔍 Review Approved Cost Sheet — {{ filename }}</h2></div>
-        <div class="stats-grid">
-            <div class="stat-card"><div class="label">Rows Detected</div><div class="value">{{ counts.total }}</div></div>
-            <div class="stat-card"><div class="label">Valid</div><div class="value">{{ counts.valid }}</div></div>
-            <div class="stat-card"><div class="label">Invalid</div><div class="value">{{ counts.invalid }}</div></div>
-            <div class="stat-card"><div class="label">Duplicates in File</div><div class="value">{{ counts.duplicates_in_file }}</div></div>
-            <div class="stat-card"><div class="label">Will Insert</div><div class="value">{{ counts.will_insert }}</div></div>
-            <div class="stat-card"><div class="label">Will Update</div><div class="value">{{ counts.will_update }}</div></div>
-        </div>
-        {% if status == 'committed' %}
-        <div class="badge badge-green" style="display:block; padding:10px 14px;">✅ Already imported.</div>
-        {% else %}
-        <table style="margin-top:10px;">
-            <thead><tr><th>#</th><th>Company</th><th>PVID</th><th>Product</th><th>Pack Size</th><th>Location</th><th>Rate</th><th>Action</th><th>Errors</th></tr></thead>
-            <tbody>
-            {% for r in rows %}
-            <tr style="{% if r.errors %}background:rgba(239,68,68,0.06);{% elif r.is_duplicate_in_file %}background:rgba(245,158,11,0.06);{% endif %}">
-                <td>{{ r.row_num }}</td><td>{{ r.company or '—' }}</td><td>{{ r.pvid }}</td><td>{{ r.product_name }}</td>
-                <td>{{ r.pack_size }}</td><td>{{ r.location }}</td>
-                <td>{% if r.approved_rate is not none %}₹{{ "%.2f"|format(r.approved_rate) }}{% else %}—{% endif %}</td>
-                <td>
-                    {% if r.errors %}<span class="badge badge-red">Invalid</span>
-                    {% elif r.is_duplicate_in_file %}<span class="badge badge-amber">Duplicate in file</span>
-                    {% elif r.will_action == 'INSERT' %}<span class="badge badge-green">Insert</span>
-                    {% else %}<span class="badge badge-blue">Update</span>
-                    {% endif %}
-                </td>
-                <td style="color:#f87171; font-size:12px;">{{ r.errors|join(', ') if r.errors else '—' }}</td>
-            </tr>
-            {% endfor %}
-            </tbody>
-        </table>
-        <form method="POST" action="/rate_master/bulk_import/review/{{ staging_id }}/confirm" style="margin-top:16px;">
-            <button type="submit" class="btn" {% if counts.valid == 0 %}disabled{% endif %}>✅ Confirm Import ({{ counts.valid - counts.duplicates_in_file }} rows)</button>
-            <a href="/rate_master" class="btn btn-outline" style="text-decoration:none;">Cancel</a>
-        </form>
-        {% endif %}
-    </div>
-    <footer>{{ factory_display_name }} &middot; {{ platform_name }}</footer>
-</div>
-</body>
-</html>
-"""
-
 RATE_MASTER_HTML = STYLE_BLOCK + """
 <title>Rate Master | {{ factory_display_name }}</title>
 </head>
@@ -2307,40 +2154,10 @@ RATE_MASTER_HTML = STYLE_BLOCK + """
     {% if error_msg %}
     <div class="badge badge-amber" style="display:block; padding:10px 14px; margin-bottom:14px; font-size:13px;">{{ error_msg }}</div>
     {% endif %}
-    {% if ok_msg %}
-    <div class="badge badge-green" style="display:block; padding:10px 14px; margin-bottom:14px; font-size:13px;">{{ ok_msg }}</div>
-    {% endif %}
-
     <div class="card">
-        <div class="card-header"><h2>📤 Bulk Approved Cost Sheet Import</h2>
-            <a href="/rate_master/bulk_import/template" class="btn btn-outline btn-sm">⬇ Download Template</a>
-        </div>
+        <div class="card-header"><h2>💰 ERP Approved Rate Master</h2></div>
         <div style="color:var(--text-muted); font-size:12.5px; margin-bottom:14px;">
-            Upload a .csv or .xlsx with columns for PVID, Product, Pack Size, Location and Approved Rate (common header names/aliases are recognized automatically).
-            Company can be selected below OR included as its own column in the file. Nothing is written until you review and confirm.
-        </div>
-        <form method="POST" action="/rate_master/bulk_import/preview" enctype="multipart/form-data">
-            <div class="form-grid">
-                <div>
-                    <label>Company (optional if file has a company column)</label>
-                    <select name="company">
-                        <option value="">— use file's company column —</option>
-                        {% for c in companies %}<option value="{{ c }}">{{ c }}</option>{% endfor %}
-                    </select>
-                </div>
-                <div>
-                    <label>Approved Cost Sheet (.csv or .xlsx)</label>
-                    <input type="file" name="cost_sheet_file" accept=".csv,.xlsx" required style="padding:10px;">
-                </div>
-            </div>
-            <button type="submit" class="btn" style="margin-top:10px;">Upload &amp; Preview</button>
-        </form>
-    </div>
-
-    <div class="card">
-        <div class="card-header"><h2>➕ Manual Approved Cost Entry</h2></div>
-        <div style="color:var(--text-muted); font-size:12.5px; margin-bottom:14px;">
-            Fill PVID + Pack Size + Location for the new matching workflow, or leave them blank to use the legacy Company+Product entry (still supported).
+            Save the approved rate for each company + product here. Every PO item is automatically checked against this rate on the Manage POs page — 🟢 if it matches, 🔴 if it differs.
         </div>
         <form method="POST" action="/rate_master/add">
             <div class="form-grid">
@@ -2354,35 +2171,15 @@ RATE_MASTER_HTML = STYLE_BLOCK + """
                     </select>
                 </div>
                 <div>
-                    <label>PVID</label>
-                    <input type="text" name="pvid" placeholder="e.g. PV1001">
-                </div>
-                <div>
-                    <label>Product Name / Description</label>
+                    <label>Product Name (must match item name exactly)</label>
                     <input type="text" name="product_name" placeholder="e.g. Instant Noodles" required>
                 </div>
                 <div>
-                    <label>Pack Size</label>
-                    <input type="text" name="pack_size" placeholder="e.g. 500g">
-                </div>
-                <div>
-                    <label>Location</label>
-                    <input type="text" name="location" placeholder="e.g. Bangalore">
-                </div>
-                <div>
-                    <label>Approved Unit Rate (₹)</label>
+                    <label>Approved Rate (₹)</label>
                     <input type="number" step="0.01" name="approved_rate" placeholder="e.g. 45.50" required>
                 </div>
-                <div>
-                    <label>Effective Date (optional)</label>
-                    <input type="date" name="effective_date">
-                </div>
-                <div>
-                    <label>Source / Remarks (optional)</label>
-                    <input type="text" name="remarks" placeholder="optional">
-                </div>
             </div>
-            <button type="submit" class="btn" style="margin-top:14px;">Save Approved Cost</button>
+            <button type="submit" class="btn" style="margin-top:14px;">Save Approved Rate</button>
         </form>
         {% if companies|length == 0 %}
         <div style="color:var(--text-muted); font-size:12.5px; margin-top:10px;">No companies yet — <a href="/companies" style="color:var(--primary);">add one first</a>.</div>
@@ -2390,36 +2187,19 @@ RATE_MASTER_HTML = STYLE_BLOCK + """
     </div>
 
     <div class="card">
-        <div class="card-header"><h2>📋 Approved Cost Master</h2></div>
-        <form method="GET" action="/rate_master" style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:14px;">
-            <select name="company" onchange="this.form.submit()" style="max-width:200px;">
-                <option value="">All Companies</option>
-                {% for c in companies %}<option value="{{ c }}" {% if c == filter_company %}selected{% endif %}>{{ c }}</option>{% endfor %}
-            </select>
-            <input type="text" name="pvid" value="{{ filter_pvid }}" placeholder="Search PVID" style="max-width:160px; margin:0;">
-            <input type="text" name="product" value="{{ filter_product }}" placeholder="Search Product" style="max-width:180px; margin:0;">
-            <input type="text" name="location" value="{{ filter_location }}" placeholder="Search Location" style="max-width:160px; margin:0;">
-            <button type="submit" class="btn btn-outline btn-sm">Filter</button>
-            {% if filter_company or filter_pvid or filter_product or filter_location %}<a href="/rate_master" class="btn btn-outline btn-sm" style="text-decoration:none;">Clear</a>{% endif %}
-        </form>
+        <div class="card-header"><h2>📋 Approved Rates</h2></div>
         {% if rates|length > 0 %}
         <table>
-            <thead><tr><th>Company</th><th>PVID</th><th>Product</th><th>Pack Size</th><th>Location</th><th>Approved Rate</th><th>Effective Date</th><th>Updated At</th><th>Updated By</th><th></th></tr></thead>
+            <thead><tr><th>Company</th><th>Product</th><th>Approved Rate</th><th>Last Updated</th><th></th></tr></thead>
             <tbody>
             {% for r in rates %}
             <tr>
                 <td><span class="badge badge-blue">{{ r[1] }}</span></td>
-                <td>{{ r[5] or '—' }}</td>
                 <td>{{ r[2] }}</td>
-                <td>{{ r[6] or '—' }}</td>
-                <td>{{ r[7] or '—' }}</td>
                 <td>₹{{ "%.2f"|format(r[3]) }}</td>
-                <td style="font-size:12px; color:var(--text-muted);">{{ r[8] or '—' }}</td>
                 <td style="color:var(--text-muted); font-size:12px;">{{ r[4][:16] if r[4] else '—' }}</td>
-                <td style="color:var(--text-muted); font-size:12px;">{{ r[9] or '—' }}</td>
                 <td>
-                    {% if not r[5] or not r[6] or not r[7] %}<span class="badge badge-amber" title="Missing PVID/Pack Size/Location — Legacy record">Legacy</span>{% endif %}
-                    <form method="POST" action="/rate_master/delete/{{ r[0] }}" onsubmit="return confirm('Delete this approved rate?');" style="display:inline;">
+                    <form method="POST" action="/rate_master/delete/{{ r[0] }}" onsubmit="return confirm('Delete this approved rate?');">
                         <button type="submit" class="btn btn-danger btn-sm">Delete</button>
                     </form>
                 </td>
@@ -2428,7 +2208,7 @@ RATE_MASTER_HTML = STYLE_BLOCK + """
             </tbody>
         </table>
         {% else %}
-        <div class="empty-state">No approved cost records set yet. Add one above or bulk-import a sheet.</div>
+        <div class="empty-state">No approved rates set yet. Add one above.</div>
         {% endif %}
     </div>
 
@@ -2521,7 +2301,7 @@ AI_IMPORT_REVIEW_PO_HTML = STYLE_BLOCK + """
                 <div><label>Tax / GST %</label><input type="number" step="0.01" name="tax_percent" value="{{ extracted.tax_percent if extracted.tax_percent is not none else '' }}"></div>
             </div>
             <table style="margin-top:16px;">
-                <thead><tr><th></th><th>Item</th><th>Weight</th><th>Qty</th><th>Rate</th><th>Barcode</th><th>PVID</th><th>Pack Size</th><th>Location</th></tr></thead>
+                <thead><tr><th></th><th>Item</th><th>Weight</th><th>Qty</th><th>Rate</th><th>Barcode</th></tr></thead>
                 <tbody>
                 {% for it in extracted['items'] %}
                 <tr>
@@ -2531,13 +2311,10 @@ AI_IMPORT_REVIEW_PO_HTML = STYLE_BLOCK + """
                     <td><input type="number" name="ordered_qty" value="{{ it.ordered_qty or '' }}" style="margin:0; min-width:80px;"></td>
                     <td><input type="number" step="0.01" name="rate" value="{{ it.rate if it.rate is not none else '' }}" style="margin:0; min-width:80px;"></td>
                     <td><input type="text" name="barcode" value="{{ it.barcode or '' }}" style="margin:0; min-width:120px;"></td>
-                    <td><input type="text" name="pvid" value="{{ it.pvid or '' }}" style="margin:0; min-width:90px;" placeholder="optional"></td>
-                    <td><input type="text" name="pack_size" value="{{ it.pack_size or '' }}" style="margin:0; min-width:90px;" placeholder="optional"></td>
-                    <td><input type="text" name="cost_location" value="{{ it.location or '' }}" style="margin:0; min-width:100px;" placeholder="optional"></td>
                 </tr>
                 {% endfor %}
                 {% if extracted['items']|length == 0 %}
-                <tr><td colspan="9" style="text-align:center; color:var(--text-muted);">No items were extracted — the document may be unclear. You can still add items manually on the Manage POs page.</td></tr>
+                <tr><td colspan="6" style="text-align:center; color:var(--text-muted);">No items were extracted — the document may be unclear. You can still add items manually on the Manage POs page.</td></tr>
                 {% endif %}
                 </tbody>
             </table>
@@ -3819,32 +3596,18 @@ def rate_master_page():
     if not session.get('logged_in'): return redirect('/login')
     fid = current_factory_id()
     filter_company = request.args.get('company', '').strip()
-    filter_pvid = request.args.get('pvid', '').strip()
-    filter_product = request.args.get('product', '').strip()
-    filter_location = request.args.get('location', '').strip()
     conn = get_conn()
     cursor = conn.cursor()
     cursor.execute('SELECT name FROM companies WHERE factory_id = %s ORDER BY name', (fid,))
     companies = [r[0] for r in cursor.fetchall()]
-    where = 'factory_id = %s'
-    params = [fid]
     if filter_company:
-        where += ' AND company = %s'; params.append(filter_company)
-    if filter_pvid:
-        where += ' AND pvid ILIKE %s'; params.append(f'%{filter_pvid}%')
-    if filter_product:
-        where += ' AND product_name ILIKE %s'; params.append(f'%{filter_product}%')
-    if filter_location:
-        where += ' AND location ILIKE %s'; params.append(f'%{filter_location}%')
-    cursor.execute(f'''SELECT id, company, product_name, approved_rate, updated_at, pvid, pack_size, location,
-                        effective_date, updated_by FROM rate_master WHERE {where} ORDER BY company, product_name''', params)
+        cursor.execute('SELECT id, company, product_name, approved_rate, updated_at FROM rate_master WHERE factory_id = %s AND company = %s ORDER BY company, product_name', (fid, filter_company))
+    else:
+        cursor.execute('SELECT id, company, product_name, approved_rate, updated_at FROM rate_master WHERE factory_id = %s ORDER BY company, product_name', (fid,))
     rates = cursor.fetchall()
     conn.close()
     error_msg = request.args.get('error')
-    ok_msg = request.args.get('msg') if request.args.get('ok') else None
-    return render_template_string(RATE_MASTER_HTML, rates=rates, companies=companies, filter_company=filter_company,
-                                   filter_pvid=filter_pvid, filter_product=filter_product, filter_location=filter_location,
-                                   error_msg=error_msg, ok_msg=ok_msg)
+    return render_template_string(RATE_MASTER_HTML, rates=rates, companies=companies, filter_company=filter_company, error_msg=error_msg)
 
 @app.route('/rate_master/add', methods=['POST'])
 def rate_master_add():
@@ -3853,11 +3616,6 @@ def rate_master_add():
     company = request.form.get('company', '').strip()
     product_name = request.form.get('product_name', '').strip()
     rate_raw = request.form.get('approved_rate', '').strip()
-    pvid = request.form.get('pvid', '').strip()
-    pack_size = request.form.get('pack_size', '').strip()
-    location = request.form.get('location', '').strip()
-    effective_date = request.form.get('effective_date', '').strip()
-    remarks = request.form.get('remarks', '').strip()
     if not company or not product_name or not rate_raw:
         return redirect('/rate_master?error=' + quote('Company, product name and rate are all required.'))
     try:
@@ -3866,220 +3624,20 @@ def rate_master_add():
         return redirect('/rate_master?error=' + quote('Rate must be a number.'))
     conn = get_conn()
     cursor = conn.cursor()
+    cursor.execute('SELECT approved_rate FROM rate_master WHERE factory_id = %s AND company = %s AND product_name = %s', (fid, company, product_name))
+    existing = cursor.fetchone()
     ts = now_ist().isoformat()
-    pvid_n, pack_n, loc_n = _norm_key(pvid), _norm_key(pack_size), _norm_key(location)
-    if pvid_n and pack_n and loc_n:
-        # Full business key present — matches/upserts on PVID+Pack Size+Location (the new primary key).
-        cursor.execute('''SELECT approved_rate FROM rate_master WHERE factory_id = %s AND company = %s
-                           AND pvid_norm = %s AND pack_size_norm = %s AND location_norm = %s''',
-                       (fid, company, pvid_n, pack_n, loc_n))
-        existing = cursor.fetchone()
-        cursor.execute('''INSERT INTO rate_master (factory_id, company, product_name, approved_rate, pvid, pack_size, location,
-                           effective_date, remarks, pvid_norm, pack_size_norm, location_norm, updated_at, updated_by)
-                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                           ON CONFLICT (factory_id, company, pvid_norm, pack_size_norm, location_norm)
-                           DO UPDATE SET approved_rate=EXCLUDED.approved_rate, product_name=EXCLUDED.product_name,
-                           pvid=EXCLUDED.pvid, pack_size=EXCLUDED.pack_size, location=EXCLUDED.location,
-                           effective_date=EXCLUDED.effective_date, remarks=EXCLUDED.remarks,
-                           updated_at=EXCLUDED.updated_at, updated_by=EXCLUDED.updated_by''',
-                       (fid, company, product_name, approved_rate, pvid, pack_size, location,
-                        effective_date or None, remarks or None, pvid_n, pack_n, loc_n, ts, session.get('user_name')))
-        if existing and existing[0] != approved_rate:
-            log_audit(cursor, 'Approved Rate Changed', 'Rate Master', pvid, f'{company} {pvid}/{pack_size}/{location}: ₹{existing[0]} -> ₹{approved_rate}')
-        elif not existing:
-            log_audit(cursor, 'Approved Rate Added', 'Rate Master', pvid, f'{company} {pvid}/{pack_size}/{location}: set to ₹{approved_rate}')
-    else:
-        # Legacy path — unchanged, exact original behavior for backward compatibility.
-        cursor.execute('SELECT approved_rate FROM rate_master WHERE factory_id = %s AND company = %s AND product_name = %s', (fid, company, product_name))
-        existing = cursor.fetchone()
-        cursor.execute('''INSERT INTO rate_master (factory_id, company, product_name, approved_rate, updated_at, updated_by)
-                           VALUES (%s,%s,%s,%s,%s,%s)
-                           ON CONFLICT (factory_id, company, product_name) DO UPDATE SET approved_rate = EXCLUDED.approved_rate, updated_at = EXCLUDED.updated_at, updated_by = EXCLUDED.updated_by''',
-                       (fid, company, product_name, approved_rate, ts, session.get('user_name')))
-        if existing and existing[0] != approved_rate:
-            log_audit(cursor, 'PO Rate Changed', 'Rate Master', product_name, f'{company}: ₹{existing[0]} to ₹{approved_rate}')
-        elif not existing:
-            log_audit(cursor, 'Approved Rate Added', 'Rate Master', product_name, f'{company}: set to ₹{approved_rate}')
+    cursor.execute('''INSERT INTO rate_master (factory_id, company, product_name, approved_rate, updated_at, updated_by)
+                       VALUES (%s,%s,%s,%s,%s,%s)
+                       ON CONFLICT (factory_id, company, product_name) DO UPDATE SET approved_rate = EXCLUDED.approved_rate, updated_at = EXCLUDED.updated_at, updated_by = EXCLUDED.updated_by''',
+                   (fid, company, product_name, approved_rate, ts, session.get('user_name')))
+    if existing and existing[0] != approved_rate:
+        log_audit(cursor, 'PO Rate Changed', 'Rate Master', product_name, f'{company}: ₹{existing[0]} to ₹{approved_rate}')
+    elif not existing:
+        log_audit(cursor, 'Approved Rate Added', 'Rate Master', product_name, f'{company}: set to ₹{approved_rate}')
     conn.commit()
     conn.close()
     return redirect('/rate_master?company=' + quote(company) if company else '/rate_master')
-
-@app.route('/rate_master/bulk_import/template')
-def rate_master_bulk_template():
-    """Part 2: downloadable sample CSV for the bulk Approved Cost Sheet — shows the exact expected
-    logical columns (any supported alias also works on upload, but the template uses the primary names)."""
-    if not session.get('logged_in'): return redirect('/login')
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(['company', 'pvid', 'product_name', 'pack_size', 'location', 'approved_rate', 'effective_date', 'remarks'])
-    writer.writerow(['Zepto', 'PV1001', 'Instant Noodles', '500g', 'Bangalore', '145.00', '2026-01-01', 'Sample row'])
-    return Response(output.getvalue(), mimetype='text/csv',
-                     headers={'Content-Disposition': 'attachment; filename=approved_cost_sheet_template.csv'})
-
-@app.route('/rate_master/bulk_import/preview', methods=['POST'])
-def rate_master_bulk_preview():
-    """Part 2: parses the uploaded sheet and stores a REVIEW-ONLY record — nothing is written to
-    rate_master here. The person must explicitly Confirm Import (below) before anything changes."""
-    if not session.get('logged_in'): return redirect('/login')
-    fid = current_factory_id()
-    ui_company = request.form.get('company', '').strip()
-    file = request.files.get('cost_sheet_file')
-    if not file or file.filename == '':
-        return redirect('/rate_master?error=' + quote('No file selected for bulk import.'))
-    filename_lower = file.filename.lower()
-    if not (filename_lower.endswith('.csv') or filename_lower.endswith('.xlsx')):
-        return redirect('/rate_master?error=' + quote('Please upload a .csv or .xlsx file.'))
-    fieldnames, rows = _read_spreadsheet_rows(file)
-    if fieldnames is None:
-        return redirect('/rate_master?error=' + quote('Could not read the file — check it has a header row.'))
-    colmap = _map_csv_headers(fieldnames, COST_MASTER_HEADER_MAP)
-    required = ['pvid', 'product_name', 'pack_size', 'location', 'approved_rate']
-    missing_cols = [k for k in required if k not in colmap]
-    if missing_cols:
-        return redirect('/rate_master?error=' + quote(f'These required columns were not found (or no recognized alias): {", ".join(missing_cols)}'))
-
-    conn = get_conn()
-    cursor = conn.cursor()
-    preview_rows = []
-    seen_keys_in_file = {}
-    counts = {'total': 0, 'valid': 0, 'invalid': 0, 'will_insert': 0, 'will_update': 0, 'duplicates_in_file': 0}
-    for idx, row in enumerate(rows):
-        counts['total'] += 1
-        file_company = (row.get(colmap.get('company', '')) or '').strip() if 'company' in colmap else ''
-        pvid = (row.get(colmap['pvid']) or '').strip()
-        product_name = (row.get(colmap['product_name']) or '').strip()
-        pack_size = (row.get(colmap['pack_size']) or '').strip()
-        location = (row.get(colmap['location']) or '').strip()
-        rate_raw = (row.get(colmap['approved_rate']) or '').strip()
-        effective_date = (row.get(colmap.get('effective_date', '')) or '').strip() if 'effective_date' in colmap else ''
-        remarks = (row.get(colmap.get('remarks', '')) or '').strip() if 'remarks' in colmap else ''
-
-        errors = []
-        company = ui_company
-        if ui_company and file_company and _norm_key(ui_company) != _norm_key(file_company):
-            errors.append(f"Company conflict: UI selected '{ui_company}' but file row says '{file_company}'")
-        elif file_company and not ui_company:
-            company = file_company
-        if not company:
-            errors.append('Company missing (not selected in UI and not present in file)')
-        if not pvid: errors.append('PVID missing')
-        if not product_name: errors.append('Product name missing')
-        if not pack_size: errors.append('Pack Size missing')
-        if not location: errors.append('Location missing')
-        approved_rate = None
-        if not rate_raw:
-            errors.append('Approved Rate missing')
-        else:
-            try:
-                approved_rate = float(rate_raw)
-                if approved_rate < 0:
-                    errors.append('Approved Rate cannot be negative')
-            except ValueError:
-                errors.append(f"Approved Rate '{rate_raw}' is not a number")
-
-        is_dup_in_file = False
-        will_action = None
-        if not errors:
-            key = (fid, _norm_key(company), _norm_key(pvid), _norm_key(pack_size), _norm_key(location))
-            if key in seen_keys_in_file:
-                is_dup_in_file = True
-                counts['duplicates_in_file'] += 1
-            seen_keys_in_file[key] = idx
-            cursor.execute('''SELECT approved_rate FROM rate_master WHERE factory_id = %s AND company = %s
-                               AND pvid_norm = %s AND pack_size_norm = %s AND location_norm = %s''',
-                           (fid, company, _norm_key(pvid), _norm_key(pack_size), _norm_key(location)))
-            existing = cursor.fetchone()
-            will_action = 'UPDATE' if existing else 'INSERT'
-            if will_action == 'UPDATE':
-                counts['will_update'] += 1
-            else:
-                counts['will_insert'] += 1
-            counts['valid'] += 1
-        else:
-            counts['invalid'] += 1
-
-        preview_rows.append({'row_num': idx + 1, 'company': company, 'pvid': pvid, 'product_name': product_name,
-                              'pack_size': pack_size, 'location': location, 'approved_rate': approved_rate,
-                              'effective_date': effective_date, 'remarks': remarks, 'errors': errors,
-                              'is_duplicate_in_file': is_dup_in_file, 'will_action': will_action})
-
-    ts = now_ist().isoformat()
-    cursor.execute('''INSERT INTO ai_import_staging (factory_id, import_type, company, source_filename, extracted_json, status, created_at, created_by)
-                       VALUES (%s,'COST_MASTER',%s,%s,%s,'pending_review',%s,%s) RETURNING id''',
-                   (fid, ui_company, file.filename, json.dumps({'rows': preview_rows, 'counts': counts}), ts, session.get('user_name')))
-    staging_id = cursor.fetchone()[0]
-    log_audit(cursor, 'Approved Cost Sheet Uploaded', 'Rate Master', staging_id, f'{file.filename}: {counts["total"]} rows detected, {counts["valid"]} valid, {counts["invalid"]} invalid')
-    conn.commit()
-    conn.close()
-    return redirect(f'/rate_master/bulk_import/review/{staging_id}')
-
-@app.route('/rate_master/bulk_import/review/<int:staging_id>')
-def rate_master_bulk_review(staging_id):
-    if not session.get('logged_in'): return redirect('/login')
-    fid = current_factory_id()
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute("SELECT source_filename, extracted_json, status FROM ai_import_staging WHERE id = %s AND factory_id = %s AND import_type = 'COST_MASTER'", (staging_id, fid))
-    row = cursor.fetchone()
-    conn.close()
-    if not row:
-        return "Import not found. <a href='/rate_master'>Back</a>", 404
-    filename, extracted_json, status = row
-    data = json.loads(extracted_json) if extracted_json else {'rows': [], 'counts': {}}
-    return render_template_string(RATE_MASTER_BULK_REVIEW_HTML, staging_id=staging_id, filename=filename,
-                                   rows=data.get('rows', []), counts=data.get('counts', {}), status=status)
-
-@app.route('/rate_master/bulk_import/review/<int:staging_id>/confirm', methods=['POST'])
-def rate_master_bulk_confirm(staging_id):
-    """Part 2: ONLY here does anything actually get written to rate_master — an explicit human
-    Confirm Import action. UPSERT per row; existing rows never deleted merely for being absent from
-    the sheet (a later upload is incremental, never a destructive sync)."""
-    if not session.get('logged_in'): return redirect('/login')
-    fid = current_factory_id()
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute("SELECT extracted_json, status FROM ai_import_staging WHERE id = %s AND factory_id = %s AND import_type = 'COST_MASTER'", (staging_id, fid))
-    row = cursor.fetchone()
-    if not row or row[1] == 'committed':
-        conn.close()
-        return redirect('/rate_master')
-    data = json.loads(row[0])
-    ts = now_ist().isoformat()
-    inserted, updated, skipped = 0, 0, 0
-    seen_this_run = set()
-    for r in data.get('rows', []):
-        if r['errors'] or r['is_duplicate_in_file']:
-            skipped += 1
-            continue  # invalid rows and in-file duplicates (after the first) are never written
-        key = (_norm_key(r['company']), _norm_key(r['pvid']), _norm_key(r['pack_size']), _norm_key(r['location']))
-        if key in seen_this_run:
-            skipped += 1
-            continue
-        seen_this_run.add(key)
-        cursor.execute('''SELECT approved_rate FROM rate_master WHERE factory_id = %s AND company = %s
-                           AND pvid_norm = %s AND pack_size_norm = %s AND location_norm = %s''',
-                       (fid, r['company'], key[1], key[2], key[3]))
-        existing = cursor.fetchone()
-        cursor.execute('''INSERT INTO rate_master (factory_id, company, product_name, approved_rate, pvid, pack_size, location,
-                           effective_date, remarks, pvid_norm, pack_size_norm, location_norm, updated_at, updated_by)
-                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                           ON CONFLICT (factory_id, company, pvid_norm, pack_size_norm, location_norm)
-                           DO UPDATE SET approved_rate=EXCLUDED.approved_rate, product_name=EXCLUDED.product_name,
-                           pack_size=EXCLUDED.pack_size, location=EXCLUDED.location, effective_date=EXCLUDED.effective_date,
-                           remarks=EXCLUDED.remarks, updated_at=EXCLUDED.updated_at, updated_by=EXCLUDED.updated_by''',
-                       (fid, r['company'], r['product_name'], r['approved_rate'], r['pvid'], r['pack_size'], r['location'],
-                        r.get('effective_date') or None, r.get('remarks') or None, key[1], key[2], key[3], ts, session.get('user_name')))
-        if existing:
-            updated += 1
-            if existing[0] != r['approved_rate']:
-                log_audit(cursor, 'Approved Rate Changed', 'Rate Master', r['pvid'], f'{r["company"]} {r["pvid"]}/{r["pack_size"]}/{r["location"]}: ₹{existing[0]} -> ₹{r["approved_rate"]}')
-        else:
-            inserted += 1
-    cursor.execute("UPDATE ai_import_staging SET status = 'committed' WHERE id = %s", (staging_id,))
-    log_audit(cursor, 'Bulk Import Confirmed', 'Rate Master', staging_id, f'{inserted} inserted, {updated} updated, {skipped} skipped')
-    conn.commit()
-    conn.close()
-    return redirect('/rate_master?ok=1&msg=' + quote(f'Bulk import confirmed: {inserted} inserted, {updated} updated, {skipped} skipped.'))
 
 @app.route('/rate_master/delete/<int:rate_id>', methods=['POST'])
 def rate_master_delete(rate_id):
@@ -4095,6 +3653,526 @@ def rate_master_delete(rate_id):
     conn.commit()
     conn.close()
     return redirect('/rate_master')
+
+
+# =============================================================================
+# PO RATE CHECKER — integrated under Rate Master
+# =============================================================================
+
+import re as _re_poc
+
+_POC_SEED_DG  = [{"p":"c6785076-da75-487e-b0b1-d9b2f42eb2d4","d":"Daily Good Biryani Basmati Rice | Long Grain","BLR":110.66,"HYD":112.66,"CHN":111.36},{"p":"03cb5377-4879-4805-9827-533f24d82739","d":"Daily Good Biryani Basmati Rice | Long Grain","BLR":544.35,"HYD":554.35,"CHN":547.85},{"p":"e4a33da2-2226-440d-8a84-ff657c6ec0c5","d":"Daily Good Mogra Basmati Rice | Broken Grain","BLR":55.58,"HYD":57.58,"CHN":56.28},{"p":"f68a86da-93ed-4db0-b737-6db295cdc396","d":"Daily Good Mogra Basmati Rice | Broken Grain","BLR":268.95,"HYD":278.95,"CHN":272.45},{"p":"17d18de5-e7c2-4082-9398-05c00c5ba05d","d":"Daily Good Mogra Basmati Rice | Broken Grain","BLR":532.85,"HYD":552.85,"CHN":539.85},{"p":"81daeca5-c5f0-4fd4-8218-7f26a3896673","d":"Daily Good Rozana Premium Basmati Rice | Medium Grain","BLR":75.98,"HYD":77.98,"CHN":76.68},{"p":"c58c6377-ebad-40ae-a32b-fbcff76df867","d":"Daily Good Rozana Premium Basmati Rice | Medium Grain","BLR":370.95,"HYD":380.95,"CHN":374.45},{"p":"1a821406-c8ed-45be-bdd8-457fc71cb7ef","d":"Daily Good Rozana Regular Basmati Rice | Medium Grain","BLR":65.78,"HYD":67.78,"CHN":66.48},{"p":"5faec4bd-dd2d-4771-aef2-cc292a21fe9f","d":"Daily Good Rozana Regular Basmati Rice | Medium Grain","BLR":319.95,"HYD":329.95,"CHN":323.45},{"p":"ccc68365-9595-4aab-a64c-8a1b430595ec","d":"Daily Good Super Basmati Rice | Long Grain","BLR":90.26,"HYD":92.26,"CHN":90.96},{"p":"a0c0b2fa-9f63-4fba-8f11-622a3ccb98b5","d":"Daily Good Super Basmati Rice | Long Grain","BLR":442.35,"HYD":452.35,"CHN":445.85},{"p":"99ab7bdd-9a83-4b8c-bbc6-b7deadc9bb89","d":"Daily Good Chana Brown","BLR":80.04,"HYD":82.04,"CHN":80.74},{"p":"4dfcda8b-d8a6-4bc9-86cf-4cac890b6c4d","d":"Daily Good Chana Brown","BLR":40.74,"HYD":41.74,"CHN":41.09},{"p":"2e7c30eb-2180-4389-a9b8-f84c118972a4","d":"Daily Good Chana Dal Unpolished","BLR":83.1,"HYD":85.1,"CHN":83.8},{"p":"81f28964-be30-400c-9853-0fa21d93cca0","d":"Daily Good Chana Dal Unpolished","BLR":42.27,"HYD":43.27,"CHN":42.62},{"p":"d8c7a102-7daf-4828-bc82-66947fabcb91","d":"Daily Good Kabuli Chana Big","BLR":122.88,"HYD":124.88,"CHN":123.58},{"p":"9e39643a-3ad9-4230-a375-c1aa0a5b2330","d":"Daily Good Kabuli Chana Big","BLR":62.16,"HYD":63.16,"CHN":62.51},{"p":"016f4d81-5e8f-4ac2-8301-942935f87c2e","d":"Daily Good Kabuli Chana Medium","BLR":95.34,"HYD":97.34,"CHN":96.04},{"p":"ad965f02-45c6-40b8-b844-6d3d03a5a29a","d":"Daily Good Kabuli Chana Medium","BLR":48.39,"HYD":49.39,"CHN":48.74},{"p":"a2be534f-d20d-46c5-af64-e21a60f53ab2","d":"Daily Good Unpolished Masoor Black Whole","BLR":83.1,"HYD":85.1,"CHN":83.8},{"p":"dc0e0b82-83ca-4389-963c-3972caa6aa38","d":"Daily Good Unpolished Masoor Black Whole","BLR":42.27,"HYD":43.27,"CHN":42.62},{"p":"3b54c4ea-b4d6-4e65-858c-fe25e8bc4b10","d":"Daily Good Unpolished Masoor Dal","BLR":90.24,"HYD":92.24,"CHN":90.94},{"p":"4ef249e4-c823-47a7-842b-a81402e3fba4","d":"Daily Good Unpolished Masoor Dal","BLR":45.84,"HYD":46.84,"CHN":46.19},{"p":"781a376b-0547-48b8-af19-3b31c03e6420","d":"Daily Good Unpolished Red Masoor Whole - Malka - Lentils","BLR":85.14,"HYD":87.14,"CHN":85.84},{"p":"d3cecb2c-2ac3-44ac-b902-266168a1632b","d":"Daily Good Unpolished Green Moong Chilka Dal -Split","BLR":118.8,"HYD":120.8,"CHN":119.5},{"p":"ddd290b4-d31e-4657-b3dc-bf1b748becbe","d":"Daily Good Unpolished Green Moong Chilka Dal-Split","BLR":60.12,"HYD":61.12,"CHN":60.47},{"p":"235888e5-1420-4a9b-bed3-65179d5d5a2b","d":"Daily Good Unpolished Green Moong Whole","BLR":113.7,"HYD":115.7,"CHN":114.4},{"p":"e8b6fd25-1b1a-4fac-bd6d-0809a1d9538f","d":"Daily Good Unpolished Green Moong Whole","BLR":57.57,"HYD":58.57,"CHN":57.92},{"p":"554cf524-77e5-444c-81c8-a9cb2457c886","d":"Daily Good Unpolished Moong Dal","BLR":116.76,"HYD":118.76,"CHN":117.46},{"p":"30c8c4d8-813b-4993-8427-dde70b87d3f1","d":"Daily Good Unpolished Moong Dal","BLR":59.1,"HYD":60.1,"CHN":59.45},{"p":"86e861f9-761e-49c9-8c67-69eb0e5006ba","d":"Daily Good Matki / Moth","BLR":60.12,"HYD":61.12,"CHN":60.47},{"p":"8fac0b2f-9ea4-41e1-9e36-4658a74fc80c","d":"Daily Good Matki | Moth","BLR":24.56,"HYD":24.96,"CHN":24.7},{"p":"cfbf008c-0d22-4a25-ae4b-c23629483eba","d":"Daily Good Raw Peanut - Singdana","BLR":144.3,"HYD":146.3,"CHN":145},{"p":"d165ad34-5357-42d9-bfff-d99d440cadcb","d":"Daily Good Raw Peanut - Singdana","BLR":29.67,"HYD":30.07,"CHN":29.81},{"p":"27f6d723-530b-4cb9-9d8d-15f145586b30","d":"Daily Good Raw Peanut / Singdana","BLR":72.87,"HYD":73.87,"CHN":73.22},{"p":"41aa1263-6fb9-489b-9a99-32df19f02794","d":"Daily Good Unpolished Green Peas / Matar","BLR":42.78,"HYD":43.78,"CHN":43.13},{"p":"36ed5c78-b1f4-420b-b1d2-fd8edb629686","d":"Daily Good Unpolished White Peas / Matar / Vatana","BLR":55.56,"HYD":57.56,"CHN":56.26},{"p":"964e524b-ab12-49b2-9c93-4c659f464aa6","d":"Daily Good Unpolished White Peas / Matar / Vatana","BLR":28.5,"HYD":29.5,"CHN":28.85},{"p":"72078697-ffd4-475f-a883-611f99a14198","d":"Daily Good Medium Poha | Avalakki | Indori Poha","BLR":27.54,"HYD":28.54,"CHN":27.89},{"p":"a285d8fd-c4ff-4892-bdab-8307e448d2a9","d":"Daily Good Medium Poha | Avalakki | Indori Poha","BLR":15.57,"HYD":16.07,"CHN":15.75},{"p":"6e5598c2-423f-4c62-ab55-1bd4aefd8eb7","d":"Daily Good Poha / Avalakki Thick","BLR":30.6,"HYD":31.6,"CHN":30.95},{"p":"4c9d9ee9-d6b1-448e-872d-afba5da408eb","d":"Daily Good Poha-Avalakki Thin","BLR":18.38,"HYD":18.88,"CHN":18.55},{"p":"25830ced-3b2d-443d-bd3b-b5a91d817b8b","d":"Daily Good Unpolished Rajma | Kidney Beans /Chitra/White","BLR":61.14,"HYD":62.14,"CHN":61.49},{"p":"7773da64-a5b6-4df0-a78b-399775e4be4a","d":"Daily Good Unpolished Rajma | Kidney Beans Red","BLR":125.94,"HYD":127.94,"CHN":126.64},{"p":"9bdb4536-d11f-4df6-8bc6-5c7c32d6c8f0","d":"Daily Good Unpolished Rajma | Kidney Beans Red","BLR":63.69,"HYD":64.69,"CHN":64.04},{"p":"c5e2e4a7-857b-4789-8ae8-59bcaf65c106","d":"Daily Good Unpolished Rajma | Kidney Beans Sharmili","BLR":93.3,"HYD":95.3,"CHN":94},{"p":"fe92b801-78b8-4a36-9b89-8d6506a0e08c","d":"Daily Good Unpolished Rajma | Kidney Beans Sharmili","BLR":47.37,"HYD":48.37,"CHN":47.72},{"p":"62b68a62-f712-47d9-b03e-4bfc9054e763","d":"Daily Good Unpolished Rajma | Kidney Beans-Chitra-White","BLR":120.84,"HYD":122.84,"CHN":121.54},{"p":"60c6b6d7-d6af-4b27-ad30-dc9f62a24521","d":"Daily Good Brown Rice","BLR":61.7,"HYD":63.7,"CHN":62.4},{"p":"66405fbd-3f90-411a-87f2-528f19aec713","d":"Daily Good Dosa Rice","BLR":38.24,"HYD":40.24,"CHN":38.94},{"p":"6e80d7eb-4916-45f7-bf86-06039a80feae","d":"Daily Good Dosa Rice","BLR":180.4,"HYD":190.4,"CHN":183.9},{"p":"9f086348-a866-427c-9b51-c146baa27d59","d":"Daily Good Hmt Kolam Steam Rice","BLR":297.7,"HYD":307.7,"CHN":301.2},{"p":"5214d32c-2a68-4f5e-b0ad-ebf5c1830d0e","d":"Daily Good Hmt Kolam Steam Rice","BLR":593.6,"HYD":613.6,"CHN":600.6},{"p":"eeaccfd1-3f8f-4a67-bfbd-6de7ebfdcc7d","d":"Daily Good Hmt Kolam Steam Rice","BLR":1507.38,"HYD":1559.38,"CHN":1525.58},{"p":"281ccc3f-918e-4478-b43f-cb2fb766d1c1","d":"Daily Good Idli Rice","BLR":45.38,"HYD":47.38,"CHN":46.08},{"p":"f3e4f39a-7776-451f-b42c-6b9fe4c784ca","d":"Daily Good Idli Rice","BLR":216.1,"HYD":226.1,"CHN":219.6},{"p":"0fb44653-b847-4452-986d-9269234aef6c","d":"Daily Good Kurnool Sona Masoori Raw Rice","BLR":282.4,"HYD":292.4,"CHN":285.9},{"p":"ceb511a4-4a75-488d-aea8-4929f6e2f3f2","d":"Daily Good Kurnool Sona Masoori Raw Rice","BLR":563.22,"HYD":583.22,"CHN":570.22},{"p":"42c7808e-6045-456d-9bfe-5a3874fec333","d":"Daily Good Kurnool Sona Masoori Raw Rice","BLR":1428.4,"HYD":1480.4,"CHN":1446.6},{"p":"78595922-d7c1-42d5-b956-8383533cce96","d":"Daily Good Kurnool Sona Masoori Steam Rice","BLR":287.5,"HYD":297.5,"CHN":291},{"p":"806c6b9f-4e47-4d55-b970-4761ef0b784e","d":"Daily Good Kurnool Sona Masoori Steam Rice","BLR":573.35,"HYD":593.35,"CHN":580.35},{"p":"da99eb0b-9d63-48c2-aa7c-ce7116b7640a","d":"Daily Good Kurnool Sona Masoori Steam Rice","BLR":1454.72,"HYD":1506.72,"CHN":1472.92},{"p":"6dc3ca8f-2cf3-4c95-b65b-9e75afdc484e","d":"Daily Good Lachkari Kolam Raw Rice","BLR":66.8,"HYD":68.8,"CHN":67.5},{"p":"3eaa0e46-c8e0-49fb-a200-e716372cb06a","d":"Daily Good Lachkari Kolam Raw Rice","BLR":323.2,"HYD":333.2,"CHN":326.7},{"p":"2763ab76-39d6-4bf8-8217-a6f6d41d0c1a","d":"Daily Good Lachkari Kolam Raw Rice","BLR":644.22,"HYD":664.22,"CHN":651.22},{"p":"3d7d4f08-89f6-464d-8a45-2c1bf28a7227","d":"Daily Good Medium Poha | Avalakki | Indori Poha","BLR":53.71,"HYD":55.71,"CHN":54.41},{"p":"33e1997e-2d7a-4912-9765-c908b51bc46a","d":"Daily Good Ponni Boiled Rice","BLR":56.6,"HYD":58.6,"CHN":57.3},{"p":"981eafe8-5362-43ab-ae38-0b70a5113366","d":"Daily Good Ponni Boiled Rice","BLR":272.2,"HYD":282.2,"CHN":275.7},{"p":"c5fb2197-1f99-4b11-bc38-4ef9f84cd228","d":"Daily Good Ponni Boiled Rice","BLR":542.97,"HYD":562.97,"CHN":549.97},{"p":"70599e09-fc85-435b-b61a-e983fc352019","d":"Daily Good Ponni Boiled Rice","BLR":1375.75,"HYD":1427.75,"CHN":1393.95},{"p":"8d459c3c-6992-47c0-9cbe-1716d3891106","d":"Daily Good Ponni Raw Rice","BLR":282.4,"HYD":292.4,"CHN":285.9},{"p":"3b1b0379-66b8-45a6-8637-4d53fb06b1d8","d":"Daily Good Ponni Raw Rice","BLR":563.22,"HYD":583.22,"CHN":570.22},{"p":"75812685-0ba0-4792-99f2-c88329613142","d":"Daily Good Ponni Raw Rice","BLR":1428.4,"HYD":1480.4,"CHN":1446.6},{"p":"6d970def-75ae-4e8a-b944-33e4cedaf242","d":"Daily Good Ponni Steam Rice","BLR":59.66,"HYD":61.66,"CHN":60.36},{"p":"94e2bccf-3d00-49e0-a675-af2088ee67eb","d":"Daily Good Ponni Steam Rice","BLR":287.5,"HYD":297.5,"CHN":291},{"p":"67f26af0-54f5-42a1-923f-24ce644ee6f3","d":"Daily Good Ponni Steam Rice","BLR":573.35,"HYD":593.35,"CHN":580.35},{"p":"061c8ae4-8a7d-42a1-93f2-4dbe4d0a5800","d":"Daily Good Ponni Steam Rice","BLR":1454.72,"HYD":1506.72,"CHN":1472.92},{"p":"eaae60a3-62aa-4bdd-bb1a-fcd81b9a7379","d":"Daily Good Rajbhogam Boiled Rice","BLR":56.6,"HYD":58.6,"CHN":57.3},{"p":"26986c6b-44cd-4983-85a2-5e3348a0e054","d":"Daily Good Rajbhogam Boiled Rice","BLR":272.2,"HYD":282.2,"CHN":275.7},{"p":"a6948775-9150-4005-a59d-f0f2b2e5f827","d":"Daily Good Rajbhogam Boiled Rice","BLR":542.97,"HYD":562.97,"CHN":549.97},{"p":"9a21c478-0a69-449a-9565-e73deeaefdce","d":"Daily Good Red Matta Rice","BLR":59.66,"HYD":61.66,"CHN":60.36},{"p":"6a401fce-3ead-496e-a2c4-3ae3928c709e","d":"Daily Good Sona Masoori Boiled Rice","BLR":272.2,"HYD":282.2,"CHN":275.7},{"p":"466a2c85-12aa-4612-b54c-fa9b8e886de3","d":"Daily Good Sona Masoori Boiled Rice","BLR":542.97,"HYD":562.97,"CHN":549.97},{"p":"77fd7498-1eb6-4a36-90db-48f61a96bfa1","d":"Daily Good Sona Masoori Boiled Rice","BLR":1375.75,"HYD":1427.75,"CHN":1393.95},{"p":"bfe98cad-c52c-4c3f-9f99-ee9f0f71118f","d":"Daily Good Sona Masoori Raw Rice","BLR":58.64,"HYD":60.64,"CHN":59.34},{"p":"95edc2a8-2f28-43e4-871a-2308c0c6c62a","d":"Daily Good Sona Masoori Raw Rice","BLR":282.4,"HYD":292.4,"CHN":285.9},{"p":"35485dd9-898a-49e5-b47c-938fadcc0742","d":"Daily Good Sona Masoori Raw Rice","BLR":563.22,"HYD":583.22,"CHN":570.22},{"p":"2315c5c9-8398-4e89-93f6-38e2ccdaab86","d":"Daily Good Sona Masoori Raw Rice","BLR":1428.4,"HYD":1480.4,"CHN":1446.6},{"p":"0bb3643e-b91d-4883-bce3-a20ac78490ad","d":"Daily Good Sona Masoori Steam Rice","BLR":282.4,"HYD":292.4,"CHN":285.9},{"p":"34376002-1aca-4d43-99ec-d40020007a13","d":"Daily Good Sona Masoori Steam Rice","BLR":563.22,"HYD":583.22,"CHN":570.22},{"p":"aa683645-861c-4367-bcdf-734d6e4dcd3f","d":"Daily Good Sona Masoori Steam Rice","BLR":1428.4,"HYD":1480.4,"CHN":1446.6},{"p":"ed6e550a-699a-452b-81e5-c4997cdcb5a1","d":"Daily Good Tamil Ponni Boiled Rice","BLR":56.6,"HYD":58.6,"CHN":57.3},{"p":"f37072d8-de04-474b-bd13-9297e5f75456","d":"Daily Good Roasted Chana Dal / Phutana","BLR":53.35,"HYD":54.35,"CHN":53.7},{"p":"e92a05aa-b68f-4136-b9e2-ca8a1eecc8ba","d":"Daily Good Roasted Chana Whole With Husk","BLR":50.8,"HYD":51.8,"CHN":51.15},{"p":"4a7d4796-0d8a-4627-907f-e6df14abf923","d":"Daily Good Toor Dal Regular","BLR":123.9,"HYD":125.9,"CHN":124.6},{"p":"b87382db-a2fd-43df-88dd-b63aaf407931","d":"Daily Good Unpolished Toor - Tur - Arhar Dal","BLR":65.22,"HYD":66.22,"CHN":65.57},{"p":"d05b8f97-2ccb-49ea-b1a2-9ec699a82871","d":"Daily Good Unpolished Toor / Tur / Arhar Dal","BLR":129,"HYD":131,"CHN":129.7},{"p":"fb6b6353-0ca5-4296-8fef-1590f1e941ff","d":"Daily Good Unpolished Urad Black Chilka/Splits","BLR":60.12,"HYD":61.12,"CHN":60.47},{"p":"2edf4311-a271-4b72-9669-e240fddd23d1","d":"Daily Good Unpolished Urad Black Chilka-Splits","BLR":118.8,"HYD":120.8,"CHN":119.5},{"p":"616439ff-9c27-429a-abd1-286699161337","d":"Daily Good Unpolished Urad Black Whole","BLR":118.8,"HYD":120.8,"CHN":119.5},{"p":"61a85ba7-bf51-49da-a056-104eb292e961","d":"Daily Good Unpolished Urad Black Whole","BLR":60.12,"HYD":61.12,"CHN":60.47},{"p":"e0c65e93-3f0e-4a79-8d2b-e09d0348f90a","d":"Daily Good Unpolished Urad Dal | Split White","BLR":122.88,"HYD":124.88,"CHN":123.58},{"p":"d37a3cfd-ddbc-44df-8a3d-de1c40f0ae90","d":"Daily Good Unpolished Urad Dal | Split White","BLR":62.16,"HYD":63.16,"CHN":62.51},{"p":"632519f7-c5b2-4da3-97df-809c46d3484e","d":"Daily Good Unpolished Urad White Whole - Gota","BLR":122.88,"HYD":124.88,"CHN":123.58},{"p":"83d4141e-013d-45f0-8913-6591352fcce9","d":"Daily Good Unpolished Urad White Whole / Gota","BLR":62.16,"HYD":63.16,"CHN":62.51},{"p":"24e30a20-fbdc-4000-b9d5-2d13964d7371","d":"Daily Good Unpolished Green Moong Chilka Dal -Split","BLR":24.56,"HYD":24.96,"CHN":24.7},{"p":"cc023603-8f3d-46b5-82c5-345da2f73436","d":"Daily Good Unpolished Green Dried Peas / Matar","BLR":17.62,"HYD":18.02,"CHN":17.76},{"p":"a3d88c5e-09ba-48ec-bf7b-fad7729f967f","d":"Daily Good Unpolished Rajma | Kidney Beans Red","BLR":24.56,"HYD":24.96,"CHN":24.7},{"p":"b47107f3-6900-438a-a2cb-fdb26eaf11d7","d":"Daily Good Unpolished Rajma | Kidney Beans Sharmili","BLR":19.46,"HYD":19.86,"CHN":19.6},{"p":"20494704-11fb-47c3-a91d-29295dfe84f0","d":"Daily Good Unpolished Urad Black Chilka - Splits","BLR":24.56,"HYD":24.96,"CHN":24.7},{"p":"3660ee74-a633-4dc1-ba35-11f1f46fb788","d":"Daily Good Unpolished Urad Black Whole","BLR":24.56,"HYD":24.96,"CHN":24.7},{"p":"e7eee3c7-f98c-4bb6-b03c-27b66cdfe167","d":"Daily Good Unpolished Urad Dal | Split White","BLR":24.96,"HYD":25.36,"CHN":25.1},{"p":"d380073e-b868-464d-b272-f08d98867b3b","d":"Daily Good Idli Rava - Sooji","BLR":22.79,"HYD":23.79,"CHN":23.14},{"p":"91a9da89-0343-4761-87c2-ca789465ee28","d":"Daily Good Idli Rava","BLR":44.14,"HYD":46.14,"CHN":44.84}]
+_POC_SEED_BP  = [{"p":"672dfdfd-12ba-4caf-82fd-7f4f64b0bd60","d":"Basic Besan","BLR":32.25,"HYD":33.15,"CHN":32.65},{"p":"5a9fe27b-97ed-4520-98c1-cefab19f9a7c","d":"Basic Chana Dal | Regular","BLR":38.43,"HYD":39.33,"CHN":38.83},{"p":"93e6a769-c6cf-46b6-974e-f2c728aafeae","d":"Basic Idli Rawa","BLR":41.25,"HYD":43.05,"CHN":42.05},{"p":"1a852258-b52c-43e6-a184-d23b1db36c9c","d":"Basic Green Moong Whole","BLR":47.43,"HYD":48.33,"CHN":47.83},{"p":"81c51ebd-b4d9-42bc-96f5-54bad48275b5","d":"Basic Moong Dal","BLR":47.43,"HYD":48.33,"CHN":47.83},{"p":"e44236e8-e93e-47fa-b852-aa029b10df64","d":"Basic Peanut","BLR":65.93,"HYD":66.83,"CHN":66.33},{"p":"1169658e-a5a6-4d6f-87f1-6916916a6409","d":"Basic Biryani Basmati Rice","BLR":84.25,"HYD":86.05,"CHN":85.05},{"p":"728f3f76-84dd-47fa-ac24-f290dcb7d5d5","d":"Basic Dosa Rice","BLR":36.25,"HYD":38.05,"CHN":37.05},{"p":"63fbbfff-8618-4640-944d-5a463c221b03","d":"Basic Idli Rice","BLR":44.25,"HYD":46.05,"CHN":45.05},{"p":"46205762-1cd1-4982-9fcf-736b3973eda3","d":"Basic Kolam HMT Steam Rice","BLR":58.25,"HYD":60.05,"CHN":59.05},{"p":"4ba7a7bc-ef75-46bc-8961-76d16bd3552b","d":"Basic Kolam Raw Rice","BLR":62.25,"HYD":64.05,"CHN":63.05},{"p":"638b44d5-ffcd-49f0-a524-634d48c8ddd6","d":"Basic Sona Masoori Raw Rice","BLR":51.25,"HYD":53.05,"CHN":52.05},{"p":"d5dfb236-f3de-4bf6-b18d-a7ee75a7ed66","d":"Basic Toor Dal","BLR":110.25,"HYD":112.05,"CHN":111.05},{"p":"c16f2c81-e704-4046-900a-17e8ba82154c","d":"Basic Toor Dal Bold","BLR":104.25,"HYD":106.05,"CHN":105.05},{"p":"c09f8705-58f1-4646-a9dd-16dfbeaa6a30","d":"Basic Urad White Whole","BLR":110.25,"HYD":112.05,"CHN":111.05},{"p":"43e4d10b-3194-4fc3-8d19-5e24cc9ade6b","d":"Basic Sona Masoori Steam Rice","BLR":47.25,"HYD":49.05,"CHN":48.05},{"p":"123051dc-e24a-4156-b776-18f3f32e4ae8","d":"Basic Ponni Boiled Rice","BLR":54.25,"HYD":56.05,"CHN":55.05},{"p":"f022cc78-0321-44b0-99a4-054c03602115","d":"Basic Urad Dal","BLR":54.43,"HYD":55.33,"CHN":54.83}]
+_POC_SEED_FK  = [{"f":"PLSHZGZSDFSA8JFV","d":"Unbranded Chana Dal 200 gm","app":20.1125,"BLR":20.1125,"DWD":20.3125},{"f":"PLSHZGZSMPFMS7NR","d":"Unbranded Masoor Dal 200 gm","app":20.5325,"BLR":20.5325,"DWD":20.7325},{"f":"RICHHPJPH2HYDBMN","d":"Unbranded Puffed Rice ( Murmura ) 200 gm","app":2.1525,"BLR":2.1525,"DWD":2.3525},{"f":"PLSHZGZS3PDHZEZE","d":"Unbranded Toor Dal 200 gm","app":27.9375,"BLR":27.9375,"DWD":28.1375},{"f":"PLSHZGZS954NMT9W","d":"Unbranded Yellow Moong dal 200 gm","app":24.0525,"BLR":24.0525,"DWD":24.2525},{"f":"PLSHHPKPGHGMURDC","d":"Unbranded Fried Gram Whole Whole Fried Gram 250 g","app":28.9875,"BLR":28.9875,"DWD":29.2375},{"f":"PLSHMJMYNZPHWFH5","d":"Unbranded Peanut Whole Raw Peanut 250 g","app":43.6375,"BLR":43.6375,"DWD":43.8875},{"f":"PLSFT7N5A5XD7TAJ","d":"My Kitchen Fried Gram Yellow Split Fried Gram 500 g","app":50.673,"BLR":50.673,"DWD":51.173},{"f":"PLSHMGQYBWXN7WNY","d":"Unbranded ( Chawli ) Whole Lobia 500 g","app":45.423,"BLR":45.423,"DWD":45.923},{"f":"GNMHHPMYY4PRZQMZ","d":"Unbranded 500 g Sago","app":34.923,"BLR":34.923,"DWD":35.423},{"f":"PLSHHPKPJXBDCD4J","d":"Unbranded Bhuna Chana Whole Fried Gram 500 g","app":54.723,"BLR":54.723,"DWD":55.223},{"f":"PLSHHPHD8YK6FXFK","d":"Unbranded Chana (Whole) Brown Whole Chana 500 g","app":43.698,"BLR":43.698,"DWD":44.198},{"f":"PLSHHPHHRTJHHZUA","d":"Unbranded Chana Brown Brown Whole Chana Dal 500 g","app":43.698,"BLR":43.698,"DWD":44.198},{"f":"PLSEWWBTEHDTDAUF","d":"Unbranded Chana Dal NA Split Chana Dal 500 g","app":45.323,"BLR":45.323,"DWD":45.823},{"f":"PLSHHPKPZSJRDQSS","d":"Unbranded Fried Gram Split Split Fried Gram 500 g","app":53.673,"BLR":53.673,"DWD":54.173},{"f":"FLRHHUFNEEMFH3Y4","d":"Unbranded Gram Flour/ Besan 500 g","app":35.8575,"BLR":35.8575,"DWD":36.3575},{"f":"PLSEWWBUUJZYKP4H","d":"Unbranded Kabuli Chana NA Whole Kabuli Chana 500 g","app":51.048,"BLR":51.048,"DWD":51.548},{"f":"PLSHMGQYFKWBZGVU","d":"Unbranded Masoor Dal Black Whole Black Whole Masoor Dal 500 g","app":43.223,"BLR":43.223,"DWD":43.723},{"f":"PLSEWWBUSN9ZZXNE","d":"Unbranded Masoor Dal Red Split Masoor Dal 500 g","app":45.323,"BLR":45.323,"DWD":45.823},{"f":"RICHHPJPGHDSMGET","d":"Unbranded Medium Poha 0.5 kg","app":28.623,"BLR":28.623,"DWD":29.123},{"f":"PLSHHPHDA2ZYXMGV","d":"Unbranded Mix Dal Split Mix Dal 500 g","app":55.298,"BLR":55.298,"DWD":55.798},{"f":"PLSHHPHDMWQGHC38","d":"Unbranded Moong Dal (Split) Green Split Moong Dal 500 g","app":53.673,"BLR":53.673,"DWD":54.173},{"f":"PLSHHPHD3XMMXXGG","d":"Unbranded Moong Dal (Whole) Green Whole Moong Dal 500 g","app":54.723,"BLR":54.723,"DWD":55.223},{"f":"PLSEWWBTGJZCE6FC","d":"Unbranded Moong Dal Yellow Split Moong Dal 500 g","app":53.673,"BLR":53.673,"DWD":54.173},{"f":"PLSHHPHDKNPM6Y4T","d":"Unbranded Rajma (Whole) Red Whole Rajma 500 g","app":65.798,"BLR":65.798,"DWD":66.298},{"f":"PLSHHPKPGKFFSUM3","d":"Unbranded Rajma (Whole) Red Whole Rajma 500 g","app":65.798,"BLR":65.798,"DWD":66.298},{"f":"PLSHHPKPMNK7RTEM","d":"Unbranded Rajma (Whole) White Whole Rajma 500 g","app":68.423,"BLR":68.423,"DWD":68.923},{"f":"PLSEWWBURSNYCGEP","d":"Unbranded Raw Peanuts/ Mungaphali/ Shengdana Whole Peanut 500 g","app":81.973,"BLR":81.973,"DWD":82.473},{"f":"PLSEWWBTYF3AMHQ3","d":"Unbranded Red Masoor Dal Whole Red Whole Masoor Dal 500 g","app":45.323,"BLR":45.323,"DWD":45.823},{"f":"PLSHMGQYUHMWEVRJ","d":"Unbranded Sharmili Whole Rajma Kashmiri 500 g","app":55.298,"BLR":55.298,"DWD":55.798},{"f":"PLSHHPHDRYPHGGZM","d":"Unbranded Toor Dal/Arhar Dal Split Toor Dal Split Toor Dal 500 g","app":63.3855,"BLR":63.3855,"DWD":63.8855},{"f":"PLSHMGQYTYB7HMG6","d":"Unbranded Urad Black Chilka (Split ) Black Split Urad Dal 500 g","app":62.173,"BLR":62.173,"DWD":62.673},{"f":"PLSHMGQYDU2VHYTJ","d":"Unbranded Urad Black Whole Black Whole Urad Dal 500 g","app":60.598,"BLR":60.598,"DWD":61.098},{"f":"PLSEWWBTYVJSMXMK","d":"Unbranded Urad Dal Split White Split Urad Dal 500 g","app":64.798,"BLR":64.798,"DWD":65.298},{"f":"PLSHHPKPWPYUYHVD","d":"Unbranded Urad Gota (Whole) Whole Urad Gota 500 g","app":64.798,"BLR":64.798,"DWD":65.298},{"f":"PLSGAHAMUBD6KMG5","d":"Unbranded White Peas White Whole Peas 500 g","app":34.723,"BLR":34.723,"DWD":35.223},{"f":"PLSFT7N5YWQWHTYU","d":"My Kitchen Chana Dal Split Chana Dal 1 kg","app":86.2575,"BLR":86.2575,"DWD":87.2575},{"f":"PLSFT7N5Z4JVZTUC","d":"My Kitchen Moong Dal Yellow Split Moong Dal 1 kg","app":100.9575,"BLR":100.9575,"DWD":101.9575},{"f":"PLSFT7N5AJVBYBHW","d":"My Kitchen Raw Peanut Whole Raw Peanut 1 kg","app":169.2075,"BLR":169.2075,"DWD":170.2075},{"f":"PLSFT7N5XNHW8DGA","d":"My Kitchen Toor Dal Split Toor Dal 1 kg","app":120.3825,"BLR":120.3825,"DWD":121.3825},{"f":"PLSFT7N5S8TCXXH9","d":"My Kitchen Urad Dal Whole Urad Dal 1 kg","app":128.2075,"BLR":128.2075,"DWD":129.2075},{"f":"GNMHHPMFHEAY8Z5W","d":"Unbranded 1 kg Sago","app":74.7075,"BLR":74.7075,"DWD":75.7075},{"f":"RICHHWCZ3AZRUGYD","d":"Unbranded Basmati Dubar Rice 1 kg","app":63.1575,"BLR":63.1575,"DWD":64.1575},{"f":"RICHHWCZWJDCJR4E","d":"Unbranded Basmati Tibar Rice 1 kg","app":73.6575,"BLR":73.6575,"DWD":74.6575},{"f":"FLRFUUSDAXCC7YFZ","d":"Unbranded Besan 1 kg","app":71.2005,"BLR":71.2005,"DWD":72.2005},{"f":"RICHHWCZRBGJCHKF","d":"Unbranded Biryani Rice Steam Rice (1 kg)","app":93.6075,"BLR":93.6075,"DWD":94.6075},{"f":"PLSGQP6DHS8TK4DU","d":"Unbranded Chana (Whole) Brown Whole Chana 1 kg","app":84.0075,"BLR":84.0075,"DWD":85.0075},{"f":"PLSEWWBTEZUQT7GP","d":"Unbranded Chana Dal NA Split Chana Dal 1 kg","app":88.2575,"BLR":88.2575,"DWD":89.2575},{"f":"RICHMGPQZEJRFDKC","d":"Unbranded Dosa 1 kg","app":43.2075,"BLR":43.2075,"DWD":44.2075},{"f":"RICHMGPQWPZRGHHM","d":"Unbranded HMT 1 kg","app":64.2075,"BLR":64.2075,"DWD":65.2075},{"f":"RICHMGPQCJUJBGQA","d":"Unbranded Idli 1 kg","app":51.0825,"BLR":51.0825,"DWD":52.0825},{"f":"RICHHPJM8UR8TDYR","d":"Unbranded Jeera / Ambemohar / Gobindobhog 1 kg","app":161.8575,"BLR":161.8575,"DWD":162.8575},{"f":"PLSEWWBUZ5SXKC9B","d":"Unbranded Kabuli Chana NA Whole Kabuli Chana 1 kg","app":103.9575,"BLR":103.9575,"DWD":104.9575},{"f":"PLSHHPHD9JVKFGJY","d":"Unbranded Masoor Dal Red Split Masoor Dal 1 kg","app":88.2575,"BLR":88.2575,"DWD":89.2575},{"f":"PLSEWWBTGXESQAAZ","d":"Unbranded Masoor Dal Red Whole Masoor Dal 1 kg","app":88.2575,"BLR":88.2575,"DWD":89.2575},{"f":"RICHHPJMAHV8JJGG","d":"Unbranded Medium Poha (1 kg)","app":56.8575,"BLR":56.8575,"DWD":57.8575},{"f":"PLSHHPHDYD3D6JKM","d":"Unbranded Mix Dal Split Mix Dal 1 kg","app":113.4575,"BLR":113.4575,"DWD":114.4575},{"f":"PLSHHPHDUQTSQYKH","d":"Unbranded Moong Dal (Split) Green Split Moong Dal 1 kg","app":115.5075,"BLR":115.5075,"DWD":116.5075},{"f":"PLSHHPHDXMWB8X9H","d":"Unbranded Moong Dal (Whole) Green Whole Moong Dal 1 kg","app":110.2575,"BLR":110.2575,"DWD":111.2575},{"f":"PLSEWWBTQUG2TZWJ","d":"Unbranded Moong Dal Yellow Split/Chilka Moong Dal 1 kg","app":103.9575,"BLR":103.9575,"DWD":104.9575},{"f":"PLSHZ9VX8AZ5GXJH","d":"Unbranded White Urad Dal (Whole) (2 kg)","app":128.2075,"BLR":128.2075,"DWD":129.2075},{"f":"RICHHWCZUANYMQTN","d":"Unbranded Parmal Rice 1 kg","app":55.8075,"BLR":55.8075,"DWD":56.8075},{"f":"RICHMGPQPMZQWDGG","d":"Unbranded Ponni 1 kg","app":64.2075,"BLR":64.2075,"DWD":65.2075},{"f":"RICHHPJMUXCQBUHX","d":"Unbranded Pulav 1 kg","app":98.8575,"BLR":98.8575,"DWD":99.8575},{"f":"RICHHPJMVJJJZCYZ","d":"Unbranded Pulav Rice 1 kg","app":98.8575,"BLR":98.8575,"DWD":99.8575},{"f":"PLSHHPKPHWNHJHSH","d":"Unbranded Rajma (Whole) Red Whole Rajma 1 kg","app":129.2075,"BLR":129.2075,"DWD":130.2075},{"f":"PLSHMJMY9WW4HPFC","d":"Unbranded Rajma White Chitra White Whole Rajma 1 kg","app":134.4575,"BLR":134.4575,"DWD":135.4575},{"f":"PLSEWWBUZCWUVKFP","d":"Unbranded Raw Peanuts/ Mungaphali/ Shengdana Whole Peanut 1 kg","app":159.5575,"BLR":159.5575,"DWD":160.5575},{"f":"PLSHHPHDG3HEXW7J","d":"Unbranded Red Masoor Dal Whole Red Whole Masoor Dal 500 g","app":88.2575,"BLR":88.2575,"DWD":89.2575},{"f":"PLSHMGQYERERN3WP","d":"Unbranded Sharmili Whole Rajma Kashmiri 1 kg","app":108.2075,"BLR":108.2075,"DWD":109.2075},{"f":"RICHHWCZUMMZWXZG","d":"Unbranded Sona Masoori Rice (Steam) 1 kg","app":66.3075,"BLR":66.3075,"DWD":67.3075},{"f":"RICHMGPQJZWUU2YS","d":"Unbranded Thanjavur Ponni Full Grain 1 kg","app":64.2075,"BLR":64.2075,"DWD":65.2075},{"f":"PLSHHPHDQX29BPWW","d":"Unbranded Toor Dal/Arhar Dal Split Toor Dal Split Toor Dal 1 kg","app":123.3825,"BLR":123.3825,"DWD":124.3825},{"f":"PLSHMGQYH8J6ZZXG","d":"Unbranded Urad Black Chilka (Split ) Black Split Urad Dal 1 kg","app":122.9575,"BLR":122.9575,"DWD":123.9575},{"f":"PLSHMGQYH8YHAPG7","d":"Unbranded Urad Black Whole Black Whole Urad Dal 1 kg","app":119.8075,"BLR":119.8075,"DWD":120.8075},{"f":"PLSEWWBTMH66GCRX","d":"Unbranded Urad Dal Split White Split Urad Dal 1 kg","app":128.2075,"BLR":128.2075,"DWD":129.2075},{"f":"PLSFUUSECTTGEDDR","d":"Unbranded Urad Dal Whole Whole Urad Dal 1 kg","app":128.2075,"BLR":128.2075,"DWD":129.2075},{"f":"PLSHHPKPMWBTNAJ8","d":"Unbranded Urad Gota ( Whole ) Whole Urad Gota 1 kg","app":128.2075,"BLR":128.2075,"DWD":129.2075},{"f":"PLSHHPKPTVJHFFAA","d":"Unbranded Urad Gota White ( Whole ) Whole Urad Gota 1 kg","app":128.2075,"BLR":128.2075,"DWD":129.2075},{"f":"RICHMGPQDXXJVUNU","d":"Unbranded Vada Kolam Long Grain 1 kg","app":64.2075,"BLR":64.2075,"DWD":65.2075},{"f":"PLSGAHAMNHNXECPH","d":"Unbranded White Peas White Whole Peas 1 kg","app":63.0575,"BLR":63.0575,"DWD":64.0575},{"f":"PLSFUUSEYVGTZECP","d":"Unbranded Masoor Dal (Split) (2 kg)","app":178.2005,"BLR":178.2005,"DWD":180.2005},{"f":"PLSHZ9WYYJ8PH9MS","d":"Unbranded Brown Chana (2 kg)","app":175.0005,"BLR":175.0005,"DWD":177.0005},{"f":"PLSHZ9VXYGPBFJVQ","d":"Unbranded Chana Dal (2 kg)","app":174.0005,"BLR":174.0005,"DWD":176.0005},{"f":"PLSHZ9WHYEEJQ4ZS","d":"Unbranded Green Moong Dal (Whole) (2 kg)","app":217.0005,"BLR":217.0005,"DWD":219.0005},{"f":"PLSHZ9VXGGHH7XY3","d":"Unbranded Red Masoor Dal (Whole) (2 kg)","app":178.2005,"BLR":178.2005,"DWD":180.2005},{"f":"PLSHZ9WYE3FHME4R","d":"Unbranded Toor/Arhar Dal (2 kg)","app":243.2505,"BLR":243.2505,"DWD":245.2505},{"f":"PLSHZ9W2UNX3VCRH","d":"Unbranded Urad Dal (Split) (2 kg)","app":254.9005,"BLR":254.9005,"DWD":256.9005},{"f":"PLSHZ9VXV8PFATPF","d":"Unbranded Yellow Moong Dal (Split) (2 kg)","app":204.4005,"BLR":204.4005,"DWD":206.4005},{"f":"RICHHPJMXDUBWFFP","d":"Unbranded Parmal Rice (5 kg)","app":278.754,"BLR":278.754,"DWD":283.754},{"f":"RICHHPJMSNC4URCW","d":"Unbranded Basmati Dubar Rice 5 kg","app":315.504,"BLR":315.504,"DWD":320.504},{"f":"RICHHPJMQFVEXHJG","d":"Unbranded Basmati Tibar Rice 5 kg","app":368.004,"BLR":368.004,"DWD":373.004},{"f":"RICHHPJMSGJK8UJG","d":"Unbranded Biryani Steam Rice (5 kg)","app":467.754,"BLR":467.754,"DWD":472.754},{"f":"RICHHPJMMW5KZPX3","d":"Unbranded Biryani Rice Steam Rice (5 kg)","app":467.754,"BLR":467.754,"DWD":472.754},{"f":"RICHHPJMHFQAENGK","d":"Unbranded Gobindbhog 5 kg","app":809.004,"BLR":809.004,"DWD":814.004},{"f":"RICHHPJMYDQ5WXHU","d":"Unbranded Gobindbhog Rice 5 kg","app":809.004,"BLR":809.004,"DWD":814.004},{"f":"RICHHXDQSGVPH7C4","d":"Unbranded HMT 5 kg","app":320.754,"BLR":320.754,"DWD":325.754},{"f":"RICHHPJM3UZ9JFZT","d":"Unbranded Idli Rice 5 kg","app":255.129,"BLR":255.129,"DWD":260.129},{"f":"RICHM38G7VYESSFP","d":"Unbranded Kurnool Sona Masoori 5 kg","app":310.254,"BLR":310.254,"DWD":315.254},{"f":"RICHZ9WDG2EZKAGT","d":"Unbranded Matta Rice (5 kg)","app":320.754,"BLR":320.754,"DWD":325.754},{"f":"RICHHPJMNCGYHHXZ","d":"Unbranded Mogra Basmati Rice 5 kg","app":278.754,"BLR":278.754,"DWD":283.754},{"f":"RICHHT9ENVA2EUEE","d":"Unbranded Parmal Rice 5 kg","app":278.754,"BLR":278.754,"DWD":283.754},{"f":"RICHHPJMRKGHYY7R","d":"Unbranded Ponni Full Grain 5 kg","app":320.754,"BLR":320.754,"DWD":325.754},{"f":"RICHHPJMCA2M2QM4","d":"Unbranded Sona Masoori 5 kg","app":310.254,"BLR":310.254,"DWD":315.254},{"f":"RICFUUSHY57YKEUX","d":"Unbranded Surti Kolam Steam Rice 5 kg","app":331.254,"BLR":331.254,"DWD":336.254},{"f":"RICHHPJMHSG4U6FU","d":"Unbranded Thanjavur Ponni Full Grain 5 kg","app":320.754,"BLR":320.754,"DWD":325.754},{"f":"RICHHPJMMNAFAB4K","d":"Unbranded Vada Kolam Rice Long Grain 5 kg","app":320.754,"BLR":320.754,"DWD":325.754},{"f":"RICHMGPQTQMYGWUE","d":"Unbranded HMT 10 kg","app":635.775,"BLR":635.775,"DWD":645.775},{"f":"RICHHT9ETQ9AVCDB","d":"Unbranded Idli Rice 10 kg","app":504.525,"BLR":504.525,"DWD":514.525},{"f":"RICHHT9EAP8SHYGC","d":"Unbranded Mogra Basmati Rice 10 kg","app":551.775,"BLR":551.775,"DWD":561.775},{"f":"RICHHPJMSU54NZBU","d":"Unbranded Ponni 10 kg","app":635.775,"BLR":635.775,"DWD":645.775},{"f":"RICHHPJMYFHNDQZH","d":"Unbranded Sona Masoori 10 kg","app":614.775,"BLR":614.775,"DWD":624.775},{"f":"RICHHPJMPHQZZYVZ","d":"Unbranded Vada Kolam Rice Long Grain 10 kg","app":635.775,"BLR":635.775,"DWD":645.775}]
+_POC_SEED_NK  = [{"s":114640,"f":"RICFUUSHY57YKEUX","d":"Surti Kolam Steam Rice 5 kg","ean":"8908012586852","uom":5.0,"BLR":331.25,"DWD":336.25},{"s":114660,"f":"RICHHWCZ3AZRUGYD","d":"Unbranded Basmati Dubar Rice 1 kg","ean":"8908012586913","uom":1.0,"BLR":63.16,"DWD":64.16},{"s":114652,"f":"RICHHPJMSNC4URCW","d":"Unbranded Basmati Dubar Rice 5 kg","ean":"8908012586869","uom":5.0,"BLR":315.5,"DWD":320.5},{"s":114664,"f":"RICHHWCZWJDCJR4E","d":"Unbranded Basmati Tibar Rice 1 kg","ean":"8908012586920","uom":1.0,"BLR":73.66,"DWD":74.66},{"s":114649,"f":"RICHHPJMQFVEXHJG","d":"Unbranded Basmati Tibar Rice 5 kg","ean":"8908012586876","uom":5.0,"BLR":368.0,"DWD":373.0},{"s":114588,"f":"FLRFUUSDAXCC7YFZ","d":"Unbranded Besan 1 kg","ean":"8906219850035","uom":1.0,"BLR":71.2,"DWD":72.2},{"s":114596,"f":"FLRHHUFNEEMFH3Y4","d":"Unbranded Besan 500 gm","ean":"8906219850042","uom":0.5,"BLR":35.86,"DWD":36.36},{"s":114661,"f":"RICHHWCZRBGJCHKF","d":"Unbranded Biryani Rice 1 kg","ean":"8908012586937","uom":1.0,"BLR":93.61,"DWD":94.61},{"s":114651,"f":"RICHHPJMSGJK8UJG","d":"Unbranded Biryani Rice 5 kg","ean":"8908012586883","uom":5.0,"BLR":467.75,"DWD":472.75},{"s":114615,"f":"PLSGQP6DHS8TK4DU","d":"Unbranded Brown Chana 1 kg","ean":"8906219850288","uom":1.0,"BLR":81.01,"DWD":82.01},{"s":114617,"f":"PLSHHPHD8YK6FXFK","d":"Unbranded Brown Chana 500 g","ean":"8906219850264","uom":0.5,"BLR":40.7,"DWD":41.2},{"s":114604,"f":"PLSEWWBTEZUQT7GP","d":"Unbranded Chana Dal 1 Kg","ean":"8908012586272","uom":1.0,"BLR":86.26,"DWD":87.26},{"s":114603,"f":"PLSEWWBTEHDTDAUF","d":"Unbranded Chana Dal 500 gm","ean":"8908012586289","uom":0.5,"BLR":43.32,"DWD":43.82},{"s":114673,"f":"RICHMGPQZEJRFDKC","d":"Unbranded Dosa Rice 1 kg","ean":"8908012586616","uom":1.0,"BLR":43.21,"DWD":44.21},{"s":114628,"f":"PLSHHPKPGHGMURDC","d":"Unbranded Fried Bengal Gram / Bhuna Chana (Whole) 250 g","ean":"8908012586296","uom":0.25,"BLR":25.99,"DWD":26.24},{"s":114629,"f":"PLSHHPKPJXBDCD4J","d":"Unbranded Fried Bengal Gram / Bhuna Chana (Whole) 500 g","ean":"8908012586302","uom":0.5,"BLR":51.72,"DWD":52.22},{"s":114632,"f":"PLSHHPKPZSJRDQSS","d":"Unbranded Fried Gram Split 500 g","ean":"8908012586319","uom":0.5,"BLR":50.67,"DWD":51.17},{"s":114644,"f":"RICHHPJMYDQ5WXHU","d":"Unbranded Gobindbhog Rice 5 Kg","ean":"8908012586975","uom":5.0,"BLR":809.0,"DWD":814.0},{"s":114642,"f":"RICHHPJM8UR8TDYR","d":"Unbranded Gobindobhog / Jeera Rice 1 kg","ean":"8908012586630","uom":1.0,"BLR":161.86,"DWD":162.86},{"s":114626,"f":"PLSHHPHDXMWB8X9H","d":"Unbranded Green Moong Whole 1 kg","ean":"8908012586326","uom":1.0,"BLR":107.26,"DWD":108.26},{"s":114616,"f":"PLSHHPHD3XMMXXGG","d":"Unbranded Green Moong Whole 500 gm","ean":"8908012586333","uom":0.5,"BLR":51.72,"DWD":52.22},{"s":114672,"f":"RICHMGPQWPZRGHHM","d":"Unbranded HMT (Steam) (1 kg)","ean":"8908012586647","uom":1.0,"BLR":64.21,"DWD":65.21},{"s":114665,"f":"RICHHXDQSGVPH7C4","d":"Unbranded HMT (Steam) (5 kg)","ean":"8908012586654","uom":5.0,"BLR":320.75,"DWD":325.75},{"s":114671,"f":"RICHMGPQTQMYGWUE","d":"Unbranded HMT (Steam) 10 kg","ean":"8908012586661","uom":10.0,"BLR":635.77,"DWD":645.77},{"s":114667,"f":"RICHMGPQCJUJBGQA","d":"Unbranded Idli Rice 1 kg","ean":"8908012586678","uom":1.0,"BLR":51.08,"DWD":52.08},{"s":114659,"f":"RICHHT9ETQ9AVCDB","d":"Unbranded Idli Rice 10 kg","ean":"8908012586685","uom":10.0,"BLR":504.52,"DWD":514.52},{"s":114641,"f":"RICHHPJM3UZ9JFZT","d":"Unbranded Idli Rice 5 kg","ean":"8908012586692","uom":5.0,"BLR":255.13,"DWD":260.13},{"s":114613,"f":"PLSEWWBUZ5SXKC9B","d":"Unbranded Kabuli Chana 1 kg","ean":"8908012586340","uom":1.0,"BLR":100.96,"DWD":101.96},{"s":114612,"f":"PLSEWWBUUJZYKP4H","d":"Unbranded Kabuli Chana 500 gm","ean":"8908012586357","uom":0.5,"BLR":48.05,"DWD":48.55},{"s":114666,"f":"RICHM38G7VYESSFP","d":"Unbranded Kurnool Sona Masoori rice 5 kg","ean":"8908012586708","uom":5.0,"BLR":310.25,"DWD":315.25},{"s":114633,"f":"PLSHMGQYBWXN7WNY","d":"Unbranded Lobia White ( Chawli ) 500 gm","ean":"8906219850011","uom":0.5,"BLR":45.42,"DWD":45.92},{"s":114635,"f":"PLSHMGQYFKWBZGVU","d":"Unbranded Masoor Black Whole 500 gm","ean":"8908012586364","uom":0.5,"BLR":41.22,"DWD":41.72},{"s":114627,"f":"PLSHHPHDYD3D6JKM","d":"Unbranded Mix Dal 1 kg","ean":"8908012586371","uom":1.0,"BLR":111.46,"DWD":112.46},{"s":114619,"f":"PLSHHPHDA2ZYXMGV","d":"Unbranded Mix Dal 500 g","ean":"8908012586388","uom":0.5,"BLR":53.3,"DWD":53.8},{"s":114657,"f":"RICHHT9EAP8SHYGC","d":"Unbranded Mogra Basmati Rice 10 kg","ean":"8908012586944","uom":10.0,"BLR":551.77,"DWD":561.77},{"s":114647,"f":"RICHHPJMNCGYHHXZ","d":"Unbranded Mogra Basmati Rice 5 kg","ean":"8908012586890","uom":5.0,"BLR":278.75,"DWD":283.75},{"s":114607,"f":"PLSEWWBTQUG2TZWJ","d":"Unbranded Moong Dal Yellow Split 1 kg","ean":"8908012586395","uom":1.0,"BLR":100.96,"DWD":101.96},{"s":114605,"f":"PLSEWWBTGJZCE6FC","d":"Unbranded Moong Dal Yellow Split 500 g","ean":"8908012586401","uom":0.5,"BLR":50.67,"DWD":51.17},{"s":114625,"f":"PLSHHPHDUQTSQYKH","d":"Unbranded Moong Green Chilka Split 1 kg","ean":"8908012586418","uom":1.0,"BLR":112.51,"DWD":113.51},{"s":114622,"f":"PLSHHPHDMWQGHC38","d":"Unbranded Moong Green Chilka Split 500 g","ean":"8908012586425","uom":0.5,"BLR":50.67,"DWD":51.17},{"s":114662,"f":"RICHHWCZUANYMQTN","d":"Unbranded Parmal Rice 1 kg","ean":"8908012586951","uom":1.0,"BLR":55.81,"DWD":56.81},{"s":114658,"f":"RICHHT9ENVA2EUEE","d":"Unbranded Parmal Rice 5 kg","ean":"8908012586968","uom":5.0,"BLR":278.75,"DWD":283.75},{"s":114656,"f":"RICHHPJPGHDSMGET","d":"Unbranded Poha Medium 500 gm","ean":"8908012586715","uom":0.5,"BLR":28.62,"DWD":29.12},{"s":114650,"f":"RICHHPJMRKGHYY7R","d":"Unbranded Ponni Rice Full Grain, Boiled 5 kg","ean":"8908012586722","uom":5.0,"BLR":320.75,"DWD":325.75},{"s":114670,"f":"RICHMGPQPMZQWDGG","d":"Unbranded Ponni Steam Rice 1 kg","ean":"8908012586739","uom":1.0,"BLR":64.21,"DWD":65.21},{"s":114653,"f":"RICHHPJMSU54NZBU","d":"Unbranded Ponni Steam Rice 10 kg","ean":"8908012586746","uom":10.0,"BLR":635.77,"DWD":645.77},{"s":114654,"f":"RICHHPJMUXCQBUHX","d":"Unbranded Pulav Rice 1 kg","ean":"8908012586906","uom":1.0,"BLR":98.86,"DWD":99.86},{"s":114621,"f":"PLSHHPHDKNPM6Y4T","d":"Unbranded Rajma Red Whole 500 g","ean":"8908012586432","uom":0.5,"BLR":63.8,"DWD":64.3},{"s":114634,"f":"PLSHMGQYERERN3WP","d":"Unbranded Rajma Sharmili / Kashmiri 1Kg","ean":"8908012586449","uom":1.0,"BLR":106.21,"DWD":107.21},{"s":114638,"f":"PLSHMGQYUHMWEVRJ","d":"Unbranded Rajma Sharmili / Kashmiri 500 gm","ean":"8908012586456","uom":0.5,"BLR":53.3,"DWD":53.8},{"s":114630,"f":"PLSHHPKPMNK7RTEM","d":"Unbranded Rajma White Whole 500 g","ean":"8908012586487","uom":0.5,"BLR":66.42,"DWD":66.92},{"s":114639,"f":"PLSHMJMYNZPHWFH5","d":"Unbranded Raw Peanut 250 gm","ean":"8908012586494","uom":0.25,"BLR":39.64,"DWD":39.89},{"s":114610,"f":"PLSEWWBURSNYCGEP","d":"Unbranded Raw Peanuts/ Mungaphali/ Shengdana 500g","ean":"8908012586500","uom":0.5,"BLR":77.97,"DWD":78.47},{"s":114618,"f":"PLSHHPHD9JVKFGJY","d":"Unbranded Red Masoor Dal (Split) (1 kg)","ean":"8908012586517","uom":1.0,"BLR":86.26,"DWD":87.26},{"s":114611,"f":"PLSEWWBUSN9ZZXNE","d":"Unbranded Red Masoor Dal (Split) (500 g)","ean":"8908012586524","uom":0.5,"BLR":43.32,"DWD":43.82},{"s":114620,"f":"PLSHHPHDG3HEXW7J","d":"Unbranded Red Masoor Dal Whole 1 kg","ean":"8908012586531","uom":1.0,"BLR":86.26,"DWD":87.26},{"s":114608,"f":"PLSEWWBTYF3AMHQ3","d":"Unbranded Red Masoor Dal Whole 500 gm","ean":"8908012586555","uom":0.5,"BLR":43.32,"DWD":43.82},{"s":114601,"f":"GNMHHPMFHEAY8Z5W","d":"Unbranded Sago Medium ( Sabudana ) 1 kg","ean":"8908012586753","uom":1.0,"BLR":74.71,"DWD":75.71},{"s":114602,"f":"GNMHHPMYY4PRZQMZ","d":"Unbranded Sago Medium ( Sabudana ) 500gm","ean":"8908012586760","uom":0.5,"BLR":34.92,"DWD":35.42},{"s":114663,"f":"RICHHWCZUMMZWXZG","d":"Unbranded Sona Masoori Rice (Steam) 1 kg","ean":"8908012586777","uom":1.0,"BLR":66.31,"DWD":67.31},{"s":114655,"f":"RICHHPJMYFHNDQZH","d":"Unbranded Sona Masoori Rice (Steam) 10 kg","ean":"8908012586784","uom":10.0,"BLR":614.77,"DWD":624.77},{"s":114643,"f":"RICHHPJMCA2M2QM4","d":"Unbranded Sona Masoori Rice (Steam) 5 kg","ean":"8908012586791","uom":5.0,"BLR":310.25,"DWD":315.25},{"s":114669,"f":"RICHMGPQJZWUU2YS","d":"Unbranded Thanjavur Ponni Boiled Rice Full Grain 1 kg","ean":"8908012586807","uom":1.0,"BLR":64.21,"DWD":65.21},{"s":114645,"f":"RICHHPJMHSG4U6FU","d":"Unbranded Thanjavur Ponni Boiled Rice Full Grain 5 kg","ean":"8908012586814","uom":5.0,"BLR":320.75,"DWD":325.75},{"s":114623,"f":"PLSHHPHDQX29BPWW","d":"Unbranded Toor Dal/Arhar Dal 1 kg","ean":"8908012586562","uom":1.0,"BLR":120.38,"DWD":121.38},{"s":114624,"f":"PLSHHPHDRYPHGGZM","d":"Unbranded Toor Dal/Arhar Dal 500 g","ean":"8908012586579","uom":0.5,"BLR":60.39,"DWD":60.89},{"s":114637,"f":"PLSHMGQYTYB7HMG6","d":"Unbranded Urad Black Chilka (Split ) 500 gm","ean":"8908012586586","uom":0.5,"BLR":61.17,"DWD":61.67},{"s":114636,"f":"PLSHMGQYH8YHAPG7","d":"Unbranded Urad Black Whole 1 kg","ean":"8908012586609","uom":1.0,"BLR":118.81,"DWD":119.81},{"s":114606,"f":"PLSEWWBTMH66GCRX","d":"Unbranded Urad Dal Split 1 kg","ean":"8908012586999","uom":1.0,"BLR":127.21,"DWD":128.21},{"s":114609,"f":"PLSEWWBTYVJSMXMK","d":"Unbranded Urad Dal Split 500 gm","ean":"8906219850028","uom":0.5,"BLR":63.8,"DWD":64.3},{"s":114631,"f":"PLSHHPKPTVJHFFAA","d":"Unbranded Urad Dal White (Whole) 1 kg","ean":"8908012586982","uom":1.0,"BLR":127.21,"DWD":128.21},{"s":114668,"f":"RICHMGPQDXXJVUNU","d":"Unbranded Vada Kolam Rice Long Grain, Steam 1 kg","ean":"8908012586821","uom":1.0,"BLR":64.21,"DWD":65.21},{"s":114648,"f":"RICHHPJMPHQZZYVZ","d":"Unbranded Vada Kolam Rice Long Grain, Steam 10 kg","ean":"8908012586838","uom":10.0,"BLR":635.77,"DWD":645.77},{"s":114646,"f":"RICHHPJMMNAFAB4K","d":"Unbranded Vada Kolam Rice Long Grain, Steam 5 kg","ean":"8908012586845","uom":5.0,"BLR":320.75,"DWD":325.75},{"s":114614,"f":"PLSGAHAMUBD6KMG5","d":"Unbranded White Peas 500 gm","ean":"8906219850257","uom":0.5,"BLR":30.72,"DWD":31.22}]
+_POC_SEED_FK_EAN = {"PLSFT7N5YWQWHTYU":"8908012586081","PLSFT7N5A5XD7TAJ":"8908012586180","PLSFT7N5Z4JVZTUC":"8908012586029","PLSFT7N5AJVBYBHW":"8908012586098","PLSFT7N5XNHW8DGA":"8908012586067","PLSFT7N5S8TCXXH9":"8908012586173","PLSHMGQYBWXN7WNY":"8906219850011","GNMHHPMFHEAY8Z5W":"8908012586753","GNMHHPMYY4PRZQMZ":"8908012586760","FLRFUUSDAXCC7YFZ":"8906219850035","PLSHHPKPJXBDCD4J":"8908012586302","PLSGQP6DHS8TK4DU":"8906219850288","PLSHHPHD8YK6FXFK":"8906219850264","PLSEWWBTEZUQT7GP":"8908012586272","PLSEWWBTEHDTDAUF":"8908012586289","RICHMGPQZEJRFDKC":"8908012586616","PLSHHPKPZSJRDQSS":"8908012586319","PLSHHPKPGHGMURDC":"8908012586296","FLRHHUFNEEMFH3Y4":"8906219850042","RICHMGPQWPZRGHHM":"8908012586647","RICHMGPQTQMYGWUE":"8908012586661","RICHHXDQSGVPH7C4":"8908012586654","RICHMGPQCJUJBGQA":"8908012586678","RICHHT9ETQ9AVCDB":"8908012586685","RICHHPJM3UZ9JFZT":"8908012586692","PLSEWWBUZ5SXKC9B":"8908012586340","PLSEWWBUUJZYKP4H":"8908012586357","RICHM38G7VYESSFP":"8908012586708","PLSHMGQYFKWBZGVU":"8908012586364","PLSHHPHD9JVKFGJY":"8908012586517","PLSEWWBUSN9ZZXNE":"8908012586524","RICHHPJPGHDSMGET":"8908012586715","PLSHHPHDYD3D6JKM":"8908012586371","PLSHHPHDA2ZYXMGV":"8908012586388","PLSHHPHDUQTSQYKH":"8908012586418","PLSHHPHDMWQGHC38":"8908012586425","PLSHHPHDXMWB8X9H":"8908012586326","PLSHHPHD3XMMXXGG":"8908012586333","PLSEWWBTGJZCE6FC":"8908012586401","PLSEWWBTQUG2TZWJ":"8908012586395","PLSHMJMYNZPHWFH5":"8908012586494","RICHMGPQPMZQWDGG":"8908012586739","RICHHPJMSU54NZBU":"8908012586746","RICHHPJMRKGHYY7R":"8908012586722","PLSHHPKPHWNHJHSH":"8906219850004","PLSHHPHDKNPM6Y4T":"8908012586432","PLSHHPKPMNK7RTEM":"8908012586487","PLSEWWBURSNYCGEP":"8908012586500","PLSEWWBTYF3AMHQ3":"8908012586555","PLSHHPHDG3HEXW7J":"8908012586531","PLSHMGQYERERN3WP":"8908012586449","PLSHMGQYUHMWEVRJ":"8908012586456","RICHHPJMYFHNDQZH":"8908012586784","RICHHPJMCA2M2QM4":"8908012586791","RICHHWCZUMMZWXZG":"8908012586777","RICFUUSHY57YKEUX":"8908012586852","RICHMGPQJZWUU2YS":"8908012586807","RICHHPJMHSG4U6FU":"8908012586814","PLSHHPHDQX29BPWW":"8908012586562","PLSHHPHDRYPHGGZM":"8908012586579","PLSHMGQYTYB7HMG6":"8908012586586","PLSHMGQYH8YHAPG7":"8908012586609","PLSEWWBTMH66GCRX":"8908012586999","PLSEWWBTYVJSMXMK":"8906219850028","PLSHHPKPMWBTNAJ8":"8908012586982","PLSHHPKPTVJHFFAA":"8908012586982","RICHMGPQDXXJVUNU":"8908012586821","RICHHPJMPHQZZYVZ":"8908012586838","RICHHPJMMNAFAB4K":"8908012586845","PLSGAHAMUBD6KMG5":"8906219850257","RICHHWCZ3AZRUGYD":"8908012586913","RICHHPJMSNC4URCW":"8908012586869","RICHHWCZWJDCJR4E":"8908012586920","RICHHPJMQFVEXHJG":"8908012586876","RICHHPJMSGJK8UJG":"8908012586883","RICHHWCZRBGJCHKF":"8908012586937","RICHHPJMHFQAENGK":"8908012586623","RICHHPJMYDQ5WXHU":"8908012586975","RICHHPJM8UR8TDYR":"8908012586630","RICHHT9EAP8SHYGC":"8908012586944","RICHHPJMNCGYHHXZ":"8908012586890","RICHHWCZUANYMQTN":"8908012586951","RICHHT9ENVA2EUEE":"8908012586968","RICHHPJMUXCQBUHX":"8908012586906","PLSHMJMY9WW4HPFC":"8908012586463","PLSHZ9VXYGPBFJVQ":"8906219850073","PLSHZ9VX8AZ5GXJH":"8906219850141","PLSHZ9WYE3FHME4R":"8906219850127","PLSHZ9VXGGHH7XY3":"8906219850110","PLSEWWBTGXESQAAZ":"8908012586531","PLSFUUSEYVGTZECP":"8906219850103","PLSHZ9WYYJ8PH9MS":"8906219850066","PLSHHPKPGKFFSUM3":"8908012586432","RICHHPJPH2HYDBMN":"8906219850332","PLSHMGQYDU2VHYTJ":"8906219850431","PLSHMGQYH8J6ZZXG":"8906219850417","PLSHHPHHRTJHHZUA":"8906219850363","RICHHPJMMW5KZPX3":"8906219850370","RICHHPJMXDUBWFFP":"8908012586968","RICHHPJMAHV8JJGG":"8906219850394","RICHZ9WDG2EZKAGT":"8906219850387","RICHHPJMVJJJZCYZ":"8908012586906","PLSEWWBUZCWUVKFP":"8906219850424","PLSFUUSECTTGEDDR":"8908012586982","PLSGAHAMNHNXECPH":"8906219850172","PLSHZ9WHYEEJQ4ZS":"8906219850080","PLSHZ9VXV8PFATPF":"8906219850097","PLSHHPKPWPYUYHVD":"8906219850356","PLSHZ9W2UNX3VCRH":"8906219850134"}
+_POC_SEED_ZP_EAN = {"3660ee74-a633-4dc1-ba35-11f1f46fb788":"8909177028683","60c6b6d7-d6af-4b27-ad30-dc9f62a24521":"8909177015966","61a85ba7-bf51-49da-a056-104eb292e961":"8909177015652","632519f7-c5b2-4da3-97df-809c46d3484e":"8909177016246","66405fbd-3f90-411a-87f2-528f19aec713":"8909177015898","6e80d7eb-4916-45f7-bf86-06039a80feae":"8909177015904","83d4141e-013d-45f0-8913-6591352fcce9":"8909177015676","95edc2a8-2f28-43e4-871a-2308c0c6c62a":"8909177016284","f68a86da-93ed-4db0-b737-6db295cdc396":"8909177001952","27f6d723-530b-4cb9-9d8d-15f145586b30":"8909177015591","281ccc3f-918e-4478-b43f-cb2fb766d1c1":"8909177015874","9a21c478-0a69-449a-9565-e73deeaefdce":"8909177016413","ac9576b7-6ca4-40bf-a72c-59b868c1ba1e":"8909177007664","bb0b3235-925d-422c-a63b-034dbe0f0378":"8909177007572","c0ab0003-97bb-4579-94c1-03a985fe80c7":"8909177014761","d165ad34-5357-42d9-bfff-d99d440cadcb":"8909177016192","d37a3cfd-ddbc-44df-8a3d-de1c40f0ae90":"8909177015669","e0c65e93-3f0e-4a79-8d2b-e09d0348f90a":"8909177016239","e92a05aa-b68f-4136-b9e2-ca8a1eecc8ba":"8909177016505","bfe98cad-c52c-4c3f-9f99-ee9f0f71118f":"8909177016383","11b39e73-f47b-49f2-9b47-b18017118a17":"8909177007657","616439ff-9c27-429a-abd1-286699161337":"8909177016222","91a9da89-0343-4761-87c2-ca789465ee28":"8909177007596","b8461434-a34c-4db2-bc8f-ddc387561f50":"8909177000092","c6785076-da75-487e-b0b1-d9b2f42eb2d4":"8909177001907","e4a33da2-2226-440d-8a84-ff657c6ec0c5":"8909177016031","e7eee3c7-f98c-4bb6-b03c-27b66cdfe167":"8909177028690","f3e4f39a-7776-451f-b42c-6b9fe4c784ca":"8909177015881","fb6b6353-0ca5-4296-8fef-1590f1e941ff":"8909177015645","03cb5377-4879-4805-9827-533f24d82739":"8909177001914","17d18de5-e7c2-4082-9398-05c00c5ba05d":"8909177001945","2edf4311-a271-4b72-9669-e240fddd23d1":"8909177016215","81daeca5-c5f0-4fd4-8218-7f26a3896673":"8909177001969","8d459c3c-6992-47c0-9cbe-1716d3891106":"8909177016338","c5e2e4a7-857b-4789-8ae8-59bcaf65c106":"8909177006479","cfbf008c-0d22-4a25-ae4b-c23629483eba":"8909177016178","d380073e-b868-464d-b272-f08d98867b3b":"8909177014785","d3cecb2c-2ac3-44ac-b902-266168a1632b":"8909177016161","ddd290b4-d31e-4657-b3dc-bf1b748becbe":"8909177015553","fe92b801-78b8-4a36-9b89-8d6506a0e08c":"8909177015621","a0c0b2fa-9f63-4fba-8f11-622a3ccb98b5":"8909177001938","7773da64-a5b6-4df0-a78b-399775e4be4a":"8909177006479","0fb44653-b847-4452-986d-9269234aef6c":"8909177016277","3d7d4f08-89f6-464d-8a45-2c1bf28a7227":"8909177013450","4c9d9ee9-d6b1-448e-872d-afba5da408eb":"8909177016550","6e5598c2-423f-4c62-ab55-1bd4aefd8eb7":"8909177015706","72078697-ffd4-475f-a883-611f99a14198":"8909177016666","6dc3ca8f-2cf3-4c95-b65b-9e75afdc484e":"8909177016307","86e861f9-761e-49c9-8c67-69eb0e5006ba":"8909177015584","016f4d81-5e8f-4ac2-8301-942935f87c2e":"8909177006391","1a821406-c8ed-45be-bdd8-457fc71cb7ef":"8909177001983","75812685-0ba0-4792-99f2-c88329613142":"8909177006186","35485dd9-898a-49e5-b47c-938fadcc0742":"8909177006155","cceca12e-71b0-424f-822a-9dca0b884dcf":"8909177014792","a5b9d61d-6325-44a2-b71a-eef719285527":"8909177014990","6431a78f-cf70-42c1-baaa-3099d5999298":"8909177015003","f44d8388-2647-441b-bc03-1c4a0d52580b":"8909177014983","228781e3-0d03-487f-bf88-825378868601":"8909177014754","1e60e40a-41a5-4708-a74d-f7fd379fce56":"8909177014747","0c544670-ba54-47d6-ab35-363c730826e4":"8909177015010","43e424a4-3e30-45bf-b791-8f87a8c51576":"8909177015461","4dfcda8b-d8a6-4bc9-86cf-4cac890b6c4d":"8909177015454","2e7c30eb-2180-4389-a9b8-f84c118972a4":"8909177016543","81f28964-be30-400c-9853-0fa21d93cca0":"8909177015430","ad965f02-45c6-40b8-b844-6d3d03a5a29a":"8909177016086","9e39643a-3ad9-4230-a375-c1aa0a5b2330":"8909177016093","2e69fdfc-e891-46c7-8e45-9aeb2a2a11db":"8909177016062","2c3be5de-10cb-4921-b1d5-4791a83249f5":"8909177016611","f78b7d20-ac97-44f2-9817-ae1da319caa2":"8909177015560","5b47ab3b-f4bd-418d-b526-03d424c11a51":"8909177015485","5f6271ea-8d17-4267-a82c-ef98d28b39bf":"8909177015478","3b54c4ea-b4d6-4e65-858c-fe25e8bc4b10":"8909177016116","781a376b-0547-48b8-af19-3b31c03e6420":"8909177016109","dc0e0b82-83ca-4389-963c-3972caa6aa38":"8909177015492","4ef249e4-c823-47a7-842b-a81402e3fba4":"8909177015508","82256b4f-be80-44ec-8350-1d0eff1392b7":"8909177015577","235888e5-1420-4a9b-bed3-65179d5d5a2b":"8909177016147","554cf524-77e5-444c-81c8-a9cb2457c886":"8909177016154","30c8c4d8-813b-4993-8427-dde70b87d3f1":"8909177015546","e8b6fd25-1b1a-4fac-bd6d-0809a1d9538f":"8909177015539","12e70356-e25d-42c3-bcbf-698200eab925":"8909177016185","36ed5c78-b1f4-420b-b1d2-fd8edb629686":"8909177016123","41aa1263-6fb9-489b-9a99-32df19f02794":"8909177015515","ddd7b7ed-a703-43dc-8177-75e7046223e2":"8909177016130","964e524b-ab12-49b2-9c93-4c659f464aa6":"8909177015522","25830ced-3b2d-443d-bd3b-b5a91d817b8b":"8909177015607","9bdb4536-d11f-4df6-8bc6-5c7c32d6c8f0":"8909177015614","f37072d8-de04-474b-bd13-9297e5f75456":"8909177015447","555ed29c-bad3-458a-b90e-d454f14bbc79":"8909177016253","d05b8f97-2ccb-49ea-b1a2-9ec699a82871":"8909177016208","b87382db-a2fd-43df-88dd-b63aaf407931":"8909177015638","ece6c21b-8976-4eb9-9f01-1b958b081ecf":"8909177015058","2064292c-8091-4ed3-ab71-4d790f60c2b0":"8909177015041","31ad3e8b-e689-48c1-956c-ca36d9fcac2c":"8909177014778","295dca45-3a22-4ce7-a3ca-5345c2549eb0":"8909177015027","4b78c7bb-f8bf-4dff-98ad-312393341581":"8909177015287","d3567ea3-d103-442d-bc34-2a40b0da1fc2":"8909177014808","763dbe3b-38b6-4c72-a3cb-040ab964a239":"8909177014815","69c43ef4-04ed-4fc1-9e9e-1e3ea6d1a854":"8909177015034","3e5b3a65-104d-4509-a5a3-5576a236ab00":"8909177016499","21b3a005-02f3-4cb0-9f33-678291c266fb":"8909177016659","c78b24de-69a8-408a-876c-1fde8934c2bf":"8909177016475","1beea0ac-893f-4eb0-b8e0-91b338070fe8":"8909177015720","5115315c-a268-4d71-9d3f-25551619481b":"8909177016468","7862ca82-65a9-4d68-b10b-123b877801a9":"8909177016482","30c9b996-26a0-4e98-befe-d6cd72efbb02":"8909177016451","02529ddd-05cc-4025-9b8c-2a434d7dd637":"8909177015713","d03f7dd2-20df-4a05-935f-cd005949aa45":"8909177016512","d4a411d4-97d0-4c9b-a24e-67457420c3d8":"8909177016079","4986080e-05b8-4e42-b796-61fe5363f823":"8909177016444","50ace031-483a-4eb5-b009-612cc646b546":"8909177015959","0e31d2a6-bc88-4c7d-ade0-a818be0cff34":"8909177016420","eaae60a3-62aa-4bdd-bb1a-fcd81b9a7379":"8909177015911","73dbd566-dff8-4045-8ff6-0972f9f8ab3e":"8909177015850","4ec5122a-acb2-4669-8670-8b2535625919":"8909177015805","cc8877b0-4cf8-44f6-b9d4-07d16102303e":"8909177016437","8b15fd51-357a-4d6a-9822-381e57d3e5f9":"8909177015973","7abc18cb-80d8-40d5-a523-767267339445":"8909177016567","6d0a13f2-986a-4557-ac86-159d20929aee":"8909177016390","ed6e550a-699a-452b-81e5-c4997cdcb5a1":"8909177016581","a334197e-a754-4614-bc1b-ebcf719551bc":"8909177015997","33e1997e-2d7a-4912-9765-c908b51bc46a":"8909177016321","dbcb2d9c-01fe-4245-8cc3-80e7ba2fe928":"8909177016369","6d970def-75ae-4e8a-b944-33e4cedaf242":"8909177015836","2d5581af-bebd-43c3-8556-82eb70df428a":"8909177015805","4a303fcb-8988-4c53-af9e-7b948ff6d3f6":"8909177015942","f3a556b9-cb7c-44f7-ae19-58d6b85218eb":"8909177016017","67f838df-711d-408d-9219-0f316eea4e6c":"890917700623","70599e09-fc85-435b-b61a-e983fc352019":"8909177016529","5a952e56-79dc-4217-9227-ca351d898633":"8909177016536","981eafe8-5362-43ab-ae38-0b70a5113366":"8909177016642","a6f6fadc-ba4a-486b-af25-90a080e31e8c":"8909177016000","953c9af2-6a49-4ec4-b01d-90b1a2d639d8":"8909177015935","a16fee1a-51ee-4c5b-81df-b8066e9ab5b7":"8909177016598","8c80665a-6771-459f-8b4b-4c2f7742d97a":"8909177015775","329c76a7-bf1f-4145-9b68-58372433204a":"8909177015867","9f594477-174d-4ac7-94bd-a06bf7adf601":"8909177016574","3c59e5dc-2ee4-4e92-9a10-267145aa4cc1":"8909177016314","538341da-0c37-41bb-812e-576bec62e741":"8909177016604","78595922-d7c1-42d5-b956-8383533cce96":"8909177016628","94e2bccf-3d00-49e0-a675-af2088ee67eb":"8909177015843","9f086348-a866-427c-9b51-c146baa27d59":"8909177015799","fc6c84b2-d739-46a9-984b-d63d15f8d9ce":"8909177016635","a298fc45-cc5c-42e6-b39b-8f3212a60c0f":"8909177016406","0bb3643e-b91d-4883-bce3-a20ac78490ad":"8909177016260","3eaa0e46-c8e0-49fb-a200-e716372cb06a":"8909177015782","23a86465-a3bf-421c-8fef-9ee12f8c1561":"8909177016376","d63e98f3-3eb0-41ab-a378-d667c533be0b":"8909177015980","45e0ea09-f4eb-4cd0-8360-6cbb190eff24":"8909177016017","26986c6b-44cd-4983-85a2-5e3348a0e054":"8909177016345","6a401fce-3ead-496e-a2c4-3ae3928c709e":"8909177016048","ff5911cf-cce7-4d19-9efd-e53d2ffa7672":"8909177015812","c640aebb-48fc-47e8-9929-f7280fc6217c":"8909177016291","cb453954-a287-4471-8083-ca8107fac74c":"8909177015829","d590bb7c-1cad-46a1-bb38-5af765350f8a":"8909177016352","2cc41ee3-c147-4991-9ee4-603a29180b16":"8909177016055","73f653db-f3e4-495a-a14e-ee1049ac1f29":"8909177015683","0730cb65-3a66-4ba0-9cec-791b15f93960":"8909177015690","85fcd904-d75c-4e28-9ec1-646df4e25d98":"8909177015744","eebc84c1-06d3-4e18-b24e-b0c03ebf3164":"8909177015737","fec03f0a-9bc2-44a7-877b-7e675f8246d1":"8909177015751","fc3294d6-cb56-4559-827f-87a726bcc17e":"8909177015768"}
+_POC_ZP_MANUAL = {"b8461434-a34c-4db2-bc8f-ddc387561f50":{"d":"Daily Good Premium Kachi Ghani Mustard Oil - 1 pc (857 ml or 1 L)","BLR":162,"HYD":163,"CHN":163,"packKg":1.468}}
+
+_POC_DG_MAP = {it['p']: it for it in _POC_SEED_DG}
+_POC_BP_MAP = {it['p']: it for it in _POC_SEED_BP}
+_POC_ZP_MAP = {**_POC_DG_MAP, **_POC_BP_MAP}
+for _pvid, _it in _POC_ZP_MANUAL.items():
+    _POC_ZP_MAP[_pvid] = {**_it, 'p': _pvid}
+_POC_FK_MAP  = {it['f']: it for it in _POC_SEED_FK}
+_POC_NK_MAP  = {it['s']: it for it in _POC_SEED_NK}
+_POC_LOSS_THRESHOLD = 5000
+
+
+def _poc_fk_rate(item, wh):
+    wh = (wh or '').lower()
+    if any(x in wh for x in ('dha','dharw')): return item.get('DWD') or item.get('BLR',0)
+    return item.get('BLR',0)
+
+def _poc_city(store):
+    import re
+    for p in re.split(r'[-_\s]+', (store or '').upper()):
+        if p in ('BLR','HYD','CHN'): return p
+    return None
+
+def _poc_valid_fk_date(raw):
+    from datetime import datetime as _dt
+    raw = str(raw or '').strip().split(' ')[0]
+    for fmt in ('%d/%m/%Y','%m/%d/%Y','%Y-%m-%d','%d-%m-%Y'):
+        try:
+            d = _dt.strptime(raw, fmt)
+            return d.year == 2026 and d.month == 7 and d.day >= 17
+        except: pass
+    return True
+
+def _poc_read_file(file_storage):
+    fname = (file_storage.filename or '').lower()
+    raw   = file_storage.read()
+    if fname.endswith('.xlsx') or fname.endswith('.xls'):
+        try:
+            import openpyxl
+            wb = openpyxl.load_workbook(io.BytesIO(raw), data_only=True)
+            ws = wb.active
+            it = ws.iter_rows(values_only=True)
+            hdr = next(it, None)
+            if not hdr or all(h is None for h in hdr): return None, None
+            fnames = [str(h).strip() if h is not None else '' for h in hdr]
+            rows = []
+            for row in it:
+                if not row or all(v is None for v in row): continue
+                d = {}
+                for fn, v in zip(fnames, row):
+                    if v is None: v = ''
+                    elif isinstance(v, float) and v == int(v): v = str(int(v))
+                    else: v = str(v)
+                    d[fn] = v.strip()
+                rows.append(d)
+            return fnames, rows
+        except Exception:
+            try:
+                import xlrd
+                wb = xlrd.open_workbook(file_contents=raw)
+                ws = wb.sheet_by_index(0)
+                hdr = [str(ws.cell_value(0,c)).strip() for c in range(ws.ncols)]
+                rows = []
+                for r in range(1, ws.nrows):
+                    d = {}
+                    for c,fn in enumerate(hdr):
+                        v = ws.cell_value(r,c)
+                        if isinstance(v,float) and v==int(v): v=str(int(v))
+                        else: v=str(v).strip()
+                        d[fn]=v
+                    rows.append(d)
+                return hdr, rows
+            except: return None, None
+    try:
+        text = raw.decode('utf-8-sig', errors='ignore')
+        rdr  = csv.DictReader(io.StringIO(text))
+        return rdr.fieldnames, list(rdr)
+    except: return None, None
+
+def _poc_analyse_zepto(rows, fname):
+    groups = {}
+    for r in rows:
+        po = (r.get('PoNumber') or '').strip()
+        if po: groups.setdefault(po, []).append(r)
+    results = []
+    for po_num, po_rows in groups.items():
+        store = (po_rows[0].get('StoreName') or '').strip()
+        po_date = (po_rows[0].get('PoDate') or '').strip()
+        city = _poc_city(store)
+        if not city:
+            results.append({'error': f'Cannot detect city from StoreName "{store}"', 'po_num': po_num, 'platform': 'zepto'})
+            continue
+        compared, loss_total = [], 0.0
+        for r in po_rows:
+            pvid = (r.get('Sku') or '').strip()
+            desc = (r.get('SkuDesc') or '').strip()
+            po_rate = float(r.get('UnitBaseCost') or 0)
+            qty     = float(r.get('Quantity') or 0)
+            ean     = (r.get('EAN') or '').strip()
+            item    = _POC_ZP_MAP.get(pvid)
+            if not item:
+                compared.append({'desc': desc, 'pvid': pvid, 'ean': ean, 'qty': qty, 'po_rate': po_rate, 'agreed_rate': None, 'diff': None, 'impact': None, 'status': 'unmatched'})
+                continue
+            agreed = float(item.get(city) or item.get('BLR', 0))
+            diff   = round(po_rate - agreed, 4)
+            impact = round(diff * qty, 2)
+            status = 'ok' if abs(diff) < 0.005 else ('loss' if diff < 0 else 'gain')
+            if diff < 0: loss_total += abs(impact)
+            compared.append({'desc': desc or item.get('d',''), 'pvid': pvid, 'ean': ean, 'qty': qty, 'po_rate': po_rate, 'agreed_rate': agreed, 'diff': diff, 'impact': impact, 'status': status, 'city': city})
+        results.append({'po_num': po_num, 'po_date': po_date, 'store': store, 'city': city, 'platform': 'zepto', 'compared': compared,
+            'loss_total': round(loss_total,2), 'match_count': sum(1 for c in compared if c['status']=='ok'),
+            'loss_count': sum(1 for c in compared if c['status']=='loss'),
+            'unmatched': sum(1 for c in compared if c['status']=='unmatched'),
+            'action_needed': loss_total > _POC_LOSS_THRESHOLD})
+    return results
+
+def _poc_analyse_flipkart(rows, fname):
+    if not rows: return [{'error': f'{fname}: empty file', 'platform':'flipkart'}]
+    head = {k.lower().replace('_',' ').strip(): k for k in rows[0].keys()}
+    if any('fsn/isbn13' in k for k in head): return _poc_analyse_fk_direct(rows, fname, head)
+    fsn_col  = next((h for k,h in head.items() if k=='fsn'), None)
+    rate_col = next((h for k,h in head.items() if 'supplier' in k and ('app' in k or 'price' in k)), None)
+    qty_col  = next((h for k,h in head.items() if k in ('order quantity','open po','quantity')), None)
+    wh_col   = next((h for k,h in head.items() if 'warehouse' in k or k=='origin warehouse id'), None)
+    date_col = next((h for k,h in head.items() if 'po date' in k or k=='po_date'), None)
+    po_col   = next((h for k,h in head.items() if 'purchase order id' in k), None)
+    title_col= next((h for k,h in head.items() if 'product title' in k or k=='title'), None)
+    if not fsn_col or not rate_col:
+        return [{'error': f'{fname}: missing FSN or Supplier Price column', 'platform':'flipkart'}]
+    groups = {}
+    for r in rows:
+        po = (r.get(po_col) or fname.split('.')[0]).strip()
+        if date_col and not _poc_valid_fk_date(r.get(date_col,'')): continue
+        groups.setdefault(po, []).append(r)
+    results = []
+    for po_num, po_rows in groups.items():
+        compared, loss_total = [], 0.0
+        for r in po_rows:
+            fsn = (r.get(fsn_col) or '').strip(); item = _POC_FK_MAP.get(fsn)
+            wh  = (r.get(wh_col) or '') if wh_col else ''
+            po_rate = 0.0
+            try: po_rate = float(str(r.get(rate_col) or '').replace('INR','').replace(',','').strip())
+            except: pass
+            qty = 0
+            try: qty = float(r.get(qty_col) or 0)
+            except: pass
+            title = (r.get(title_col) or '').strip() if title_col else ''
+            if not item:
+                compared.append({'desc': title or fsn, 'fsn': fsn, 'qty': qty, 'po_rate': po_rate, 'agreed_rate': None, 'diff': None, 'impact': None, 'status': 'unmatched'})
+                continue
+            agreed = _poc_fk_rate(item, wh); diff = round(po_rate-agreed,4); impact = round(diff*qty,2)
+            status = 'ok' if abs(diff)<0.005 else ('loss' if diff<0 else 'gain')
+            if diff<0: loss_total+=abs(impact)
+            compared.append({'desc':title or item['d'],'fsn':fsn,'qty':qty,'po_rate':po_rate,'agreed_rate':agreed,'diff':diff,'impact':impact,'status':status,'warehouse':wh})
+        results.append({'po_num':po_num,'platform':'flipkart','compared':compared,'loss_total':round(loss_total,2),
+            'match_count':sum(1 for c in compared if c['status']=='ok'),
+            'loss_count':sum(1 for c in compared if c['status']=='loss'),
+            'unmatched':sum(1 for c in compared if c['status']=='unmatched'),
+            'action_needed':loss_total>_POC_LOSS_THRESHOLD})
+    return results
+
+def _poc_analyse_fk_direct(rows, fname, head):
+    hdr_idx = next((i for i,r in enumerate(rows) if any('fsn/isbn13' in str(k).lower() for k in r)),None)
+    if hdr_idx is None: return [{'error':f'{fname}: cannot find item table','platform':'flipkart'}]
+    items_rows = rows[hdr_idx:]
+    ihead = {k.lower().strip():k for k in items_rows[0].keys()}
+    fsn_k=next((v for k,v in ihead.items() if 'fsn/isbn' in k),None)
+    qty_k=next((v for k,v in ihead.items() if 'quantity' in k),None)
+    price_k=next((v for k,v in ihead.items() if 'supplier price' in k),None)
+    title_k=next((v for k,v in ihead.items() if 'title' in k),None)
+    billed=' '.join(str(v) for r in rows[:hdr_idx] for v in r.values()).lower()
+    wh='dha_kot_wh_nl_01nl' if ('dharwad' in billed or 'dharward' in billed) else 'ane_gsh_wh_nl_01nl'
+    po_num=fname.split('.')[0]
+    compared,loss_total=[],0.0
+    for r in items_rows[1:]:
+        fsn=(r.get(fsn_k) or '').strip() if fsn_k else ''
+        if not fsn: break
+        item=_POC_FK_MAP.get(fsn); po_rate=0.0
+        try: po_rate=float(str(r.get(price_k) or '').replace('INR','').replace(',','').strip())
+        except: pass
+        qty=0
+        try: qty=float(r.get(qty_k) or 0)
+        except: pass
+        title=str(r.get(title_k) or '').strip() if title_k else ''
+        if not item:
+            compared.append({'desc':title or fsn,'fsn':fsn,'qty':qty,'po_rate':po_rate,'agreed_rate':None,'diff':None,'impact':None,'status':'unmatched'})
+            continue
+        agreed=_poc_fk_rate(item,wh); diff=round(po_rate-agreed,4); impact=round(diff*qty,2)
+        status='ok' if abs(diff)<0.005 else ('loss' if diff<0 else 'gain')
+        if diff<0: loss_total+=abs(impact)
+        compared.append({'desc':title or item['d'],'fsn':fsn,'qty':qty,'po_rate':po_rate,'agreed_rate':agreed,'diff':diff,'impact':impact,'status':status})
+    return [{'po_num':po_num,'platform':'flipkart','compared':compared,'loss_total':round(loss_total,2),
+        'match_count':sum(1 for c in compared if c['status']=='ok'),
+        'loss_count':sum(1 for c in compared if c['status']=='loss'),
+        'unmatched':sum(1 for c in compared if c['status']=='unmatched'),
+        'action_needed':loss_total>_POC_LOSS_THRESHOLD}]
+
+def _poc_analyse_nk(rows, fname):
+    if not rows: return [{'error':f'{fname}: empty','platform':'ninja_kart'}]
+    head={k.lower().replace('_',' ').strip():k for k in rows[0].keys()}
+    sku_k=next((v for k,v in head.items() if k in ('skuid','sku id')),None)
+    qty_k=next((v for k,v in head.items() if 'poquantity' in k or 'po quantity' in k or k=='quantity'),None)
+    price_k=next((v for k,v in head.items() if 'purchaseprice' in k or 'purchase price' in k),None)
+    po_k=next((v for k,v in head.items() if 'purchaseorderid' in k or 'purchase order id' in k),None)
+    name_k=next((v for k,v in head.items() if 'skuname' in k or 'sku name' in k),None)
+    if not sku_k or not price_k: return [{'error':f'{fname}: missing SKUId or PurchasePrice','platform':'ninja_kart'}]
+    groups={}
+    for r in rows:
+        po=(r.get(po_k) or fname.split('.')[0]).strip(); groups.setdefault(po,[]).append(r)
+    results=[]
+    for po_num,po_rows in groups.items():
+        compared,loss_total=[],0.0
+        for r in po_rows:
+            try: sku_id=int(float(r.get(sku_k) or 0))
+            except: continue
+            item=_POC_NK_MAP.get(sku_id); po_rate=0.0
+            try: po_rate=float(r.get(price_k) or 0)
+            except: pass
+            qty=0
+            try: qty=float(r.get(qty_k) or 0)
+            except: pass
+            name=(r.get(name_k) or '').strip() if name_k else ''
+            if not item:
+                compared.append({'desc':name or f'SKU {sku_id}','sku_id':sku_id,'qty':qty,'po_rate':po_rate,'agreed_rate':None,'diff':None,'impact':None,'status':'unmatched'})
+                continue
+            agreed=item.get('BLR',0); diff=round(po_rate-agreed,4); impact=round(diff*qty,2)
+            status='ok' if abs(diff)<0.005 else ('loss' if diff<0 else 'gain')
+            if diff<0: loss_total+=abs(impact)
+            compared.append({'desc':name or item['d'],'sku_id':sku_id,'qty':qty,'po_rate':po_rate,'agreed_rate':agreed,'diff':diff,'impact':impact,'status':status})
+        results.append({'po_num':po_num,'platform':'ninja_kart','compared':compared,'loss_total':round(loss_total,2),
+            'match_count':sum(1 for c in compared if c['status']=='ok'),
+            'loss_count':sum(1 for c in compared if c['status']=='loss'),
+            'unmatched':sum(1 for c in compared if c['status']=='unmatched'),
+            'action_needed':loss_total>_POC_LOSS_THRESHOLD})
+    return results
+
+def _poc_whatsapp(r):
+    plat=r.get('platform','').upper().replace('_',' '); po=r.get('po_num','')
+    city=r.get('city','') or ''; store=r.get('store','') or ''
+    losses=[c for c in r.get('compared',[]) if c.get('status')=='loss']
+    header=f"*{plat} PO Rate Check*\nPO *{po}*"
+    if city or store: header+=f" ({city}{' - ' if city and store else ''}{store})"
+    header+=f"\nTotal loss: \u20b9{r.get('loss_total',0):,.2f}\n" + "\u2500"*30
+    lines=[header]
+    for c in losses:
+        lines.append(f"\n\u2022 {c['desc']}")
+        lines.append(f"  Our rate: \u20b9{(c.get('agreed_rate') or 0):.4f}  |  PO rate: \u20b9{c.get('po_rate',0):.4f}  |  Impact: \u20b9{abs(c.get('impact',0)):,.2f}")
+    return '\n'.join(lines)
+
+def _poc_email_body(r):
+    plat=r.get('platform','').upper().replace('_',' '); po=r.get('po_num','')
+    losses=[c for c in r.get('compared',[]) if c.get('status')=='loss']
+    lines=[f"Dear Team,","",f"During review of {plat} Purchase Order {po}, we found the following rate differences:",""]
+    for i,c in enumerate(losses,1):
+        lines.append(f"{i}. {c['desc']}")
+        lines.append(f"   Agreed: \u20b9{(c.get('agreed_rate') or 0):.4f}  |  PO: \u20b9{c.get('po_rate',0):.4f}  |  Qty: {int(c.get('qty',0))}  |  Impact: \u20b9{abs(c.get('impact',0)):,.2f}")
+        lines.append("")
+    lines+=[f"Total loss on this PO: \u20b9{r.get('loss_total',0):,.2f}","","Kindly send a revised PO with corrected rates.","","Regards,","Real Instant Foods"]
+    return '\n'.join(lines)
+
+_POC_HTML = STYLE_BLOCK + """
+<title>PO Rate Checker | {{ factory_display_name }}</title>
+</head><body>
+<div class="container">
+""" + TOPBAR_TEMPLATE.replace("__NAV__", nav_html('rate_master')) + """
+    {% if ok_msg %}<div class="badge badge-green" style="display:block;padding:10px 14px;margin-bottom:14px;font-size:13px;">{{ ok_msg }}</div>{% endif %}
+    {% if error_msg %}<div class="badge badge-amber" style="display:block;padding:10px 14px;margin-bottom:14px;font-size:13px;">{{ error_msg }}</div>{% endif %}
+    <div class="card">
+        <div class="card-header">
+            <h2>&#x1F50D; PO Rate Checker</h2>
+            <a href="/rate_master" class="btn btn-outline btn-sm">&larr; Rate Master</a>
+        </div>
+        <div style="color:var(--text-muted);font-size:12.5px;margin-bottom:16px;line-height:1.7;">
+            Upload a PO file to check every line against the built-in cost sheet.
+            Supports <strong style="color:var(--text);">Zepto CSV</strong>,
+            <strong style="color:var(--text);">Flipkart XLS/XLSX/CSV</strong> (Open-PO and direct download &mdash; auto-detected),
+            and <strong style="color:var(--text);">Ninja Kart XLSX</strong>.
+        </div>
+        <form method="POST" action="/rate_master/po_checker" enctype="multipart/form-data">
+            <div class="form-grid">
+                <div>
+                    <label>Platform</label>
+                    <select name="platform" required id="pocPlatform" onchange="pocHint()">
+                        <option value="" disabled selected>Select platform</option>
+                        <option value="zepto">Zepto</option>
+                        <option value="flipkart">Flipkart</option>
+                        <option value="ninja_kart">Ninja Kart</option>
+                    </select>
+                    <div id="pocHintText" style="color:var(--text-muted);font-size:11.5px;margin-top:4px;"></div>
+                </div>
+                <div>
+                    <label>PO File (.csv / .xls / .xlsx)</label>
+                    <input type="file" name="po_file" accept=".csv,.xls,.xlsx" required style="padding:10px;">
+                </div>
+            </div>
+            <button type="submit" class="btn" style="margin-top:12px;">&#x1F50D; Check Rates</button>
+        </form>
+    </div>
+
+    {% for r in results %}
+    <div class="card">
+        <div class="card-header">
+            <h2>
+                {% if r.get('platform')=='zepto' %}&#x1F7E3;{% elif r.get('platform')=='flipkart' %}&#x1F7E1;{% else %}&#x1F7E0;{% endif %}
+                PO {{ r.po_num }}
+                {% if r.get('error') %}<span class="badge badge-red">Error</span>
+                {% elif r.action_needed %}<span class="badge badge-red">&#x1F534; &#x20B9;{{ "%.2f"|format(r.loss_total) }} loss</span>
+                {% else %}<span class="badge badge-green">&#x2705; All OK</span>{% endif %}
+            </h2>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                {% if r.action_needed %}
+                <a href="/rate_master/po_checker/whatsapp/{{ loop.index0 }}" class="btn btn-outline btn-sm" target="_blank">&#x1F4F2; WhatsApp</a>
+                <a href="/rate_master/po_checker/email/{{ loop.index0 }}" class="btn btn-outline btn-sm">&#x1F4E7; Email Draft</a>
+                {% endif %}
+            </div>
+        </div>
+        {% if r.get('error') %}
+            <div style="color:#f87171;font-size:13px;">{{ r.error }}</div>
+        {% else %}
+            <div style="display:flex;gap:20px;flex-wrap:wrap;margin-bottom:14px;font-size:13px;">
+                {% if r.get('city') %}<div><strong>City:</strong> {{ r.city }}</div>{% endif %}
+                {% if r.get('store') %}<div><strong>Store:</strong> {{ r.store }}</div>{% endif %}
+                {% if r.get('po_date') %}<div><strong>Date:</strong> {{ r.po_date }}</div>{% endif %}
+                <div><span class="badge badge-green">{{ r.match_count }} matched</span></div>
+                <div><span class="badge badge-red">{{ r.loss_count }} loss</span></div>
+                {% if r.unmatched %}<div><span class="badge badge-amber">{{ r.unmatched }} unmatched</span></div>{% endif %}
+            </div>
+            <div style="overflow-x:auto;">
+            <table>
+                <thead><tr>
+                    <th>Product</th><th>Qty</th><th>PO Rate</th>
+                    <th>Agreed Rate</th><th>Diff</th><th>Impact (&#x20B9;)</th><th>Status</th>
+                </tr></thead>
+                <tbody>
+                {% for c in r.compared %}
+                <tr style="{% if c.status=='loss' %}background:rgba(239,68,68,0.07);{% elif c.status=='gain' %}background:rgba(34,197,94,0.04);{% endif %}">
+                    <td>{{ c.desc }}</td>
+                    <td style="text-align:right;">{{ c.qty|int }}</td>
+                    <td style="text-align:right;">&#x20B9;{{ "%.4f"|format(c.po_rate) }}</td>
+                    <td style="text-align:right;">
+                        {% if c.agreed_rate is not none %}&#x20B9;{{ "%.4f"|format(c.agreed_rate) }}
+                        {% else %}<span style="color:var(--text-muted);">&mdash;</span>{% endif %}
+                    </td>
+                    <td style="text-align:right;">
+                        {% if c.diff is not none %}
+                        <span style="color:{% if c.diff<0 %}#f87171{% elif c.diff>0 %}#4ade80{% else %}var(--text-muted){% endif %};">
+                            {{ "%+.4f"|format(c.diff) }}
+                        </span>{% else %}&mdash;{% endif %}
+                    </td>
+                    <td style="text-align:right;font-weight:{% if c.status=='loss' %}700{% else %}400{% endif %};color:{% if c.status=='loss' %}#f87171{% elif c.status=='gain' %}#4ade80{% else %}var(--text-muted){% endif %};">
+                        {% if c.impact is not none %}{{ "%+.2f"|format(c.impact) }}{% else %}&mdash;{% endif %}
+                    </td>
+                    <td>
+                        {% if c.status=='ok' %}<span class="badge badge-green">&#x2705; OK</span>
+                        {% elif c.status=='loss' %}<span class="badge badge-red">&#x1F534; Loss</span>
+                        {% elif c.status=='gain' %}<span class="badge badge-blue">&#x1F7E2; Gain</span>
+                        {% else %}<span class="badge badge-amber">&#x1F7E1; Unmatched</span>{% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+                </tbody>
+                {% if r.loss_total %}
+                <tfoot>
+                    <tr style="border-top:2px solid var(--border);">
+                        <td colspan="5" style="text-align:right;font-weight:700;padding:12px 14px;">Total Loss:</td>
+                        <td style="text-align:right;font-weight:800;color:#f87171;font-size:15px;">&#x20B9;{{ "%.2f"|format(r.loss_total) }}</td>
+                        <td></td>
+                    </tr>
+                </tfoot>
+                {% endif %}
+            </table>
+            </div>
+        {% endif %}
+    </div>
+    {% endfor %}
+
+    <footer>{{ factory_display_name }} &middot; {{ platform_name }}</footer>
+</div>
+<script>
+const pocHints={zepto:'Zepto CSV (PoNumber, Sku, StoreName, UnitBaseCost, Quantity, SkuDesc)',flipkart:'Flipkart Open-PO CSV/XLSX or direct website PO .xls \u2014 auto-detected',ninja_kart:'Ninja Kart XLSX (PurchaseOrderId, SKUId, SKUName, POQuantity, PurchasePrice)'};
+function pocHint(){const v=document.getElementById('pocPlatform').value;document.getElementById('pocHintText').textContent=pocHints[v]||'';}
+</script>
+</body></html>
+"""
+
+_POC_WA_HTML = STYLE_BLOCK + """
+<title>WhatsApp Draft | {{ factory_display_name }}</title>
+</head><body><div class="container">
+""" + TOPBAR_TEMPLATE.replace("__NAV__", nav_html('rate_master')) + """
+    <div class="card" style="max-width:580px;margin:0 auto;">
+        <div class="card-header">
+            <h2>&#x1F4F2; WhatsApp &mdash; PO {{ po_num }}</h2>
+            <a href="/rate_master/po_checker" class="btn btn-outline btn-sm">&larr; Back</a>
+        </div>
+        <pre style="background:rgba(255,255,255,0.04);border:1px solid var(--border);border-radius:10px;padding:16px;white-space:pre-wrap;font-family:inherit;font-size:13.5px;line-height:1.6;">{{ msg }}</pre>
+        <a href="https://wa.me/?text={{ msg_encoded }}" target="_blank"
+           class="btn btn-block" style="margin-top:12px;text-decoration:none;display:block;box-sizing:border-box;text-align:center;">
+            &#x1F4F2; Open in WhatsApp
+        </a>
+    </div>
+    <footer>{{ factory_display_name }} &middot; {{ platform_name }}</footer>
+</div></body></html>
+"""
+
+_POC_EMAIL_HTML = STYLE_BLOCK + """
+<title>Email Draft | {{ factory_display_name }}</title>
+</head><body><div class="container">
+""" + TOPBAR_TEMPLATE.replace("__NAV__", nav_html('rate_master')) + """
+    {% if err %}<div class="badge badge-amber" style="display:block;padding:10px 14px;margin-bottom:14px;font-size:13px;">{{ err }}</div>{% endif %}
+    <div class="card" style="max-width:640px;margin:0 auto;">
+        <div class="card-header">
+            <h2>&#x1F4E7; Email Draft &mdash; PO {{ po_num }}</h2>
+            <a href="/rate_master/po_checker" class="btn btn-outline btn-sm">&larr; Back</a>
+        </div>
+        <form method="POST" action="/rate_master/po_checker/email/{{ idx }}/send">
+            <label>To</label>
+            <input type="email" name="to_email" value="{{ to_email }}" required>
+            <label>CC</label>
+            <input type="text" name="cc_email" value="{{ cc_email }}">
+            <label>Subject</label>
+            <input type="text" name="subject" value="Rate Difference &mdash; PO {{ po_num }}" required>
+            <label>Body</label>
+            <textarea name="body" rows="14" style="width:100%;padding:12px 14px;border-radius:10px;border:1px solid var(--border);background:rgba(255,255,255,0.03);color:var(--text);font-family:inherit;font-size:13.5px;line-height:1.6;">{{ email_body }}</textarea>
+            <button type="submit" class="btn btn-block" style="margin-top:14px;">&#x2705; Send Email</button>
+        </form>
+    </div>
+    <footer>{{ factory_display_name }} &middot; {{ platform_name }}</footer>
+</div></body></html>
+"""
+
+@app.route('/rate_master/po_checker', methods=['GET','POST'])
+def rate_master_po_checker():
+    if not session.get('logged_in'): return redirect('/login')
+    fid = current_factory_id()
+    results = []; error_msg = None
+    if request.method == 'POST':
+        platform = request.form.get('platform','').strip()
+        file     = request.files.get('po_file')
+        if not platform or not file or not file.filename:
+            error_msg = 'Please select a platform and upload a file.'
+        else:
+            _, rows = _poc_read_file(file)
+            if rows is None:
+                error_msg = 'Could not read the file — check format (CSV / XLSX / XLS) and try again.'
+            else:
+                fname = file.filename
+                if platform == 'zepto':       results = _poc_analyse_zepto(rows, fname)
+                elif platform == 'flipkart':  results = _poc_analyse_flipkart(rows, fname)
+                elif platform == 'ninja_kart':results = _poc_analyse_nk(rows, fname)
+                else: error_msg = 'Unknown platform.'
+                if results:
+                    session['_poc_results'] = results
+                    session.modified = True
+                    conn = get_conn(); cursor = conn.cursor()
+                    po_nums    = ', '.join(r.get('po_num','?') for r in results if not r.get('error'))
+                    total_loss = sum(r.get('loss_total',0) for r in results if not r.get('error'))
+                    log_audit(cursor, 'PO Rate Check', 'Rate Master', po_nums,
+                              f'{platform} | {len(results)} PO(s) | Loss: \u20b9{total_loss:,.2f}')
+                    conn.commit(); conn.close()
+    return render_template_string(_POC_HTML, results=results, error_msg=error_msg,
+        ok_msg=request.args.get('msg') if request.args.get('ok') else None)
+
+
+@app.route('/rate_master/po_checker/whatsapp/<int:idx>')
+def rate_master_po_checker_whatsapp(idx):
+    if not session.get('logged_in'): return redirect('/login')
+    results = session.get('_poc_results', [])
+    if idx >= len(results): return 'Session expired — please re-upload the PO.', 404
+    r = results[idx]; msg = _poc_whatsapp(r)
+    from urllib.parse import quote as _uq
+    return render_template_string(_POC_WA_HTML, po_num=r.get('po_num',''), msg=msg, msg_encoded=_uq(msg))
+
+
+@app.route('/rate_master/po_checker/email/<int:idx>', methods=['GET','POST'])
+def rate_master_po_checker_email(idx):
+    if not session.get('logged_in'): return redirect('/login')
+    fid = current_factory_id()
+    results = session.get('_poc_results', [])
+    if idx >= len(results): return 'Session expired — please re-upload the PO.', 404
+    r = results[idx]
+    conn = get_conn(); cursor = conn.cursor()
+    pc = {'zepto':'Zepto','flipkart':'Flipkart','ninja_kart':'Ninja Kart'}.get(r.get('platform',''))
+    to_email = cc_email = ''
+    if pc:
+        cursor.execute('SELECT to_email, cc_email FROM email_contacts WHERE factory_id=%s AND company_name=%s AND is_active=TRUE', (fid, pc))
+        row = cursor.fetchone()
+        if row: to_email, cc_email = row[0] or '', row[1] or ''
+    if request.method == 'GET':
+        conn.close()
+        return render_template_string(_POC_EMAIL_HTML, po_num=r.get('po_num',''), idx=idx,
+            to_email=to_email, cc_email=cc_email, email_body=_poc_email_body(r), err=request.args.get('error'))
+    to_email  = request.form.get('to_email','').strip()
+    cc_email  = request.form.get('cc_email','').strip() or None
+    subject   = request.form.get('subject','').strip()
+    body      = request.form.get('body','').strip()
+    ok, result = send_tenant_email(cursor, fid, to_email, cc_email, subject, body,
+                                   session.get('user_name'), po_number=r.get('po_num',''),
+                                   email_type='po_rate_check')
+    conn.commit(); conn.close()
+    if ok: return redirect('/rate_master/po_checker?ok=1&msg=' + quote(f'Email sent to {to_email}.'))
+    return redirect(f'/rate_master/po_checker/email/{idx}?error=' + quote(str(result)))
+
+# =============================================================================
+# END PO RATE CHECKER
+# =============================================================================
+
 
 @app.route('/production')
 def production_page():
@@ -4610,11 +4688,10 @@ def pos_page():
     filter_company = request.args.get('company', '').strip()
     conn = get_conn()
     cursor = conn.cursor()
-    base_cols = 'id, po_number, item_name, weight, ordered_qty, barcode, company, rate, status, po_date, delivery_date, tax_percent, approved_by, approved_at, pvid, pack_size, cost_location'
     if filter_company:
-        cursor.execute(f'SELECT {base_cols} FROM po_items WHERE factory_id = %s AND company = %s ORDER BY po_number, id DESC', (fid, filter_company))
+        cursor.execute('SELECT id, po_number, item_name, weight, ordered_qty, barcode, company, rate, status, po_date, delivery_date, tax_percent, approved_by, approved_at FROM po_items WHERE factory_id = %s AND company = %s ORDER BY po_number, id DESC', (fid, filter_company))
     else:
-        cursor.execute(f'SELECT {base_cols} FROM po_items WHERE factory_id = %s ORDER BY po_number, id DESC', (fid,))
+        cursor.execute('SELECT id, po_number, item_name, weight, ordered_qty, barcode, company, rate, status, po_date, delivery_date, tax_percent, approved_by, approved_at FROM po_items WHERE factory_id = %s ORDER BY po_number, id DESC', (fid,))
     rows = cursor.fetchall()
     cursor.execute('SELECT name FROM companies WHERE factory_id = %s ORDER BY name', (fid,))
     companies = [r[0] for r in cursor.fetchall()]
@@ -4626,36 +4703,16 @@ def pos_page():
         key = (it[6] or '', it[1])
         if key not in groups_map:
             groups_map[key] = {'company': it[6] or '', 'po_number': it[1], 'rows': [], 'total_ordered': 0,
-                                'has_rate_diff': False, 'has_draft': False, 'po_date': it[9], 'delivery_date': it[10],
-                                'cv_total': 0, 'cv_green': 0, 'cv_red': 0, 'cv_unmatched': 0, 'cv_total_red_variance': 0.0}
+                                'has_rate_diff': False, 'has_draft': False, 'po_date': it[9], 'delivery_date': it[10]}
             order.append(key)
         rate_info = get_rate_status(cursor, fid, it[6], it[2], it[7])
-        # PO Cost Variance Control: use PVID+Pack Size+Location matching (Part 4) when the item has
-        # all three keys; fall back to the legacy product-name-based get_cost_variation() when they
-        # are absent (old PO records) — never crashes, never silently fuzzy-matches.
-        pvid, pack_size, cost_location = it[14], it[15], it[16]
-        cost_match = evaluate_po_item_cost(cursor, fid, it[6], it[2], pvid, pack_size, cost_location, it[7], it[4])
+        cost_variation = get_cost_variation(cursor, fid, it[6], it[2], it[7], it[4])
         if rate_info['status'] == 'diff':
             groups_map[key]['has_rate_diff'] = True
         if (it[8] or 'Draft') == 'Draft':
             groups_map[key]['has_draft'] = True
-        groups_map[key]['rows'].append(it + (rate_info, cost_match))
+        groups_map[key]['rows'].append(it + (rate_info, cost_variation))
         groups_map[key]['total_ordered'] += it[4] or 0
-        groups_map[key]['cv_total'] += 1
-        if cost_match['status'] == 'GREEN':
-            groups_map[key]['cv_green'] += 1
-        elif cost_match['status'] == 'RED':
-            groups_map[key]['cv_red'] += 1
-            groups_map[key]['cv_total_red_variance'] += cost_match['variance'] or 0
-        elif cost_match['status'] in ('unmatched', 'not_found', 'ambiguous', 'none'):
-            groups_map[key]['cv_unmatched'] += 1
-    for g in groups_map.values():
-        if g['cv_red'] > 0:
-            g['cost_status_overall'] = 'RED'
-        elif g['cv_unmatched'] > 0:
-            g['cost_status_overall'] = 'UNMATCHED'
-        else:
-            g['cost_status_overall'] = 'GREEN'
     po_groups = [groups_map[k] for k in order]
     conn.close()
 
@@ -4717,14 +4774,11 @@ def pos_edit_item(item_id):
     barcode = request.form.get('barcode', '').strip()
     rate_raw = request.form.get('rate', '').strip()
     rate = float(rate_raw) if rate_raw else None
-    pvid = request.form.get('pvid', '').strip()
-    pack_size = request.form.get('pack_size', '').strip()
-    cost_location = request.form.get('cost_location', '').strip()
     conn = get_conn()
     cursor = conn.cursor()
     # Only editable while still in Draft — an Approved item must be reopened first, so a final PO can't silently change.
-    cursor.execute("UPDATE po_items SET item_name = %s, weight = %s, ordered_qty = %s, barcode = %s, rate = %s, pvid = %s, pack_size = %s, cost_location = %s WHERE id = %s AND factory_id = %s AND status = 'Draft'",
-                   (item_name, weight, int(ordered_qty), barcode, rate, pvid or None, pack_size or None, cost_location or None, item_id, fid))
+    cursor.execute("UPDATE po_items SET item_name = %s, weight = %s, ordered_qty = %s, barcode = %s, rate = %s WHERE id = %s AND factory_id = %s AND status = 'Draft'",
+                   (item_name, weight, int(ordered_qty), barcode, rate, item_id, fid))
     log_audit(cursor, 'PO Item Edited', 'Manage POs', item_id, f'Edited {item_name} ({ordered_qty})')
     conn.commit()
     conn.close()
@@ -4746,15 +4800,11 @@ def pos_add():
     delivery_date = request.form.get('delivery_date', '').strip()
     tax_raw = request.form.get('tax_percent', '').strip()
     tax_percent = float(tax_raw) if tax_raw else None
-    pvid = request.form.get('pvid', '').strip()
-    pack_size = request.form.get('pack_size', '').strip()
-    cost_location = request.form.get('cost_location', '').strip()
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute('''INSERT INTO po_items (factory_id, po_number, item_name, weight, ordered_qty, barcode, company, rate, status, po_date, delivery_date, tax_percent, pvid, pack_size, cost_location)
-                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'Draft', %s, %s, %s, %s, %s, %s)''',
-                   (fid, po_number, item_name, weight, int(ordered_qty), barcode, company, rate, po_date or None, delivery_date or None, tax_percent,
-                    pvid or None, pack_size or None, cost_location or None))
+    cursor.execute('''INSERT INTO po_items (factory_id, po_number, item_name, weight, ordered_qty, barcode, company, rate, status, po_date, delivery_date, tax_percent)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'Draft', %s, %s, %s)''',
+                   (fid, po_number, item_name, weight, int(ordered_qty), barcode, company, rate, po_date or None, delivery_date or None, tax_percent))
     log_audit(cursor, 'Product Updated', 'Manage POs', po_number, f'Added {item_name} ({ordered_qty}) to PO {po_number} (Draft)')
     conn.commit()
     conn.close()
@@ -4772,25 +4822,6 @@ CSV_HEADER_MAP = {
     'po_date': ['po_date', 'po date', 'order date', 'order_date', 'date'],
     'delivery_date': ['delivery_date', 'delivery date', 'due date', 'due_date', 'expected delivery'],
     'tax_percent': ['tax_percent', 'tax', 'gst', 'tax %', 'gst %', 'gst_percent'],
-    # PO Cost Variance Control (Part 3): optional matching-key columns in a PO import sheet.
-    'pvid': ['pvid', 'pvid_code', 'sku_code', 'product_id', 'item_code'],
-    'pack_size': ['pack_size', 'packing_size', 'pack', 'size'],
-    'cost_location': ['location', 'plant', 'branch', 'warehouse', 'city', 'cost_location'],
-}
-
-# PO Cost Variance Control — Part 2: bulk Approved Cost Sheet aliases. Kept SEPARATE from
-# CSV_HEADER_MAP above (not merged) because 'cost'/'rate' mean different things in a PO sheet
-# (item price) vs a cost-master sheet (approved unit rate) — merging would create ambiguous alias
-# collisions. _map_csv_headers() itself is unchanged/reused; only the alias dictionary differs.
-COST_MASTER_HEADER_MAP = {
-    'pvid': ['pvid', 'pvid_code', 'sku', 'sku_code', 'product_id', 'item_code'],
-    'product_name': ['product_name', 'item_name', 'description', 'product'],
-    'pack_size': ['pack_size', 'packing_size', 'pack', 'size', 'weight'],
-    'location': ['location', 'plant', 'branch', 'warehouse', 'city'],
-    'approved_rate': ['approved_rate', 'approved_cost', 'unit_rate', 'unit_cost', 'erp_rate', 'cost'],
-    'company': ['company', 'client', 'customer'],
-    'effective_date': ['effective_date', 'effective date'],
-    'remarks': ['remarks', 'source', 'notes'],
 }
 
 WEIGHT_PATTERN = re.compile(r'\(?(\d+(?:\.\d+)?)\s*(kg|kgs|gm|gms|g|ml|ltr|l)\)?(?:\s|$)', re.IGNORECASE)
@@ -4803,13 +4834,10 @@ def _extract_weight(text):
     amount, unit = matches[-1]
     return f"{amount}{unit.lower()}"
 
-def _map_csv_headers(fieldnames, alias_map=None):
-    """Generic — REUSED as-is for both PO import (default CSV_HEADER_MAP) and the new bulk Approved
-    Cost Sheet import (COST_MASTER_HEADER_MAP passed explicitly). No behavior change for any
-    existing caller that doesn't pass alias_map."""
+def _map_csv_headers(fieldnames):
     normalized = {f.strip().lower(): f for f in fieldnames if f}
     resolved = {}
-    for key, aliases in (alias_map or CSV_HEADER_MAP).items():
+    for key, aliases in CSV_HEADER_MAP.items():
         for alias in aliases:
             if alias in normalized:
                 resolved[key] = normalized[alias]
@@ -4949,9 +4977,6 @@ def pos_ai_import_commit(staging_id):
     qtys = request.form.getlist('ordered_qty')
     rates = request.form.getlist('rate')
     barcodes = request.form.getlist('barcode')
-    pvids = request.form.getlist('pvid')
-    pack_sizes = request.form.getlist('pack_size')
-    cost_locations = request.form.getlist('cost_location')
     includes = request.form.getlist('include')  # indices of rows the user kept checked
 
     if not po_number or not item_names:
@@ -4974,13 +4999,9 @@ def pos_ai_import_commit(staging_id):
         weight = weights[i].strip() if i < len(weights) else ''
         rate = float(rates[i]) if i < len(rates) and rates[i].strip() else None
         barcode = barcodes[i].strip() if i < len(barcodes) else ''
-        pvid = pvids[i].strip() if i < len(pvids) else ''
-        pack_size = pack_sizes[i].strip() if i < len(pack_sizes) else ''
-        cost_location = cost_locations[i].strip() if i < len(cost_locations) else ''
-        cursor.execute('''INSERT INTO po_items (factory_id, po_number, item_name, weight, ordered_qty, barcode, company, rate, status, po_date, delivery_date, tax_percent, pvid, pack_size, cost_location)
-                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'Draft',%s,%s,%s,%s,%s,%s)''',
-                       (fid, po_number, item_name, weight, ordered_qty, barcode, company, rate, po_date, delivery_date, tax_percent,
-                        pvid or None, pack_size or None, cost_location or None))
+        cursor.execute('''INSERT INTO po_items (factory_id, po_number, item_name, weight, ordered_qty, barcode, company, rate, status, po_date, delivery_date, tax_percent)
+                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'Draft',%s,%s,%s)''',
+                       (fid, po_number, item_name, weight, ordered_qty, barcode, company, rate, po_date, delivery_date, tax_percent))
         inserted += 1
 
     cursor.execute("UPDATE ai_import_staging SET status = 'committed' WHERE id = %s", (staging_id,))
@@ -5061,13 +5082,9 @@ def pos_import_csv():
                 tax_percent = float(tax_raw)
             except ValueError:
                 tax_percent = None
-        pvid = (row.get(colmap['pvid']) or '').strip() if 'pvid' in colmap else ''
-        pack_size = (row.get(colmap['pack_size']) or '').strip() if 'pack_size' in colmap else ''
-        cost_location = (row.get(colmap['cost_location']) or '').strip() if 'cost_location' in colmap else ''
-        cursor.execute('''INSERT INTO po_items (factory_id, po_number, item_name, weight, ordered_qty, barcode, company, rate, status, po_date, delivery_date, tax_percent, pvid, pack_size, cost_location)
-                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'Draft', %s, %s, %s, %s, %s, %s)''',
-                       (fid, po_number, item_name, weight, ordered_qty, barcode, company, rate, po_date or None, delivery_date or None, tax_percent,
-                        pvid or None, pack_size or None, cost_location or None))
+        cursor.execute('''INSERT INTO po_items (factory_id, po_number, item_name, weight, ordered_qty, barcode, company, rate, status, po_date, delivery_date, tax_percent)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'Draft', %s, %s, %s)''',
+                       (fid, po_number, item_name, weight, ordered_qty, barcode, company, rate, po_date or None, delivery_date or None, tax_percent))
         inserted += 1
     conn.commit()
     conn.close()
@@ -5105,13 +5122,13 @@ def cost_variation_preview_email(item_id):
         return redirect(f'/cost_variation/{item_id}/send_revised_po_email')
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute('SELECT po_number, item_name, company, ordered_qty, rate, pvid, pack_size, cost_location FROM po_items WHERE id = %s AND factory_id = %s', (item_id, fid))
+    cursor.execute('SELECT po_number, item_name, company, ordered_qty, rate FROM po_items WHERE id = %s AND factory_id = %s', (item_id, fid))
     row = cursor.fetchone()
     if not row:
         conn.close()
         return redirect('/pos')
-    po_number, item_name, po_company, qty, po_rate, pvid, pack_size, cost_location = row
-    cv = evaluate_po_item_cost(cursor, fid, po_company, item_name, pvid, pack_size, cost_location, po_rate, qty)
+    po_number, item_name, po_company, qty, po_rate = row
+    cv = get_cost_variation(cursor, fid, po_company, item_name, po_rate, qty)
     cursor.execute('SELECT to_email, cc_email FROM email_contacts WHERE factory_id = %s AND company_name = %s AND is_active = TRUE', (fid, selected_company))
     contact = cursor.fetchone()
     conn.close()
@@ -5123,8 +5140,7 @@ def cost_variation_preview_email(item_id):
             f"During review of the following Purchase Order, we found a cost variation above our approved limit:\n\n"
             f"PO Number: {po_number}\n"
             f"Item: {item_name}\n"
-            + (f"PVID: {pvid}\nPack Size: {pack_size}\nLocation: {cost_location}\n" if (pvid and pack_size and cost_location) else "")
-            + f"Quantity: {qty}\n"
+            f"Quantity: {qty}\n"
             f"PO Rate: ₹{po_rate}\n"
             f"Applicable Approved Cost: ₹{cv['approved_rate']}\n"
             f"Total Variance: ₹{cv['variance']:.2f}\n"
@@ -5161,18 +5177,6 @@ def cost_variation_send_email(item_id):
         return redirect('/pos?ok=1&msg=' + quote('Revised PO email sent successfully.'))
     return redirect('/pos?ok=0&msg=' + quote(result))
 
-def evaluate_po_item_cost(cursor, fid, company, item_name, pvid, pack_size, cost_location, po_rate, po_qty):
-    """Single shared entry point for 'which cost-match function applies to this PO line' — used by
-    BOTH pos_page() (Part 4, initial display) AND the revised-PO recalculation route (Part 8), so
-    the exact same PVID+Pack+Location-first / legacy-fallback logic is never duplicated/diverged."""
-    if pvid and pack_size and cost_location:
-        return get_cost_match(cursor, fid, company, pvid, pack_size, cost_location, po_rate, po_qty)
-    result = get_cost_variation(cursor, fid, company, item_name, po_rate, po_qty)
-    if result['status'] == 'none':
-        return {'status': 'unmatched', 'variance': None, 'approved_rate': None,
-                'label': 'Approved Cost Not Matched — PVID / Pack Size / Location required'}
-    return result
-
 @app.route('/cost_variation/<int:item_id>/upload_revised_po', methods=['GET', 'POST'])
 def cost_variation_upload_revised_po(item_id):
     """P4: uploads a revised PO document, NEVER touching/overwriting the original po_items row.
@@ -5181,16 +5185,16 @@ def cost_variation_upload_revised_po(item_id):
     fid = current_factory_id()
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute('SELECT po_number, item_name, company, ordered_qty, rate, pvid, pack_size, cost_location FROM po_items WHERE id = %s AND factory_id = %s', (item_id, fid))
+    cursor.execute('SELECT po_number, item_name, company, ordered_qty, rate FROM po_items WHERE id = %s AND factory_id = %s', (item_id, fid))
     row = cursor.fetchone()
     if not row:
         conn.close()
         return redirect('/pos')
-    po_number, item_name, company, orig_qty, orig_rate, pvid, pack_size, cost_location = row
+    po_number, item_name, company, orig_qty, orig_rate = row
     if request.method == 'GET':
         cursor.execute('SELECT MAX(version) FROM po_revisions WHERE po_item_id = %s AND factory_id = %s', (item_id, fid))
         last_version = cursor.fetchone()[0] or 0
-        cv_orig = evaluate_po_item_cost(cursor, fid, company, item_name, pvid, pack_size, cost_location, orig_rate, orig_qty)
+        cv_orig = get_cost_variation(cursor, fid, company, item_name, orig_rate, orig_qty)
         conn.close()
         return render_template_string(UPLOAD_REVISED_PO_HTML, item_id=item_id, po_number=po_number, item_name=item_name,
                                        next_version=last_version + 1, current_variance=cv_orig)
@@ -5209,12 +5213,12 @@ def cost_variation_upload_revised_po(item_id):
     new_version = last_version + 1
     # Previous variance = the LAST known variance (original PO's, or the prior revision's if this is V2+)
     if new_version == 1:
-        prev_variance = evaluate_po_item_cost(cursor, fid, company, item_name, pvid, pack_size, cost_location, orig_rate, orig_qty)['variance']
+        prev_variance = get_cost_variation(cursor, fid, company, item_name, orig_rate, orig_qty)['variance']
     else:
         cursor.execute('SELECT new_variance FROM po_revisions WHERE po_item_id = %s AND factory_id = %s AND version = %s', (item_id, fid, last_version))
         pv_row = cursor.fetchone()
         prev_variance = pv_row[0] if pv_row else None
-    new_cv = evaluate_po_item_cost(cursor, fid, company, item_name, pvid, pack_size, cost_location, revised_rate, revised_qty)
+    new_cv = get_cost_variation(cursor, fid, company, item_name, revised_rate, revised_qty)
     file_name, file_data = None, None
     if file_obj and file_obj.filename:
         file_name = file_obj.filename
